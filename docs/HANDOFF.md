@@ -45,6 +45,10 @@ scripts/                      All free — no Perplexity, no Groq, no API spend.
                               guards the launch commands: fails if any documented
                               `uvicorn api:app` loses --no-proxy-headers, which is the
                               only way to catch a bug TestClient structurally cannot.
+  verify_consistency.py       One quantity, one value — 12 assertions. Asserts
+                              stock_data.py reads store (the book) not config (the
+                              seed), and that P&L percentages round identically to
+                              api.py. Uses a throwaway ARGUS_DB; never touches yours.
 static/
   index.html                  Boot overlay + terminal shell (cache-bust v=16)
   style.css                   All layout + theming via CSS custom properties (cache-bust v=16)
@@ -243,6 +247,39 @@ bucket.
 **Still worth doing, independently:** rotate `AGENT_SECRET` to
 `python -c "import secrets; print(secrets.token_hex(32))"`. A long random secret
 removes the brute-force risk regardless of what the limiter does.
+
+### RESOLVED 2026-08-13 — the terminal read two different books (was HIGH, found from a screenshot)
+
+Not a security finding, and not in any audit. Spotted by looking at the UI: the
+same MSFT position showed **+64.10%** in the watchlist panel and **+64.14%** in
+the holdings table, on one screen, at one price.
+
+The visible half was precision. `tools/stock_data.py` rounded the P&L percentage
+to 1dp while `api.py`'s analytics routes used 2dp, and the frontend renders both
+to two places — so 64.1 became "64.10" beside a correct "64.14".
+
+The half underneath was worse. `stock_data.py` read **`config.MY_PORTFOLIO`**,
+which is *seed* data: `store.bootstrap()` copies it into SQLite once, on first
+run, and never consults it again. Every other reader used `store.positions()`.
+So the two panels were not rounding one number differently — they were reading
+different books. A holding sold through the UI still reported a live P&L, and a
+corrected `avg_cost` still showed the original. On the machine where this was
+found, `config_local.py` still listed MELI months after it left the book.
+
+**Fixed.** `_live_book()` in `stock_data.py` reads `store.positions()` /
+`store.watchlist()`, falling back to the config seed only when the database
+cannot be read at all — the CLI case, since `main.py` never calls `bootstrap()`.
+The three percentage computations there now round to 2dp, matching `api.py`.
+
+`pct_from_52w_high` is still 1dp and that is correct: `stock_data.py` is its only
+producer, so there is nothing for it to disagree with. `verify_consistency.py`
+guards the three duplicated quantities by name rather than blanket-banning 1dp
+rounding, because a harness that fails on a non-defect gets silenced.
+
+**The lesson is about coverage, not rounding.** 121 quant assertions, 396
+provenance assertions, and a live-route sweep all passed while one screen showed
+one position two ways. Nothing compared the outputs of two code paths against
+each other — every harness checked a path against expectations, alone.
 
 ### RESOLVED 2026-08-13 — uvicorn's default proxy handling defeated both IP guards (was HIGH, found during verification)
 
@@ -526,6 +563,7 @@ harness grew from 110 to 121 when `master`'s work was merged in.
 | `verify_ticker_validation.py` | all checks passed, incl. `BRK-B` |
 | `verify_proxy_trust.py` | **17 passed, 0 failed** |
 | `verify_hardening.py` | **48 passed, 0 failed** |
+| `verify_consistency.py` | **12 passed, 0 failed** |
 
 Exercised beyond the harnesses, against a live `uvicorn`:
 

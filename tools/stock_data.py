@@ -17,7 +17,38 @@ import yfinance as yf
 from config import MY_PORTFOLIO, WATCHLIST
 from tools.validator import validate_ticker
 
+
 logger = logging.getLogger(__name__)
+
+
+def _live_book() -> tuple[dict, dict]:
+    """The operator's CURRENT positions and watchlist.
+
+    store.py is the source of truth: every edit made in the UI is written
+    there. config.MY_PORTFOLIO / WATCHLIST are seed data only — bootstrap()
+    copies them into SQLite once, on first run, and never looks at them again.
+
+    This module used to read the config dicts directly, which meant it answered
+    with the seed rather than the book. A holding sold in the UI still reported
+    a live P&L here, and a corrected avg_cost still showed the original, while
+    /api/portfolio/analytics — reading store — reported the real figures. Same
+    screen, two answers, and the config-derived one was simply stale.
+
+    store.positions() and store.watchlist() are documented as returning the
+    config shape, so callers below are unchanged.
+
+    Falls back to the seed only when the database cannot be read at all, which
+    is the CLI path: main.py never calls store.bootstrap(), so the tables may
+    not exist. Returning the seed there is better than failing outright, and it
+    matches what the CLI has always shown.
+    """
+    try:
+        import store
+        return store.positions(), store.watchlist()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("_live_book: store unavailable (%s), using config seed",
+                     type(exc).__name__)
+        return MY_PORTFOLIO, WATCHLIST
 
 
 def _safe_float(value, default=None):
@@ -116,24 +147,31 @@ def get_price_and_fundamentals(ticker: str) -> dict:
         }
 
         # ── Inject portfolio context if we hold this stock ─────────────────
-        if ticker in MY_PORTFOLIO:
-            pos = MY_PORTFOLIO[ticker]
+        book, watching = _live_book()
+
+        if ticker in book:
+            pos = book[ticker]
             avg_cost = _safe_float(pos.get("avg_cost"))
 
+            # 2dp, matching api.py's analytics routes exactly. At 1dp this
+            # returned 64.1 for a position api.py reported as 64.14, and the
+            # frontend renders both to two places — so the same holding showed
+            # "+64.10%" in the watchlist and "+64.14%" in the holdings table on
+            # one screen. Two roundings of one quantity is one too many.
             current_pnl = None
             if price is not None and avg_cost is not None and avg_cost != 0:
-                current_pnl = round(((price - avg_cost) / avg_cost) * 100, 1)
+                current_pnl = round(((price - avg_cost) / avg_cost) * 100, 2)
 
             stop_loss = _safe_float(pos.get("stop_loss"))
             trim_at   = _safe_float(pos.get("trim_at"))
 
             distance_to_stop = None
             if price is not None and stop_loss is not None and price != 0:
-                distance_to_stop = round(((price - stop_loss) / price) * 100, 1)
+                distance_to_stop = round(((price - stop_loss) / price) * 100, 2)
 
             distance_to_trim = None
             if price is not None and trim_at is not None and price != 0:
-                distance_to_trim = round(((trim_at - price) / price) * 100, 1)
+                distance_to_trim = round(((trim_at - price) / price) * 100, 2)
 
             result["my_position"] = {
                 "shares":             pos.get("shares"),
@@ -148,8 +186,8 @@ def get_price_and_fundamentals(ticker: str) -> dict:
             }
 
         # ── Inject watchlist context if applicable ─────────────────────────
-        elif ticker in WATCHLIST:
-            watch = WATCHLIST[ticker]
+        elif ticker in watching:
+            watch = watching[ticker]
             result["watchlist"] = {
                 "tranches":    watch.get("tranches"),
                 "thesis":      watch.get("thesis"),

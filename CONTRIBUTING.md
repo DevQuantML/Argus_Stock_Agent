@@ -13,6 +13,7 @@ python scripts/verify_metric_status.py     # metric provenance, 396 assertions
 python scripts/verify_ticker_validation.py # ticker guard + free routes
 python scripts/verify_proxy_trust.py       # proxy trust boundary, 17 assertions
 python scripts/verify_hardening.py         # limiter + prompt fences, 48 assertions
+python scripts/verify_consistency.py       # live-book vs seed + rounding, 12 assertions
 ```
 
 If you changed anything under `tools/`, say in the PR which harness you ran and
