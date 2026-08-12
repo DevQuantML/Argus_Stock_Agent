@@ -206,7 +206,45 @@ def main():
     # TestClient does not run that middleware, so no in-process assertion can
     # ever catch it. The only durable guard is to check the launch commands
     # themselves: if a run command loses the flag, this fails.
+    # ── 5. A lockout must not be reported as a wrong key ──────────────────
+    #
+    # The failed-unlock backstop introduced a way for a CORRECT key to be
+    # refused. The unlock screen showed "Rejected." for every failure, so a
+    # locked-out operator saw the wording for a bad key, retried, and extended
+    # their own lockout. Found by hitting it, not by reading the code.
+    api._rate_limit_store.clear()
+    api._auth_fail_store.clear()
+    prev_secret = os.environ.get("AGENT_SECRET")
+    os.environ["AGENT_SECRET"] = "harness-only-secret"
+    try:
+        r401 = client.post("/api/session", json={"key": "wrong"})
+        check("a wrong key is still a plain 401", r401.status_code, 401)
+        for _ in range(api._AUTH_FAIL_MAX + 2):
+            r429 = client.post("/api/session", json={"key": "wrong"})
+        check("the backstop returns 429, not 401", r429.status_code, 429)
+        check("the lockout 429 carries Retry-After so the client can say how long",
+              r429.headers.get("Retry-After"), str(api._AUTH_FAIL_WINDOW))
+        # The point of the whole section: the right key is refused too.
+        rgood = client.post("/api/session", json={"key": "harness-only-secret"})
+        check("a CORRECT key is also 429 while locked out", rgood.status_code, 429)
+    finally:
+        if prev_secret is None:
+            os.environ.pop("AGENT_SECRET", None)
+        else:
+            os.environ["AGENT_SECRET"] = prev_secret
+        api._rate_limit_store.clear()
+        api._auth_fail_store.clear()
+
     root = Path(__file__).resolve().parent.parent
+    # The frontend has to act on that distinction, or the backend's honesty is
+    # wasted. Source-level, because the branch lives in the browser.
+    api_js   = (root / "static" / "js" / "api.js").read_text(encoding="utf-8")
+    views_js = (root / "static" / "js" / "views.js").read_text(encoding="utf-8")
+    check("api.js surfaces the status instead of a bare boolean",
+          "status:" in api_js and "auth.authenticated = false" in api_js, True)
+    check("views.js branches on 429 rather than always saying 'Rejected.'",
+          "429" in views_js, True)
+
     launchers = {
         "Dockerfile":       root / "Dockerfile",
         "README.md":        root / "README.md",

@@ -58,11 +58,20 @@ export function showUnlock(onDone) {
     if (!v) { input.focus(); return; }
     busy = true;
     err.textContent = '';
-    const ok = await api.auth.unlock(v);
+    const res = await api.auth.unlock(v);
     busy = false;
-    if (ok) { host.className = 'gate'; host.innerHTML = ''; onDone && onDone(); return; }
-    // Deliberately generic — never hint at how close the attempt was.
-    err.textContent = 'Rejected.';
+    if (res.ok) { host.className = 'gate'; host.innerHTML = ''; onDone && onDone(); return; }
+    // Still deliberately generic about a WRONG key — never hint at how close
+    // the attempt was. But a lockout or an unreachable server is not a wrong
+    // key, and saying "Rejected." for those sends the user to retry, which on
+    // a lockout makes it worse. Distinguish the cause, not the closeness.
+    if (res.status === 429) {
+      err.textContent = 'Too many attempts. Locked for ~15 min — the key may still be right.';
+    } else if (res.status === 0) {
+      err.textContent = 'Cannot reach the server. Is uvicorn still running?';
+    } else {
+      err.textContent = 'Rejected.';
+    }
     box.classList.remove('shake'); void box.offsetWidth; box.classList.add('shake');
     input.select();
   };

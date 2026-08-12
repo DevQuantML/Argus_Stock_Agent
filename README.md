@@ -367,7 +367,7 @@ python scripts/verify_quant.py            # 121 assertions over the quant engine
 python scripts/verify_metric_status.py    # 396 assertions over metric provenance
 python scripts/verify_ticker_validation.py
 python scripts/verify_proxy_trust.py      # 17 assertions — proxy trust boundary
-python scripts/verify_hardening.py        # 42 assertions — rate limiter + prompt fences
+python scripts/verify_hardening.py        # 48 assertions — rate limiter + prompt fences
 ```
 
 These live in the repo deliberately. A verification you cannot re-run is a rumour.

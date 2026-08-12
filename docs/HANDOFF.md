@@ -13,7 +13,8 @@ Last updated: 2026-08-08
 ## 1. Project Architecture
 
 ```
-api.py                        FastAPI app — routes, auth (AGENT_SECRET), rate-limit (20 req/min/IP),
+api.py                        FastAPI app — routes, auth (AGENT_SECRET), per-path-class rate limits
+                              applied in middleware (see _budget_for; catch-all for any /api/*),
                               CSP (script-src 'self' for pages, default-src 'none' for API routes).
                               TWO auth dependencies, do not conflate:
                                 require_auth    — paid routes, metered on every call
@@ -26,7 +27,8 @@ tools/
   perplexity_research.py      Only AI path — prompts, modules, synthesis, _build_context()
   stock_data.py               yfinance price history + fundamentals
   oil_price.py                Brent futures → macro gate signal
-  validator.py                validate_ticker, guard_tool_output, sanitize_question
+  validator.py                validate_ticker, guard_tool_output, sanitize_question,
+                              sanitize_prompt_text (fences stored text out of the prompt)
   fx.py                       Currency conversion for foreign-listed names, so a
                               statement in KRW/DKK/INR is comparable to a USD market cap
   xirr.py                     XIRR calculation for portfolio analytics
@@ -39,22 +41,22 @@ scripts/                      All free — no Perplexity, no Groq, no API spend.
   verify_ticker_validation.py Ticker guard incl. hyphenated classes (BRK-B), free routes
   verify_proxy_trust.py       X-Forwarded-* trust boundary, 17 assertions. No network —
                               drives _client_ip()/_is_https() with crafted headers.
-  verify_hardening.py         Rate-limiter buckets + prompt fences, 42 assertions. Also
+  verify_hardening.py         Rate-limiter buckets + prompt fences, 48 assertions. Also
                               guards the launch commands: fails if any documented
                               `uvicorn api:app` loses --no-proxy-headers, which is the
                               only way to catch a bug TestClient structurally cannot.
 static/
-  index.html                  Boot overlay + terminal shell (cache-bust v=13)
-  style.css                   All layout + theming via CSS custom properties (cache-bust v=13)
+  index.html                  Boot overlay + terminal shell (cache-bust v=16)
+  style.css                   All layout + theming via CSS custom properties (cache-bust v=16)
   js/
     theme-boot.js             Applies accent/tempo/CRT before first paint (blocking, non-module)
     theme.js                  Preference store + typing tempo
-    app.js                    Boot, state, command parser, staged pipeline (v=13)
-    ui.js                     Every renderer — panels, pipeline, verdict, modals, DCF disclosure (v=13)
+    app.js                    Boot, state, command parser, staged pipeline (v=16)
+    ui.js                     Every renderer — panels, pipeline, verdict, modals, DCF disclosure (v=16)
     chart.js                  SVG price chart + sparklines
     md.js                     XSS-safe markdown renderer (HTML-escapes before parsing)
     api.js                    Fetch layer, session handling, error normalisation
-    views.js                  Onboarding, unlock, profile views (v=13)
+    views.js                  Onboarding, unlock, profile views (v=16)
   v2/                         Landing-page source. NOT SERVED — the /v2 route was removed
                               2026-08-08. See §4 before re-wiring it.
 ```
@@ -523,7 +525,7 @@ harness grew from 110 to 121 when `master`'s work was merged in.
 | `verify_metric_status.py` | **395 passed, 0 failed**, 1 n/a (396 assertions) |
 | `verify_ticker_validation.py` | all checks passed, incl. `BRK-B` |
 | `verify_proxy_trust.py` | **17 passed, 0 failed** |
-| `verify_hardening.py` | **42 passed, 0 failed** |
+| `verify_hardening.py` | **48 passed, 0 failed** |
 
 Exercised beyond the harnesses, against a live `uvicorn`:
 

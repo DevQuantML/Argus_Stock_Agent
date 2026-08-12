@@ -22,12 +22,25 @@ export const auth = {
   },
 
   /** Exchange AGENT_SECRET for a session cookie. Returns true on success. */
+  // Returns { ok } on success, or { ok:false, status, message } on failure.
+  // It used to return a bare boolean, which threw away the status — so the
+  // unlock screen showed "Rejected." for a wrong key, a lockout, and a dead
+  // server alike. Being locked out looks exactly like guessing wrong, so the
+  // natural response is to try again, which extends the lockout. The caller
+  // needs the status to say something true.
   async unlock(key) {
     try {
       await request('/api/session', { method: 'POST', body: { key: String(key || '') } });
       auth.authenticated = true;
-    } catch { auth.authenticated = false; }
-    return auth.authenticated;
+      return { ok: true };
+    } catch (err) {
+      auth.authenticated = false;
+      return {
+        ok:      false,
+        status:  (err && err.status) || 0,
+        message: (err && err.message) || '',
+      };
+    }
   },
 
   async signOut() {

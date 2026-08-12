@@ -5,12 +5,12 @@
    Version query on each import so a redeploy can never pair a fresh app.js
    with a stale cached sub-module. Bump together with the ?v= in index.html. */
 
-import * as api from './api.js?v=15';
-import { drawChart, makeResponsive } from './chart.js?v=15';
-import { renderMarkdown } from './md.js?v=15';
-import * as prefs from './theme.js?v=15';
-import * as ui from './ui.js?v=15';
-import * as views from './views.js?v=15';
+import * as api from './api.js?v=16';
+import { drawChart, makeResponsive } from './chart.js?v=16';
+import { renderMarkdown } from './md.js?v=16';
+import * as prefs from './theme.js?v=16';
+import * as ui from './ui.js?v=16';
+import * as views from './views.js?v=16';
 
 const $  = ui.$;
 const $$ = ui.$$;

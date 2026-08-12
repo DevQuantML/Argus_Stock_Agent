@@ -878,7 +878,13 @@ def api_session_create(request: Request, body: SessionBody, response: Response):
     # survives a misconfigured proxy chain, so nothing spoofable gates it.
     if _auth_failures_exceeded(socket_ip):
         logger.warning("api_session_create: failed-unlock budget exhausted for %s", socket_ip)
-        return JSONResponse(status_code=429, content={"error": "too many failed attempts"})
+        return JSONResponse(
+            status_code=429,
+            content={"error": "too many failed attempts"},
+            # Same as the middleware's 429. Without it the caller cannot tell a
+            # lockout from a wrong key, retries, and extends its own lockout.
+            headers={"Retry-After": str(_AUTH_FAIL_WINDOW)},
+        )
 
     if not _check_rate_limit(client_ip):
         return JSONResponse(status_code=429, content={"error": "rate limit exceeded"})
