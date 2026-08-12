@@ -12,7 +12,7 @@ python scripts/verify_quant.py             # quant engine, 121 assertions
 python scripts/verify_metric_status.py     # metric provenance, 396 assertions
 python scripts/verify_ticker_validation.py # ticker guard + free routes
 python scripts/verify_proxy_trust.py       # proxy trust boundary, 17 assertions
-python scripts/verify_hardening.py         # limiter + prompt fences, 37 assertions
+python scripts/verify_hardening.py         # limiter + prompt fences, 42 assertions
 ```
 
 If you changed anything under `tools/`, say in the PR which harness you ran and

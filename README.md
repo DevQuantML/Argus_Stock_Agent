@@ -333,7 +333,10 @@ a private portfolio ends up in a public commit.
   instructions to follow.
 - **Failed unlocks are counted against the raw TCP peer**, which no client can
   spoof at any distance — so brute force stays bounded even if the proxy hop
-  count is misconfigured.
+  count is misconfigured. Ten wrong keys lock that peer out for 15 minutes, and
+  **that includes you if you were the one mistyping.** Correct sign-ins never
+  count toward it, so this only ever bites after ten genuine failures. It's the
+  price of keying on an identity nobody can forge.
 
 `scripts/verify_proxy_trust.py` and `scripts/verify_hardening.py` assert all of
 the above, cost nothing, and make no network calls.
@@ -364,7 +367,7 @@ python scripts/verify_quant.py            # 121 assertions over the quant engine
 python scripts/verify_metric_status.py    # 396 assertions over metric provenance
 python scripts/verify_ticker_validation.py
 python scripts/verify_proxy_trust.py      # 17 assertions — proxy trust boundary
-python scripts/verify_hardening.py        # 37 assertions — rate limiter + prompt fences
+python scripts/verify_hardening.py        # 42 assertions — rate limiter + prompt fences
 ```
 
 These live in the repo deliberately. A verification you cannot re-run is a rumour.

@@ -39,6 +39,10 @@ scripts/                      All free — no Perplexity, no Groq, no API spend.
   verify_ticker_validation.py Ticker guard incl. hyphenated classes (BRK-B), free routes
   verify_proxy_trust.py       X-Forwarded-* trust boundary, 17 assertions. No network —
                               drives _client_ip()/_is_https() with crafted headers.
+  verify_hardening.py         Rate-limiter buckets + prompt fences, 42 assertions. Also
+                              guards the launch commands: fails if any documented
+                              `uvicorn api:app` loses --no-proxy-headers, which is the
+                              only way to catch a bug TestClient structurally cannot.
 static/
   index.html                  Boot overlay + terminal shell (cache-bust v=13)
   style.css                   All layout + theming via CSS custom properties (cache-bust v=13)
@@ -504,6 +508,41 @@ Not modified: `store.py`, `config.py`, `main.py`, `tools/*`, `static/style.css`,
 
 All verification, in every session below, was done via **free paths only** — no
 Perplexity or Groq spend at any point.
+
+Entries are dated because a verification result is a statement about a moment,
+not a property of the code. Read the newest one; treat older counts as history.
+
+### 2026-08-13 — public release, hardening, and the uvicorn finding
+
+Newest. Supersedes the assertion counts in the older entries below — the quant
+harness grew from 110 to 121 when `master`'s work was merged in.
+
+| Harness | Result |
+|---|---|
+| `verify_quant.py` | **121 passed, 0 failed** |
+| `verify_metric_status.py` | **395 passed, 0 failed**, 1 n/a (396 assertions) |
+| `verify_ticker_validation.py` | all checks passed, incl. `BRK-B` |
+| `verify_proxy_trust.py` | **17 passed, 0 failed** |
+| `verify_hardening.py` | **42 passed, 0 failed** |
+
+Exercised beyond the harnesses, against a live `uvicorn`:
+
+- Every route driven through the new middleware — 16 method/path pairs, **no 5xx**.
+  `/api/brent` returned 200 through a real yfinance timeout, degrading as designed.
+- Unlock flow end to end: correct key → 200 + cookie → gated route 200. Fifteen
+  *correct* unlocks in a row stayed 200, confirming the backstop counts failures
+  only. Wrong keys refused from attempt 11.
+- Rotating a spoofed `X-Forwarded-For` over real HTTP: 28× 400 then 429, i.e. the
+  spoof buys no fresh buckets. The two preceding market-bucket calls in the same
+  run account for the budget landing at 28 rather than 30.
+- The launch-command guard was proved by removing `--no-proxy-headers` from the
+  Dockerfile and confirming the harness fails, then restoring it.
+
+**Known lockout behaviour, by design:** the failed-unlock backstop keys on the
+socket peer, so ten wrong keys lock *that peer* out for 15 minutes — including
+the operator, if it was them typing badly. Correct sign-ins never count toward
+it. That is the intended trade: the identity has to be one nobody can influence,
+and the cost of that is coarseness.
 
 ### 2026-08-07 — quant engine + panel fix
 
