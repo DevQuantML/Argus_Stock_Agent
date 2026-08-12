@@ -196,10 +196,18 @@ flip), causing the engine to flag a cash-generative business as "pre-profitabili
 
 ## 3. Pending Tasks
 
-Status re-verified against the code on 2026-08-13, not inherited from the previous
-handoff. Of the four items from the 2026-08-08 audit, **two are now closed and two
-remain open.** Each open one touches auth or rate-limit design, where a careless
-patch is worse than the finding.
+**All four items from the 2026-08-08 audit are now closed, plus a fifth that the
+audit never found.** Status was re-verified against the code on 2026-08-13 rather
+than inherited from the previous handoff — one item had been sitting here marked
+open after it was already fixed, one was understated, and the most serious one
+(uvicorn's default proxy handling) surfaced only because a live-server check
+contradicted a passing in-process test. Each is kept below with what was actually
+wrong and what verifies the fix, because a resolved finding with no record is one
+that gets reintroduced.
+
+There are no known open security items. That is a claim with a date on it, not a
+permanent property: re-run the four `scripts/verify_*.py` harnesses before
+trusting it in a later session.
 
 ### RESOLVED 2026-08-13 — `X-Forwarded-For` spoofing defeated the rate limiter (was HIGH)
 
@@ -230,25 +238,106 @@ bucket.
 `python -c "import secrets; print(secrets.token_hex(32))"`. A long random secret
 removes the brute-force risk regardless of what the limiter does.
 
-### OPEN · MEDIUM — public routes are unmetered
+### RESOLVED 2026-08-13 — uvicorn's default proxy handling defeated both IP guards (was HIGH, found during verification)
 
-Confirmed still open. `_check_rate_limit` has three call sites — `require_auth`,
-`api_session_create`, and the info route — none of them middleware. `/api/demo`,
-`/api/history` and `/api/brent` have no limit at all, and `/api/portfolio` fans
-out several concurrent yfinance calls per request, so N requests become many times
-N upstream calls. **Fix:** apply the limiter in the `add_security_headers`
-middleware with a per-path-class budget, so a route added later cannot silently
-miss it.
+**Not in the original audit. Found only because a live-server check disagreed
+with a passing test**, which makes it the most instructive item in this file.
 
-### OPEN · MEDIUM — stored thesis text reaches the prompt unsanitised
+`uvicorn` enables `--proxy-headers` **by default**. Its `ProxyHeadersMiddleware`
+rewrites `scope["client"]` from the client-supplied `X-Forwarded-For` whenever
+the peer is in `forwarded_allow_ips` (default `127.0.0.1`; commonly widened to
+`*` on a platform deploy). That happens *before* any application code runs, so:
 
-Confirmed still open; `sanitize_prompt_text` does not exist in the codebase.
-`thesis` and `note` are interpolated verbatim into the provider prompt
-(`_build_context`, `_outlook_prompt`). `sanitize_question` covers only the
-`question` parameter, and `guard_tool_output` filters model *output*, not prompt
-*input*. The attacker surface narrowed when writes started requiring a session,
-but the input is still untreated. **Fix:** a `sanitize_prompt_text()` sibling,
-plus explicit delimiters around untrusted blocks.
+- `_trusted_hops()` was irrelevant. Setting `TRUST_PROXY=0` did nothing, because
+  the header had already been folded into `request.client`. The hop-count fix
+  read a header that no longer mattered.
+- `_socket_ip()` was **not unspoofable**, despite its docstring and the
+  failed-unlock backstop resting entirely on that claim. It reads
+  `request.client.host`, the exact value uvicorn had overwritten.
+
+Measured, not reasoned: 34 requests to a 30/min route with a rotating
+`X-Forwarded-For` returned 34× 200 under default uvicorn, and 30× 200 + 4× 429
+with `--no-proxy-headers`. Same code, same `.env`, same everything else.
+
+**Fix: `--no-proxy-headers` on every documented launch** — `Dockerfile` CMD,
+both README commands, §9 below, and `.claude/launch.json`. The application's own
+logic understands hop counts and indexes from the right; uvicorn's does neither.
+Two layers rewriting caller identity is what reintroduced the bypass, so exactly
+one of them stays.
+
+**Why every in-process assertion missed it.** `TestClient` does not run
+`ProxyHeadersMiddleware`, so `scripts/verify_proxy_trust.py` (17 assertions) and
+the first draft of `verify_hardening.py` both passed against an app that was wide
+open over real HTTP. No in-process test can catch this class of bug. The guard
+that can is in `verify_hardening.py` §4: it reads `Dockerfile`, `README.md` and
+this file and fails if any `uvicorn api:app` line loses the flag.
+
+The general lesson, and the reason this entry is long: **a green harness is
+evidence about the path it exercised and nothing else.** The limiter looked
+installed, every route returned 200, and the bypass was total.
+
+### RESOLVED 2026-08-13 — public routes were unmetered (was MEDIUM)
+
+`_check_rate_limit` had three call sites, all inside auth dependencies, so
+`/api/demo`, `/api/history` and `/api/brent` had no limit at all and
+`/api/portfolio` fanned out several concurrent yfinance calls per request.
+
+**Fixed as proposed, in the `add_security_headers` middleware.**
+`_check_rate_limit(ip, bucket, limit, window)` now namespaces its key, and
+`_budget_for(path)` classifies by prefix:
+
+| Bucket | Paths | Budget |
+|---|---|---|
+| *exempt* | `/health`, `/`, `/static/*` | never metered |
+| `market` | `/api/demo`, `/api/history`, `/api/brent` | 30 / min |
+| `heavy` | `/api/portfolio*` | 10 / min |
+| `default` | any other `/api/*` | 60 / min |
+
+`default` is the part that matters: it is a catch-all, so a route added later is
+metered from the moment it exists rather than having to remember a decorator.
+The three original call sites pass `bucket="auth"` and keep their 20/60s exactly,
+so a paid research call is bounded by the tighter of the two budgets and is never
+charged twice.
+
+Two exemptions are deliberate, not oversights. `/health` must never 429 — a cloud
+platform reads a non-200 health check as a dead instance and recycles the
+container, which would take the app down under exactly the load the limiter
+exists to survive. Pages and static assets are exempt because one page load pulls
+several files and would burn a per-minute budget on a single visit.
+
+Verified by `scripts/verify_hardening.py`, which asserts the burst behaviour, the
+bucket independence, the two exemptions, and that the 429 still carries the
+security headers and a `Retry-After`.
+
+### RESOLVED 2026-08-13 — stored thesis text reached the prompt unsanitised (was MEDIUM)
+
+`thesis` and `note` were interpolated verbatim into the provider prompt by
+`_build_context`. `sanitize_question` covered only the `question` parameter, and
+`guard_tool_output` filters model *output*, not prompt *input*.
+
+**The finding was understated.** `sector` — free text, 80 chars at the API
+boundary — was interpolated on the same line and named nowhere in this document.
+It is covered by the fix. Checked and *not* vectors: `profile` never reaches a
+prompt, and `tranches` is a JSON list of floats out of SQLite.
+
+**Fixed as proposed.** `sanitize_prompt_text()` in `tools/validator.py` reuses
+the module's existing `_HTML_TAG_RE` and `_INJECTION_PHRASES`, preserves line
+structure (thesis text is prose — collapsing whitespace the way
+`sanitize_question` does would destroy it), caps blank-line runs so the real
+prompt cannot be pushed out of view, and returns the text wrapped in
+`<<<UNTRUSTED:LABEL>>>` / `<<<END:LABEL>>>`. `_SYSTEM` gained an UNTRUSTED
+CONTENT RULE stating that fenced content is data, never instructions.
+
+One ordering detail is load-bearing and easy to get backwards: **fence
+neutralisation must run before the HTML strip.** `_HTML_TAG_RE` is `<[^>]+>`,
+which matches the `<<<END:THESIS>` prefix of a fence token and leaves a bare
+`>>`. With the steps reversed the forged fence is still broken, but only as an
+accident of that regex's shape — editing it would silently remove the
+protection. The first draft had this backwards and the harness caught it.
+
+Verified by `scripts/verify_hardening.py`: a forged closing fence, a guessed
+label, HTML, injection phrases, blank-line floods and over-long input are all
+handled, while ordinary multi-line prose survives intact.
 
 ### RESOLVED 2026-08-12 — dependencies unpinned (was LOW)
 
@@ -494,8 +583,10 @@ Free paths only; no provider call at any point.
 # Install dependencies
 pip install -r requirements.txt
 
-# Start server (single worker — rate limiter requires it)
-uvicorn api:app --host 0.0.0.0 --port 8000 --workers 1
+# Start server. BOTH flags are load-bearing — see §3:
+#   --workers 1         in-memory rate limiter needs a single worker
+#   --no-proxy-headers  uvicorn's default proxy handling overrides ours
+uvicorn api:app --host 0.0.0.0 --port 8000 --workers 1 --no-proxy-headers
 
 # CLI (free path — no AI spend)
 python main.py PLTR

@@ -12,6 +12,7 @@ python scripts/verify_quant.py             # quant engine, 121 assertions
 python scripts/verify_metric_status.py     # metric provenance, 396 assertions
 python scripts/verify_ticker_validation.py # ticker guard + free routes
 python scripts/verify_proxy_trust.py       # proxy trust boundary, 17 assertions
+python scripts/verify_hardening.py         # limiter + prompt fences, 37 assertions
 ```
 
 If you changed anything under `tools/`, say in the PR which harness you ran and
@@ -39,10 +40,38 @@ when `provider == "groq"` — see `_policy_prompt()` for the pattern.
 `static/js/md.js`, which HTML-escapes before parsing. Never `innerHTML` a model
 response directly.
 
+**Always run the server with `--workers 1 --no-proxy-headers`.** The first is
+for the in-memory limiter. The second is not optional either: uvicorn enables
+`--proxy-headers` by default, and it rewrites `request.client` from the
+client-supplied `X-Forwarded-For` before any app code runs. That defeats
+`TRUST_PROXY` and poisons `request.client.host`, which the brute-force backstop
+depends on being unforgeable. `TestClient` does not run that middleware, so an
+in-process test will happily pass against a wide-open server — this was found
+by a live check disagreeing with a green harness, not by the harness.
+
 **`TRUST_PROXY` is a hop count, not a boolean.** `X-Forwarded-*` headers are
 appended to, so the leftmost entry is written by the client and is hostile input.
 The code indexes from the right. Setting the count higher than the number of
 proxies you actually run silently reintroduces a rate-limiter bypass.
+
+**New `/api/*` routes are rate limited automatically — don't undo that.**
+Classification lives in `_budget_for()` in `api.py`, applied by the
+`add_security_headers` middleware, and anything under `/api/` that matches no
+prefix falls through to a default budget. That catch-all is the point: it means a
+route added later cannot silently miss the limiter. If your route is expensive
+(fans out to yfinance, say), add it to `_PATH_BUDGETS` with a tighter budget
+rather than leaving it on the default. Don't add paths to the unmetered set
+without a reason as concrete as the two that are already there.
+
+**User text that reaches a prompt goes through `sanitize_prompt_text()`.**
+`thesis`, `note` and `sector` are operator-authored, but they're still untrusted
+input to a model. The function fences them in `<<<UNTRUSTED:LABEL>>>` markers and
+strips anything that could close a fence from inside; `_SYSTEM` declares fenced
+content to be data rather than instructions. If you interpolate a new stored text
+field into a prompt, route it through the same function — `sanitize_question()`
+is not a substitute, it collapses whitespace and would destroy multi-line prose.
+Note the ordering inside that function: fence-stripping runs *before* the HTML
+strip, and the comment there explains why reversing it silently weakens the guard.
 
 ## Frontend specifics
 

@@ -33,5 +33,17 @@ EXPOSE 8000
 
 # Start the API server
 # Cloud providers (Railway, Fly.io, Render) inject PORT env var automatically
-# Set workers=1 — in-memory rate limiter only works correctly with a single worker
-CMD ["sh", "-c", "uvicorn api:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1"]
+#
+# --workers 1        the in-memory rate limiter only works with a single worker
+# --no-proxy-headers NOT optional, and not a performance tweak. uvicorn enables
+#                    --proxy-headers by DEFAULT, and its ProxyHeadersMiddleware
+#                    rewrites request.client from the client-supplied
+#                    X-Forwarded-For before any application code runs. That
+#                    silently defeats this app's own TRUST_PROXY hop-count
+#                    logic — which reads the header correctly, from the right —
+#                    and, worse, poisons request.client.host, the value the
+#                    failed-unlock backstop relies on precisely because it is
+#                    supposed to be unforgeable. Two layers rewriting caller
+#                    identity is how the bypass came back; the app's layer is
+#                    the one that understands hop counts, so uvicorn's is off.
+CMD ["sh", "-c", "uvicorn api:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1 --no-proxy-headers"]

@@ -212,7 +212,28 @@ js/api.js             fetch layer, agent-key storage, error normalisation
   what surfaced an over-broad Sharpe assertion — and AON restores the live
   redundancy. A control that has quietly stopped controlling anything is worse
   than no control, so check MMC before trusting it.
-- The in-memory rate limiter (20 req/min/IP) only works with `--workers 1`.
+- **Start the server with `--workers 1 --no-proxy-headers`. Both flags fail
+  silently.** The in-memory rate limiter needs a single worker. And uvicorn
+  enables `--proxy-headers` *by default*, which rewrites `request.client` from
+  the client-supplied `X-Forwarded-For` before any app code runs — overriding
+  `TRUST_PROXY` entirely and poisoning `request.client.host`, the value the
+  failed-unlock backstop trusts *because* it is meant to be unforgeable. Leave
+  it on and a caller rotates the header for a fresh rate-limit bucket per
+  request. `TestClient` does not run that middleware, so no in-process test can
+  catch it; `scripts/verify_hardening.py` guards the launch commands instead.
+- **Every `/api/*` path is metered in middleware**, classified by
+  `_budget_for()` in `api.py`. Anything matching no prefix falls through to a
+  default budget, so a new route is limited from the moment it exists. `/health`,
+  `/` and `/static/*` are exempt deliberately — a 429 on `/health` reads as a
+  dead instance to a cloud platform, and one page load pulls several assets.
+  Buckets are namespaced, so the middleware and `require_auth` never charge the
+  same request to one budget.
+- **Stored `thesis` / `note` / `sector` reach the provider prompt**, so they go
+  through `sanitize_prompt_text()` and arrive fenced in `<<<UNTRUSTED:…>>>`
+  markers that the text inside cannot forge. Inside that function, fence
+  stripping runs *before* the HTML strip: `_HTML_TAG_RE` is `<[^>]+>` and will
+  eat a `<<<END:X>` prefix, which destroys the evidence and makes the real guard
+  a no-op. `scripts/verify_hardening.py` asserts it.
 - **`TRUST_PROXY` is a hop count, not a boolean.** It says how many reverse
   proxies you control sit in front of the app; 0/unset means none. `_client_ip()`
   and `_is_https()` index `X-Forwarded-*` that many entries *from the right*,

@@ -115,7 +115,31 @@ _API_CSP = "default-src 'none'; frame-ancestors 'none'"
 
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
-    response = await call_next(request)
+    """Meter the request, then decorate whatever response comes back.
+
+    The limiter runs here rather than on individual routes so that a route
+    added later cannot silently miss it — see _budget_for(). Both the early 429
+    and the normal response leave through the same header block below, because
+    a rejected request needs the security headers just as much as a served one.
+    """
+    path = request.url.path
+
+    budget = _budget_for(path)
+    if budget is not None:
+        bucket, limit, window = budget
+        if not _check_rate_limit(_client_ip(request), bucket, limit, window):
+            logger.warning("rate_limit: %s exceeded %d req/%ds on bucket '%s' (%s)",
+                           _client_ip(request), limit, window, bucket, path)
+            response = JSONResponse(
+                status_code=429,
+                content={"error": "rate limit exceeded"},
+                headers={"Retry-After": str(window)},
+            )
+        else:
+            response = await call_next(request)
+    else:
+        response = await call_next(request)
+
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     # Explicitly 0, not "1; mode=block". The legacy auditor is deprecated and
@@ -124,7 +148,6 @@ async def add_security_headers(request: Request, call_next):
     response.headers["X-XSS-Protection"] = "0"
     response.headers["Referrer-Policy"] = "no-referrer"
 
-    path = request.url.path
     is_page = path == "/" or path.startswith("/static/")
     response.headers["Content-Security-Policy"] = _PAGE_CSP if is_page else _API_CSP
     return response
@@ -229,45 +252,95 @@ def _is_https(request: Request) -> bool:
     return request.url.scheme == "https"
 
 
-def _check_rate_limit(ip: str) -> bool:
+def _check_rate_limit(ip: str, bucket: str = "auth",
+                      limit: int = _RATE_LIMIT_MAX,
+                      window: int = _RATE_LIMIT_WINDOW) -> bool:
     """
     Returns True if the request should be allowed, False if rate-limited.
     Prunes stale timestamps on every call (O(n) but trivial at this scale).
 
-    Memory cap: once the store holds _RATE_LIMIT_IP_CAP unique IPs, new
-    unseen IPs are rejected until old entries are pruned. This prevents
-    an attacker from exhausting memory by sending requests from millions
-    of spoofed IPs.
+    `bucket` namespaces the key, so different classes of route meter
+    independently. That independence is the point: the middleware meters every
+    /api/* path, and the auth dependencies meter the same paid requests again.
+    Sharing one budget would charge a research call twice and halve the limit
+    that was actually sized for it. With separate buckets the effective limit is
+    simply the tighter of the two, which is the intended behaviour.
+
+    Memory cap: once the store holds _RATE_LIMIT_IP_CAP unique keys, new unseen
+    keys are rejected until old entries are pruned. This prevents an attacker
+    from exhausting memory by sending requests from millions of spoofed IPs.
     """
+    key = f"{bucket}:{ip}"
     now = time.time()
-    cutoff = now - _RATE_LIMIT_WINDOW
+    cutoff = now - window
 
-    # Prune this IP's stale timestamps
-    _rate_limit_store[ip] = [t for t in _rate_limit_store[ip] if t > cutoff]
+    # Prune this key's stale timestamps
+    _rate_limit_store[key] = [t for t in _rate_limit_store[key] if t > cutoff]
 
-    # If this is a new IP and we're at the cap, do a global prune first
-    if ip not in _rate_limit_store or not _rate_limit_store[ip]:
+    # If this is a new key and we're at the cap, do a global prune first
+    if key not in _rate_limit_store or not _rate_limit_store[key]:
         if len(_rate_limit_store) >= _RATE_LIMIT_IP_CAP:
-            # Remove all IPs whose windows have fully expired
+            # Remove all keys whose windows have fully expired
             expired = [
                 k for k, v in _rate_limit_store.items()
                 if not v or all(t <= cutoff for t in v)
             ]
             for k in expired:
                 del _rate_limit_store[k]
-            # If still at cap after pruning, reject the new IP
+            # If still at cap after pruning, reject the new key
             if len(_rate_limit_store) >= _RATE_LIMIT_IP_CAP:
                 logger.warning(
-                    "rate_limit: IP store at capacity (%d), rejecting new IP %s",
-                    _RATE_LIMIT_IP_CAP, ip,
+                    "rate_limit: store at capacity (%d), rejecting new key %s",
+                    _RATE_LIMIT_IP_CAP, key,
                 )
                 return False
 
-    if len(_rate_limit_store[ip]) >= _RATE_LIMIT_MAX:
+    if len(_rate_limit_store[key]) >= limit:
         return False
 
-    _rate_limit_store[ip].append(now)
+    _rate_limit_store[key].append(now)
     return True
+
+
+# ── Per-path-class budgets for the middleware limiter ─────────────────────
+# Previously only require_auth and api_session_create metered anything, so
+# /api/demo, /api/history and /api/brent were completely unlimited, and
+# /api/portfolio fans out several concurrent yfinance calls per request — N
+# requests became many times N upstream calls.
+#
+# Classification lives here rather than on the routes for one specific reason:
+# a route added later must not be able to silently miss the limiter. Anything
+# under /api/ that matches no prefix below falls through to _API_DEFAULT_BUDGET,
+# so a new endpoint is metered from the moment it exists.
+#
+# (bucket, limit, window_seconds), most specific prefix first.
+_PATH_BUDGETS: tuple[tuple[str, str, int, int], ...] = (
+    ("/api/portfolio",  "heavy",  10, 60),   # fans out to yfinance
+    ("/api/demo",       "market", 30, 60),
+    ("/api/history",    "market", 30, 60),
+    ("/api/brent",      "market", 30, 60),
+)
+_API_DEFAULT_BUDGET = ("default", 60, 60)
+
+# Never metered. /health is exempt deliberately: cloud platforms read a non-200
+# health check as a dead instance and will recycle the container, so a 429 here
+# would take the app down under exactly the load the limiter exists to survive.
+# Pages and static assets are exempt because one page load pulls several files
+# and would burn a per-minute budget on a single visit.
+_UNMETERED_EXACT = frozenset({"/health", "/"})
+_UNMETERED_PREFIX = ("/static/",)
+
+
+def _budget_for(path: str) -> tuple[str, int, int] | None:
+    """Return (bucket, limit, window) for a path, or None when unmetered."""
+    if path in _UNMETERED_EXACT or path.startswith(_UNMETERED_PREFIX):
+        return None
+    for prefix, bucket, limit, window in _PATH_BUDGETS:
+        if path.startswith(prefix):
+            return bucket, limit, window
+    if path.startswith("/api/"):
+        return _API_DEFAULT_BUDGET
+    return None
 
 
 # ── Failed-auth backstop ──────────────────────────────────────────────────

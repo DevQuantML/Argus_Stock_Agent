@@ -93,10 +93,10 @@ No account, no API key, no cost. Argus deliberately exposes its quant engine
 unauthenticated so you can see it work before trusting it:
 
 ```bash
-git clone https://github.com/DevQuantML/Argus_stock_Agent.git
-cd Argus_stock_Agent
+git clone https://github.com/DevQuantML/Argus_Stock_Agent.git
+cd Argus_Stock_Agent
 pip install -r requirements.txt
-uvicorn api:app --port 8000 --workers 1
+uvicorn api:app --port 8000 --workers 1 --no-proxy-headers
 ```
 
 Then in another terminal:
@@ -231,8 +231,8 @@ contributing, please don't add a code path that bypasses it.
 ## Setup
 
 ```bash
-git clone https://github.com/DevQuantML/Argus_stock_Agent.git
-cd Argus_stock_Agent
+git clone https://github.com/DevQuantML/Argus_Stock_Agent.git
+cd Argus_Stock_Agent
 
 python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
@@ -244,11 +244,21 @@ cp .env.example .env             # then edit .env — see below
 Run the web terminal:
 
 ```bash
-uvicorn api:app --host 0.0.0.0 --port 8000 --workers 1
+uvicorn api:app --host 0.0.0.0 --port 8000 --workers 1 --no-proxy-headers
 ```
 
-> **`--workers 1` is not optional.** The rate limiter keeps its state in memory,
-> so a second worker gets its own counter and the limit silently doubles.
+> **Neither flag is optional, and both fail silently.**
+>
+> `--workers 1` — the rate limiter keeps its state in memory, so a second worker
+> gets its own counter and every limit doubles.
+>
+> `--no-proxy-headers` — uvicorn enables `--proxy-headers` **by default**, and it
+> rewrites `request.client` from the client-supplied `X-Forwarded-For` before any
+> application code runs. That overrides this app's own `TRUST_PROXY` hop-count
+> logic and poisons the one value the brute-force backstop trusts *because* it's
+> supposed to be unforgeable. Leave it on and a caller can rotate the header for
+> a fresh rate-limit bucket per request — the exact bypass the app's own logic
+> exists to prevent. Every route still returns 200, so nothing looks wrong.
 
 Or use the CLI:
 
@@ -302,6 +312,32 @@ a private portfolio ends up in a public commit.
   module scope, so they don't sit on an importable namespace.
 - The session cookie is `HttpOnly` + `SameSite=Strict`, so page scripts can't read it.
 
+### Hardening worth knowing about
+
+- **Every `/api/*` route is rate limited**, by path class, in middleware rather
+  than per-route — so a route added later is metered from the moment it exists
+  instead of silently missing the limiter. `/health` and static assets are
+  exempt on purpose: a 429 on a health check reads as a dead instance to a cloud
+  platform, and one page load pulls several files.
+- **`X-Forwarded-*` headers are read from the right.** Those headers are
+  *appended* to, so the leftmost entry is written by the client and is hostile
+  input. `TRUST_PROXY` is a hop count, and the code indexes that many entries
+  back from the end. Reading position 0 — the obvious implementation — hands a
+  caller a free-form rate-limit key they can rotate for a fresh bucket per
+  request, which defeats the limiter entirely.
+- **Your stored thesis, note and sector text is fenced before it reaches the
+  model.** It's your own writing, but it's still untrusted input to a prompt: it
+  goes through `sanitize_prompt_text()`, arrives wrapped in
+  `<<<UNTRUSTED:…>>>` markers that text inside cannot forge or close, and the
+  system prompt states that fenced content is data to summarise, never
+  instructions to follow.
+- **Failed unlocks are counted against the raw TCP peer**, which no client can
+  spoof at any distance — so brute force stays bounded even if the proxy hop
+  count is misconfigured.
+
+`scripts/verify_proxy_trust.py` and `scripts/verify_hardening.py` assert all of
+the above, cost nothing, and make no network calls.
+
 ---
 
 ## The frontend
@@ -327,7 +363,8 @@ Every check below is free — no API spend, no network calls to paid services:
 python scripts/verify_quant.py            # 121 assertions over the quant engine
 python scripts/verify_metric_status.py    # 396 assertions over metric provenance
 python scripts/verify_ticker_validation.py
-python scripts/verify_proxy_trust.py      # 17 assertions over the proxy trust boundary
+python scripts/verify_proxy_trust.py      # 17 assertions — proxy trust boundary
+python scripts/verify_hardening.py        # 37 assertions — rate limiter + prompt fences
 ```
 
 These live in the repo deliberately. A verification you cannot re-run is a rumour.
@@ -338,15 +375,10 @@ These live in the repo deliberately. A verification you cannot re-run is a rumou
 
 Stated plainly, because a README that only lists strengths isn't worth reading.
 
-- **Public routes are unmetered.** `/api/demo`, `/api/history` and `/api/brent`
-  have no rate limit, and `/api/portfolio` fans out several concurrent yfinance
-  calls per request. Don't expose this to the open internet without a limiter in
-  front. *(Severity: medium — tracked.)*
-- **Stored thesis text reaches the AI prompt unsanitised.** Your own `thesis` and
-  `note` fields are interpolated into the provider prompt without the treatment
-  the `question` field gets. Writing requires a session, so the attacker surface
-  is small, but it is not zero. *(Severity: medium — tracked.)*
-- **`--workers 1` is a hard requirement**, as above.
+- **`--workers 1` is a hard requirement**, as above. The rate limiter keeps its
+  state in memory, so a second worker gets its own counters and every limit
+  silently doubles. Making this multi-worker needs a shared store (Redis or
+  similar), which is a design change rather than a patch.
 - **Groq has no live web search.** On the fallback provider, anything needing
   real-world freshness degrades to model knowledge — and the prompts declare that
   degradation in their own output rather than hiding it.
