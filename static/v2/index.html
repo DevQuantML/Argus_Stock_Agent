@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>AGENT — Institutional Research. Personal Scale.</title>
+<meta name="description" content="Institutional-grade AI stock research across five verticals — fundamentals, Brent crude framework, geo signals, thesis check, and verdict — in seconds."/>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+<link rel="stylesheet" href="/static/v2/style.css?v=4"/>
+<style>body{background:#F7F5F2;color:#0A0E1A;font-family:'Inter',sans-serif}</style>
+</head>
+<body>
+
+<!-- ── NAV ──────────────────────────────────────────────────────────── -->
+<nav id="nav">
+  <div class="nav-inner">
+    <a href="/v2" class="nav-brand">
+      <svg class="nav-icon" viewBox="0 0 28 28" width="28" height="28" fill="none">
+        <circle cx="14" cy="14" r="12" stroke="#C9963A" stroke-width="2" opacity="0.7"/>
+        <circle cx="14" cy="14" r="5" fill="#0E7B6C"/>
+        <line x1="14" y1="2" x2="14" y2="8" stroke="#C9963A" stroke-width="1.5" stroke-linecap="round"/>
+        <line x1="14" y1="20" x2="14" y2="26" stroke="#C9963A" stroke-width="1.5" stroke-linecap="round"/>
+        <line x1="2" y1="14" x2="8" y2="14" stroke="#C9963A" stroke-width="1.5" stroke-linecap="round"/>
+        <line x1="20" y1="14" x2="26" y2="14" stroke="#C9963A" stroke-width="1.5" stroke-linecap="round"/>
+      </svg>
+      <span class="nav-wordmark">AGENT</span>
+    </a>
+    <div class="nav-links" id="nav-links">
+      <a href="#how-it-works" class="nav-link">How it works</a>
+      <a href="#capabilities" class="nav-link">Capabilities</a>
+      <a href="#api-section" class="nav-link">API</a>
+      <a href="#demo" class="nav-cta">Research a stock ▸</a>
+    </div>
+    <button class="hamburger" id="hamburger" aria-label="Toggle menu">
+      <span></span><span></span><span></span>
+    </button>
+  </div>
+</nav>
+
+<!-- ── HERO ─────────────────────────────────────────────────────────── -->
+<section id="hero">
+  <canvas id="topo-canvas"></canvas>
+  <div class="hero-inner">
+    <div class="hero-text">
+      <div class="hero-label fade-up">AI RESEARCH AGENT · BUILT FOR SERIOUS INVESTORS</div>
+      <h1 class="hero-h1 fade-up">Research any stock.<br>In seconds.</h1>
+      <p class="hero-sub fade-up">Institutional-grade analysis across five research verticals — fundamentals, geopolitical signals, Brent crude framework, sector position, earnings catalysts — delivered as a clear verdict.</p>
+      <div class="hero-btns fade-up">
+        <a href="#demo" class="btn btn-primary">Research a ticker ▸</a>
+        <a href="#how-it-works" class="btn btn-ghost">See how it works</a>
+      </div>
+    </div>
+    <div class="hero-panel fade-up">
+      <div class="panel-card">
+        <div class="panel-header">LIVE BRENT CRUDE SIGNAL</div>
+        <div class="panel-price" id="hp-price">$—.—</div>
+        <div class="panel-signal" id="hp-signal">
+          <span class="signal-dot signal-neutral"></span>
+          <span id="hp-signal-text">Loading…</span>
+        </div>
+        <div class="panel-divider"></div>
+        <div class="panel-portfolio" id="hp-portfolio">
+          <div class="port-row shimmer" style="height:24px;margin-bottom:8px;border-radius:4px"></div>
+          <div class="port-row shimmer" style="height:24px;margin-bottom:8px;border-radius:4px"></div>
+          <div class="port-row shimmer" style="height:24px;border-radius:4px"></div>
+        </div>
+        <div class="panel-footer">Updates every 60 seconds</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── HOW IT WORKS ─────────────────────────────────────────────────── -->
+<section id="how-it-works">
+  <div class="section-wrap section-narrow">
+    <div class="section-label">THE RESEARCH PROCESS</div>
+    <h2 class="section-h2">Five verticals. One verdict.</h2>
+    <p class="section-body">Every research call runs five parallel checks — each one a domain where institutional investors spend hours. You get the synthesis in under 30 seconds.</p>
+    <div class="steps-flow">
+      <div class="step-card fade-up">
+        <div class="step-num">01</div>
+        <div class="step-name">Fundamentals</div>
+        <div class="step-desc">Price, P/E, revenue growth, margins, 52-week range.</div>
+      </div>
+      <div class="step-connector"><svg viewBox="0 0 40 12" width="40" height="12"><path d="M0 6h36M32 2l4 4-4 4" stroke="#E5E2DC" stroke-width="1.5" fill="none" stroke-linecap="round"/></svg></div>
+      <div class="step-card fade-up">
+        <div class="step-num">02</div>
+        <div class="step-name">Brent Gate</div>
+        <div class="step-desc">Oil price vs your framework. Gate opens or closes.</div>
+      </div>
+      <div class="step-connector"><svg viewBox="0 0 40 12" width="40" height="12"><path d="M0 6h36M32 2l4 4-4 4" stroke="#E5E2DC" stroke-width="1.5" fill="none" stroke-linecap="round"/></svg></div>
+      <div class="step-card fade-up">
+        <div class="step-num">03</div>
+        <div class="step-name">Geo Signals</div>
+        <div class="step-desc">Active events mapped to your exact positions.</div>
+      </div>
+      <div class="step-connector"><svg viewBox="0 0 40 12" width="40" height="12"><path d="M0 6h36M32 2l4 4-4 4" stroke="#E5E2DC" stroke-width="1.5" fill="none" stroke-linecap="round"/></svg></div>
+      <div class="step-card fade-up">
+        <div class="step-num">04</div>
+        <div class="step-name">Thesis Check</div>
+        <div class="step-desc">Intact / Strengthened / At Risk — with evidence.</div>
+      </div>
+      <div class="step-connector"><svg viewBox="0 0 40 12" width="40" height="12"><path d="M0 6h36M32 2l4 4-4 4" stroke="#E5E2DC" stroke-width="1.5" fill="none" stroke-linecap="round"/></svg></div>
+      <div class="step-card fade-up">
+        <div class="step-num">05</div>
+        <div class="step-name">Verdict</div>
+        <div class="step-desc">BUY&nbsp;TRANCHE / ADD / HOLD / WAIT / EXIT + entry price.</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── CAPABILITIES ─────────────────────────────────────────────────── -->
+<section id="capabilities" class="dark-section">
+  <div class="section-wrap">
+    <div class="section-label amber">RESEARCH VERTICALS</div>
+    <h2 class="section-h2 white">Every tool your portfolio needs.</h2>
+    <div class="cap-grid">
+      <div class="cap-card fade-up">
+        <div class="cap-icon amber-icon">
+          <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 2c-2 4-6 6-6 11a6 6 0 1 0 12 0c0-5-4-7-6-11z" stroke-linejoin="round"/></svg>
+        </div>
+        <h3 class="cap-name">OilLens</h3>
+        <p class="cap-desc">Live Brent crude price mapped to your deployment framework. Five zones. One clear action.</p>
+        <div class="cap-tags"><span>Brent</span><span>Framework</span><span>Live</span></div>
+      </div>
+      <div class="cap-card fade-up">
+        <div class="cap-icon teal-icon">
+          <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="9"/><path d="M12 3a15 15 0 0 1 0 18M12 3a15 15 0 0 0 0 18M3 12h18"/></svg>
+        </div>
+        <h3 class="cap-name">GeoSignal</h3>
+        <p class="cap-desc">Geopolitical events classified and mapped to your exact portfolio. Only direct transmission — not noise.</p>
+        <div class="cap-tags"><span>Geopolitics</span><span>Real-time</span><span>Portfolio</span></div>
+      </div>
+      <div class="cap-card fade-up">
+        <div class="cap-icon white-icon">
+          <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="4" y="4" width="16" height="4" rx="1"/><rect x="6" y="10" width="12" height="4" rx="1"/><rect x="8" y="16" width="8" height="4" rx="1"/></svg>
+        </div>
+        <h3 class="cap-name">TranchePilot</h3>
+        <p class="cap-desc">Monitors entry levels across all positions. Alerts when a tranche is hit. Tracks blended cost basis.</p>
+        <div class="cap-tags"><span>Entry</span><span>Accumulation</span><span>Alerts</span></div>
+      </div>
+      <div class="cap-card fade-up">
+        <div class="cap-icon amber-icon">
+          <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="8" width="4" height="12" rx="1"/><rect x="10" y="4" width="4" height="16" rx="1"/><rect x="17" y="10" width="4" height="10" rx="1"/><line x1="1" y1="6" x2="23" y2="6" stroke-dasharray="2 2" opacity="0.5"/></svg>
+        </div>
+        <h3 class="cap-name">Sector Screener</h3>
+        <p class="cap-desc">Applies your research template to full sectors. Vertical breakdown, margin trends, exposure mapping.</p>
+        <div class="cap-tags"><span>Sectors</span><span>Fundamentals</span><span>NSE</span></div>
+      </div>
+      <div class="cap-card fade-up">
+        <div class="cap-icon teal-icon">
+          <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="9" y1="4" x2="9" y2="22"/><line x1="15" y1="4" x2="15" y2="22"/><path d="M6 14l3 3 6-6"/></svg>
+        </div>
+        <h3 class="cap-name">Earnings Intel</h3>
+        <p class="cap-desc">Pre-earnings setup for every position. Analyst consensus, key metrics, bull/bear scenarios.</p>
+        <div class="cap-tags"><span>Earnings</span><span>Catalysts</span><span>Scenarios</span></div>
+      </div>
+      <div class="cap-card fade-up">
+        <div class="cap-icon gradient-icon">
+          <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="7" cy="12" r="3"/><circle cx="17" cy="7" r="3"/><circle cx="17" cy="17" r="3"/><line x1="10" y1="12" x2="14" y2="8"/><line x1="10" y1="12" x2="14" y2="16"/></svg>
+        </div>
+        <h3 class="cap-name">Frontier Models</h3>
+        <p class="cap-desc">Claude Sonnet for reasoning. Kimi K3 for 1M-token reads. Best model for every task — routed automatically.</p>
+        <div class="cap-tags"><span>Claude</span><span>Kimi K3</span><span>GLM-5.2</span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── LIVE DEMO ─────────────────────────────────────────────────────── -->
+<section id="demo">
+  <div class="section-wrap">
+    <div class="section-label">TRY IT</div>
+    <h2 class="section-h2">Type a ticker. Get a verdict.</h2>
+    <div class="demo-layout">
+      <div class="demo-input-panel fade-up">
+        <label class="input-label" for="demo-ticker">Ticker</label>
+        <input id="demo-ticker" class="demo-input" type="text" placeholder="e.g. PLTR, TATAELXSI.NS" maxlength="20" autocomplete="off" spellcheck="false"/>
+        <label class="input-label" for="demo-question">Specific question? <span class="opt">(optional)</span></label>
+        <input id="demo-question" class="demo-input" type="text" placeholder="Is the thesis intact? What are risks?" maxlength="300"/>
+        <button id="demo-run" class="btn btn-primary btn-full">Run Research</button>
+        <div class="demo-hint">Free demo shows quant metrics. Full report requires an agent key.</div>
+      </div>
+      <div class="demo-output-panel fade-up">
+        <div class="output-chrome">
+          <div class="chrome-dots"><span></span><span></span><span></span></div>
+          <span class="chrome-title" id="output-title">research output</span>
+        </div>
+        <div class="output-body" id="output-body">
+          <div class="output-section">
+            <span class="output-key">SITUATION</span>
+            <span class="output-val">PLTR at <span class="mono">$138.40</span> (+1.2%). Forward P/E <span class="mono">72x</span>.<br>Revenue growth <span class="mono">39%</span> YoY. Down <span class="mono">8.4%</span> from 52W high.</span>
+          </div>
+          <div class="output-section">
+            <span class="output-key">BRENT GATE</span>
+            <span class="output-val"><span class="mono">$74.20</span> · HOLD zone · New positions: <span class="output-amber">BLOCKED</span><br>Oil above $72 threshold. No new capital deployment.</span>
+          </div>
+          <div class="output-section">
+            <span class="output-key">GEO RISKS</span>
+            <span class="output-val">No active events with direct PLTR transmission.<br>Monitor: US-China AI export control developments.</span>
+          </div>
+          <div class="output-section">
+            <span class="output-key">THESIS CHECK</span>
+            <span class="output-val"><span class="output-pill pill-green">✅ INTACT</span> AIP commercial adoption accelerating.<br>Q2 guidance raised. Government pipeline strong.</span>
+          </div>
+          <div class="output-section">
+            <span class="output-key">VERDICT</span>
+            <span class="output-val"><strong>HOLD</strong> — next tranche at <span class="mono">$120.00</span> if Brent drops below $72.<br>Next catalyst: Q3 earnings. Watch NRR and deal count.</span>
+          </div>
+          <div class="output-cursor"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── API ───────────────────────────────────────────────────────────── -->
+<section id="api-section">
+  <div class="section-wrap section-narrow">
+    <div class="section-label">DEVELOPER API</div>
+    <h2 class="section-h2">Call it from anywhere.</h2>
+    <p class="section-body">Every research function is available over HTTP. Integrate into your own tools, schedule daily scans, or pipe output to Telegram.</p>
+    <div class="code-tabs">
+      <button class="code-tab active" data-tab="curl">cURL</button>
+      <button class="code-tab" data-tab="python">Python</button>
+      <button class="code-tab" data-tab="js">JavaScript</button>
+    </div>
+    <div class="code-block" id="code-block">
+      <pre id="code-curl" class="code-content active"><code>curl https://your-agent.railway.app/research/PLTR \
+  -H "X-Agent-Key: your-secret" \
+  | jq .</code></pre>
+      <pre id="code-python" class="code-content"><code>import requests
+
+r = requests.get(
+    "https://your-agent.railway.app/research/PLTR",
+    headers={"X-Agent-Key": "your-secret"}
+)
+print(r.text)</code></pre>
+      <pre id="code-js" class="code-content"><code>const res = await fetch(
+  "https://your-agent.railway.app/research/PLTR",
+  { headers: { "X-Agent-Key": "your-secret" } }
+);
+console.log(await res.text());</code></pre>
+    </div>
+    <div class="endpoint-pills">
+      <span class="ep-pill">GET /research/{ticker}</span>
+      <span class="ep-pill">GET /brent</span>
+      <span class="ep-pill">GET /scan</span>
+    </div>
+  </div>
+</section>
+
+<!-- ── CLOSING CTA ──────────────────────────────────────────────────── -->
+<section id="closing" class="dark-section closing-section">
+  <div class="section-wrap closing-wrap">
+    <h2 class="closing-h2">Your portfolio deserves<br>institutional-grade research.</h2>
+    <p class="closing-sub">Built by an investor, for investors. No subscriptions, no paywalls — your own agent, running on your own stack.</p>
+    <div class="closing-input-wrap">
+      <input id="closing-ticker" class="closing-input" type="text" placeholder="PLTR" maxlength="20" autocomplete="off" spellcheck="false"/>
+      <button id="closing-btn" class="closing-btn">Research ▸</button>
+    </div>
+    <p class="closing-fine">Supports US equities and Indian NSE/BSE · Free to self-host</p>
+  </div>
+</section>
+
+<!-- ── FOOTER ────────────────────────────────────────────────────────── -->
+<footer class="dark-section">
+  <div class="footer-inner">
+    <div class="footer-left">
+      <svg class="footer-icon" viewBox="0 0 28 28" width="20" height="20" fill="none">
+        <circle cx="14" cy="14" r="12" stroke="#C9963A" stroke-width="1.5" opacity="0.5"/>
+        <circle cx="14" cy="14" r="5" fill="#0E7B6C"/>
+      </svg>
+      <span>Stock Research Agent</span>
+    </div>
+    <div class="footer-center">
+      <a href="/docs" target="_blank">API Docs</a>
+      <span class="footer-sep">·</span>
+      <a href="/health" target="_blank">Health</a>
+      <span class="footer-sep">·</span>
+      <span class="footer-disclaimer">Not financial advice</span>
+    </div>
+    <div class="footer-right">Built with Perplexity · yfinance</div>
+  </div>
+</footer>
+
+<!-- ── SETTINGS DRAWER (for key) ────────────────────────────────────── -->
+<div id="key-overlay" class="key-overlay"></div>
+<aside id="key-drawer" class="key-drawer">
+  <div class="kd-head"><h3>Agent Key</h3><button id="kd-close" class="kd-close">✕</button></div>
+  <div class="kd-body">
+    <p class="kd-hint">Required for full AI research reports. Set to your <code>AGENT_SECRET</code>.</p>
+    <input id="kd-input" type="password" class="kd-input" placeholder="Enter key…" autocomplete="off"/>
+    <button id="kd-save" class="btn btn-primary btn-full">Save</button>
+    <div id="kd-msg" class="kd-msg"></div>
+  </div>
+</aside>
+
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script src="/static/v2/app.js?v=4"></script>
+</body>
+</html>

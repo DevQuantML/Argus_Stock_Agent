@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>ARGUS://TERMINAL</title>
+<meta name="description" content="Brent-gated equity research terminal. Live quant, staged AI research, one clear verdict."/>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%23060810'/%3E%3Cpath d='M6 23 L16 7 L26 23' stroke='%23E8900A' stroke-width='2.5' fill='none' stroke-linejoin='round'/%3E%3Cpath d='M11 19 h10' stroke='%23E8900A' stroke-width='2.5'/%3E%3C/svg%3E"/>
+<!-- Blocking, non-module: applies accent/tempo/CRT before first paint. -->
+<script src="/static/js/theme-boot.js?v=15"></script>
+<link rel="stylesheet" href="/static/style.css?v=15"/>
+</head>
+<body>
+
+<a class="skip-link" href="#cmd">Skip to command line</a>
+<div id="crt" aria-hidden="true"></div>
+<div id="gate" class="gate"></div>
+
+<!-- ══════════════ BOOT ══════════════ -->
+<div id="boot">
+  <div class="boot-box">
+    <pre class="boot-art" aria-label="ARGUS"> █████╗ ██████╗  ██████╗ ██╗   ██╗███████╗
+██╔══██╗██╔══██╗██╔════╝ ██║   ██║██╔════╝
+███████║██████╔╝██║  ███╗██║   ██║███████╗
+██╔══██║██╔══██╗██║   ██║██║   ██║╚════██║
+██║  ██║██║  ██║╚██████╔╝╚██████╔╝███████║
+╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝  ╚═════╝ ╚══════╝</pre>
+    <div class="boot-tag">ALL-SEEING RESEARCH. ONE CLEAR VERDICT.</div>
+    <div class="boot-hd">
+      <span class="acc">ARGUS://TERMINAL v2.0</span>
+      <span class="dim">INITIALIZING…</span>
+    </div>
+    <div id="boot-log" aria-live="polite"></div>
+    <div id="boot-skip">PRESS ANY KEY TO SKIP</div>
+  </div>
+</div>
+
+<!-- ══════════════ TERMINAL ══════════════ -->
+<div id="term">
+
+  <!-- HEADER -->
+  <header id="hdr">
+    <div class="hdr-l">
+      <span class="brand">ARGUS://TERMINAL</span>
+      <span class="brand-v">v2.0</span>
+      <button id="btn-brent" class="btn-g" type="button" style="display:none"
+              aria-expanded="false" aria-controls="col1">BRENT</button>
+      <button id="btn-watch" class="btn-g" type="button" style="display:none"
+              aria-expanded="false" aria-controls="col2">WATCHLIST</button>
+      <nav class="views" aria-label="View">
+        <button class="vb on" type="button" data-view="research">RESEARCH</button>
+        <button class="vb"    type="button" data-view="portfolio">PORTFOLIO</button>
+        <button class="vb"    type="button" data-view="profile">PROFILE</button>
+      </nav>
+    </div>
+    <div id="hdr-status">
+      <span id="st-provider" class="stat"><span class="d"></span><span class="t">PROVIDER</span></span>
+      <span id="st-brent"    class="stat"><span class="d"></span>BRENT FEED</span>
+      <span id="st-geo"      class="stat"><span class="d"></span>GEO MONITOR</span>
+    </div>
+    <div class="hdr-r">
+      <span id="key-state" class="hdr-key">QUANT ONLY</span>
+      <button id="btn-data" class="btn-g" type="button">⚙ DATA</button>
+      <button id="btn-cfg"  class="btn-g" type="button">◈ CONFIG</button>
+    </div>
+  </header>
+
+  <!-- TICKER TAPE -->
+  <div id="tape-wrap">
+    <button id="btn-tape" type="button" aria-label="Pause ticker tape">⏸</button>
+    <div class="tape-view"><div id="tape"></div></div>
+  </div>
+
+  <!-- COMMAND BAR -->
+  <div id="cmdbar">
+    <span class="prompt">ARGUS://&gt;</span>
+    <input id="cmd" type="text" autocomplete="off" spellcheck="false"
+           placeholder="research PLTR  ·  scan  ·  brent  ·  help"
+           aria-label="Command line"/>
+    <span class="kbd">↵ ENTER</span>
+    <button id="btn-exec" class="btn" type="button">EXECUTE</button>
+    <div id="cmd-hint" class="hidden"></div>
+  </div>
+
+  <!-- MAIN GRID -->
+  <div id="grid">
+
+    <!-- COLUMN 1 · BRENT + GEO -->
+    <div id="col1" class="col">
+      <div class="blk">
+        <div class="blk-h">
+          <span class="panel-h"><button class="chev" type="button" data-panel="brent" aria-label="Collapse Brent">▾</button>BRENT://SIGNAL</span>
+          <span style="display:flex;align-items:center;gap:6px">
+            <span id="brent-live" class="chiplive off"><span class="d">●</span> —</span>
+            <button id="col1-close" class="col-close" type="button" aria-label="Close Brent panel">✕</button>
+          </span>
+        </div>
+        <div id="brent-px" class="tabnum">$--.--</div>
+        <div id="brent-zone">AWAITING FEED</div>
+        <div id="brent-act"></div>
+        <div id="brent-fw"></div>
+      </div>
+      <div class="blk-grow">
+        <div class="blk-h">
+          <span class="panel-h"><button class="chev" type="button" data-panel="geo" aria-label="Collapse Geo">▾</button>GEO://SIGNAL</span>
+          <span id="geo-count" class="chiplive off"><span class="d">●</span> —</span>
+        </div>
+        <div id="geo"></div>
+      </div>
+    </div>
+
+    <!-- COLUMN 2 · WATCHLIST + COMMANDS -->
+    <div id="col2" class="col">
+      <div class="blk-grow" style="border-bottom:1px solid var(--border)">
+        <div class="blk-h">
+          <span class="panel-h"><button class="chev" type="button" data-panel="watch" aria-label="Collapse Watchlist">▾</button>WATCHLIST://ACTIVE</span>
+          <span style="display:flex;align-items:center;gap:6px">
+            <span id="watch-count" class="chiplive off"><span class="d">●</span> —</span>
+            <button id="btn-add" class="btn-g" type="button" title="Add instrument">+</button>
+            <button id="col2-close" class="col-close" type="button" aria-label="Close watchlist panel">✕</button>
+          </span>
+        </div>
+        <div id="watch-head">
+          <span data-sort="sym">SYM</span>
+          <span data-sort="last" style="text-align:right">LAST</span>
+          <span data-sort="chg"  style="text-align:right">P&amp;L%</span>
+          <span data-sort="sig"  style="text-align:right">SIGNAL</span>
+          <span style="text-align:center">⚑</span>
+        </div>
+        <div id="watch-rows"></div>
+        <div class="watch-foot">
+          <span id="watch-tally" class="dim">—</span>
+          <span id="watch-pnl" class="tabnum dim">—</span>
+        </div>
+      </div>
+      <div class="blk" style="border-bottom:none">
+        <div class="panel-h" style="margin-bottom:8px"><button class="chev" type="button" data-panel="cmds" aria-label="Collapse Commands">▾</button>COMMANDS://REF</div>
+        <div class="cmdref" id="cmdref">
+          <div data-cmd="research "><b>research</b> <i>&lt;SYM&gt;</i> <span>full staged brief</span></div>
+          <div data-cmd="quant "><b>quant</b> <i>&lt;SYM&gt;</i> <span>free metrics only</span></div>
+          <div data-cmd="chart "><b>chart</b> <i>&lt;SYM&gt;</i> <span>price + reference lines</span></div>
+          <div data-cmd="scan"><b>scan</b> <span>check every holding</span></div>
+          <div data-cmd="brent"><b>brent</b> <span>framework detail</span></div>
+          <div data-cmd="pos "><b>pos</b> <i>&lt;SYM&gt;</i> <span>open inspector</span></div>
+          <div data-cmd="add "><b>add</b> <i>&lt;SYM&gt;</i> <span>track an instrument</span></div>
+          <div data-cmd="rm "><b>rm</b> <i>&lt;SYM&gt;</i> <span>stop tracking</span></div>
+          <div data-cmd="portfolio"><b>portfolio</b> <span>P&amp;L · XIRR · outlook</span></div>
+          <div data-cmd="profile"><b>profile</b> <span>holdings &amp; settings</span></div>
+          <div data-cmd="focus"><b>focus</b> <span>hide side panels</span></div>
+          <div data-cmd="clear"><b>clear</b> <span>reset output</span></div>
+          <div data-cmd="help"><b>help</b> <span>all commands</span></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- COLUMN 3 · RESEARCH -->
+    <div id="col3" class="col">
+      <div class="res-wrap">
+        <div class="res-hd">
+          <span id="res-label" class="panel-h">ARGUS://RESEARCH</span>
+          <div style="display:flex;align-items:center;gap:7px">
+            <button id="btn-stop" class="btn-danger hidden" type="button">■ STOP</button>
+            <!-- Reading mode belongs beside the thing it widens, not in the
+                 settings cluster on the far side of the header. -->
+            <button id="btn-focus" class="btn-g" type="button"
+                    title="Reading mode — hide the side panels (Esc restores)">⛶ FOCUS</button>
+            <span id="res-status">READY</span>
+          </div>
+        </div>
+        <div id="tabs"></div>
+        <div id="out" aria-live="polite"></div>
+      </div>
+
+      <!-- INSPECTOR -->
+      <aside id="insp" aria-label="Position inspector">
+        <div class="insp-hd">
+          <span id="insp-title" class="acc" style="font-size:9px;letter-spacing:.08em">INSPECTOR://—</span>
+          <div style="display:flex;align-items:center;gap:8px">
+            <span class="dim" style="font-size:8px;letter-spacing:.06em">ESC</span>
+            <button id="insp-close" type="button" aria-label="Close inspector">✕</button>
+          </div>
+        </div>
+        <div id="insp-body"></div>
+      </aside>
+    </div>
+
+    <!-- Dismiss layer for the narrow-viewport slide-ins. Covers the grid only,
+         so the command line above stays usable while a panel is open.
+         Deliberately placed after the columns: its visibility is driven purely
+         by CSS (#col1.open ~ #scrim), so widening the window past a breakpoint
+         retires it automatically. No resize listener to go stale. -->
+    <button id="scrim" type="button" tabindex="-1" aria-label="Close panel"></button>
+  </div>
+</div>
+
+<div id="toasts" aria-live="polite"></div>
+
+<script type="module" src="/static/js/app.js?v=15"></script>
+</body>
+</html>

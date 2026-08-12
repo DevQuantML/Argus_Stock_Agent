@@ -1,0 +1,34 @@
+# ── Files that must never enter a Docker image or git repo ────────────────
+
+# Secrets — NEVER commit these
+.env
+.env.*
+!.env.example
+
+# Local database. COPY . . would otherwise bake the development book —
+# positions, cost basis, thesis text, profile, session hashes — into an image
+# layer, where anyone with pull access can read it. A container must start with
+# an empty DB and seed from config.
+argus.db
+argus.db-wal
+argus.db-shm
+
+# Agent tooling. .claude/worktrees/ holds a full second checkout of this repo.
+.claude
+
+# Python cache
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+
+# Git history (no reason to copy this into the image)
+.git
+.gitignore
+.gitattributes
+
+# Dev/editor artifacts
+*.md
+.vscode
+.idea
+*.log

@@ -1,0 +1,47 @@
+# ── Files that must never be committed to git ─────────────────────────────
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Real portfolio data — see config.py's local-override import at the bottom
+config_local.py
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Logs
+*.log
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Agent tooling. .claude/worktrees/ holds full checkouts of this repo — a
+# broad `git add` would otherwise commit a second copy of the tree.
+.claude/
+
+# Local database — profile, positions, watchlist, sessions
+argus.db
+argus.db-wal
+argus.db-shm

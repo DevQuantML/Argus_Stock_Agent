@@ -1,0 +1,18 @@
+# Versions pinned to what's currently installed and pip-audit-clean. Bump
+# deliberately, not implicitly — an unpinned >= lets a routine `pip install`
+# pull in a newer, unvetted release with no signal that anything changed.
+
+# Research engine — the OpenAI SDK is the client for BOTH providers:
+# Perplexity (api.perplexity.ai) and Groq (api.groq.com), which are both
+# OpenAI-compatible. Removing this breaks all AI research.
+openai==2.52.0
+
+# Stock data
+yfinance==1.5.2
+
+# Cloud API server
+fastapi==0.141.1
+uvicorn==0.52.0
+
+# .env file loading (local dev + local Docker runs)
+python-dotenv==1.2.2
