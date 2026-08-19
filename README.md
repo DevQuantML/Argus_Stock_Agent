@@ -235,7 +235,9 @@ git clone https://github.com/DevQuantML/Argus_Stock_Agent.git
 cd Argus_Stock_Agent
 
 python -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
+source .venv/bin/activate        # Bash / macOS / Linux
+# Windows cmd:        .venv\Scripts\activate
+# Windows PowerShell: .venv\Scripts\Activate.ps1
 
 pip install -r requirements.txt
 cp .env.example .env             # then edit .env — see below

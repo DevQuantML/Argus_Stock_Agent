@@ -86,6 +86,13 @@ strip, and the comment there explains why reversing it silently weakens the guar
 - **Never let an animation gate the pipeline.** Background tabs clamp
   `setTimeout` to ~1s, which once turned the typewriter into an indefinite stall
   that blocked a paid run mid-flight.
+- **`static/v2/` is NOT served and must not be.** It exists as unwired source
+  for reference. Do not add a `/v2` route: that code stores `AGENT_SECRET` in
+  `localStorage` (which is what the HttpOnly session cookie exists to prevent),
+  loads marked.js and Google Fonts from CDNs (breaking the zero-external-request
+  CSP rule), and pipes model output through marked into `innerHTML` without
+  HTML-escaping (an XSS sink). Details are in `api.py` above the `/static/`
+  route handler.
 
 ## Reporting a security issue
 

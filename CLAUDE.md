@@ -41,12 +41,20 @@ not.
 api.py                        FastAPI app — routes, auth, rate limit, CSP
 config.py                     MY_PORTFOLIO, WATCHLIST, BRENT_LEVELS, GEO_TRANSMISSION
 main.py                       CLI: python main.py PLTR | scan | brent
+store.py                      SQLite — positions, watchlist, sessions, profile
 tools/perplexity_research.py  the ONLY AI path — prompts, modules, synthesis
 tools/quant.py                DCF, ROIC, FCF yield, PEG, Sharpe, Beta (pure Python)
-tools/stock_data.py           yfinance fundamentals + price history
+tools/fundamentals.py         annual statements with provenance (imported by quant.py)
+tools/fx.py                   currency conversion for foreign-listed names (ADRs)
+tools/stock_data.py           yfinance prices + live-book context
 tools/oil_price.py            Brent futures → macro gate signal
 tools/validator.py            validate_ticker, guard_tool_output, sanitize_question
+tools/xirr.py                 money-weighted return for the portfolio analytics route
 static/                       frontend — index.html, style.css, js/*.js (ES modules)
+static/v2/                    NOT SERVED — unwired source kept for reference only;
+                              do not add a /v2 route (see api.py:592 for why)
+scripts/verify_*.py           free harnesses — run before any PR
+docs/HANDOFF.md               design decisions, open items, verification log
 ```
 
 ### Provider policy
