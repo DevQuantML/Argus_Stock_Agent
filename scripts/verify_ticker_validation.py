@@ -110,16 +110,21 @@ def verify_validator() -> None:
 
 def verify_frontend_regexes() -> None:
     """
-    Both frontends must let '-' and '=' survive client-side sanitising.
+    The main frontend must let '-' and '=' survive client-side sanitising.
 
     A stripped hyphen is the silent failure mode: the request still succeeds,
     so it surfaces as an empty panel rather than an error.
+
+    static/v2/ was removed from the tree (the files stored AGENT_SECRET in
+    localStorage and loaded external CDN scripts). The character-class regex
+    guarded in the check below covers the same BRK-B / BF-B defect the v2
+    sanitiser check used to assert.
     """
     print("\nfrontend sanitisers -- '-' and '=' must survive")
     # Matches the character class of any .replace(/[^...]/g, '') sanitiser.
     pattern = re.compile(r"replace\(/\[\^([A-Z0-9.=\\-]*)\]/g")
 
-    for rel in ["static/js/app.js", "static/v2/app.js"]:
+    for rel in ["static/js/app.js"]:
         path = _ROOT / rel
         if not path.exists():
             check(rel, False, "file not found")
@@ -199,11 +204,14 @@ def verify_routes() -> None:
         check(path, response.status_code == 200,
               f"{response.status_code} {body.get('error', '')}".strip())
 
-    # The v2 page is served but falls outside is_page in the CSP middleware, so
-    # its own stylesheet and script are blocked. Assert the current state so a
-    # future CSP change is a visible diff here rather than a silent one.
+    # /v2 matches no route (returns 404). It still passes through the
+    # add_security_headers middleware and receives the API's restrictive CSP,
+    # because only "/" and "/static/*" match is_page. This asserts the catch-all
+    # guarantee: any unrecognized path is locked down, regardless of content.
+    # static/v2/ was removed from the tree; this check now documents the
+    # middleware behaviour rather than a specific page.
     csp = client.get("/v2").headers.get("content-security-policy", "")
-    check("/v2 CSP (documents v2 being script-blocked)",
+    check("/v2 CSP (catch-all: unrecognised paths get default-src 'none')",
           csp.startswith("default-src 'none'"), csp[:34])
 
 

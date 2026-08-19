@@ -589,20 +589,10 @@ def serve_frontend():
     return HTMLResponse(html_file.read_text(encoding="utf-8"))
 
 
-# The v2 landing-page frontend is NOT served. static/v2/ stays in the tree as
-# unwired source, but the route is gone until it is rewritten, because that
-# code contradicts three decisions this app made deliberately:
-#   * it keeps AGENT_SECRET in localStorage (static/v2/app.js), which is
-#     exactly what the HttpOnly session cookie above exists to prevent;
-#   * it loads marked.js and Google Fonts from CDNs, breaking the
-#     zero-external-request rule the CSP enforces;
-#   * it pipes model output through marked into innerHTML, and marked does not
-#     escape HTML — that is an XSS sink. The main frontend routes model output
-#     through md.js, which escapes before parsing.
-# None of that was reachable, because /v2 matched neither arm of the is_page
-# test below and so received the API's "default-src 'none'" policy, which
-# stopped the page working at all. Do NOT "fix" that by adding /v2 to is_page:
-# it would switch all three problems on at once.
+# /v2 — the landing-page frontend was removed (see git history for static/v2/).
+# It stored AGENT_SECRET in localStorage, loaded external CDN scripts (violating
+# font-src/script-src 'self'), and piped model output into innerHTML via marked
+# without HTML-escaping. Any request to /v2 returns 404 with default-src 'none'.
 
 
 @app.get("/static/{filename:path}", include_in_schema=False)

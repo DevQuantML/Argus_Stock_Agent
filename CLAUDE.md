@@ -51,8 +51,6 @@ tools/oil_price.py            Brent futures → macro gate signal
 tools/validator.py            validate_ticker, guard_tool_output, sanitize_question
 tools/xirr.py                 money-weighted return for the portfolio analytics route
 static/                       frontend — index.html, style.css, js/*.js (ES modules)
-static/v2/                    NOT SERVED — unwired source kept for reference only;
-                              do not add a /v2 route (see api.py:592 for why)
 scripts/verify_*.py           free harnesses — run before any PR
 docs/HANDOFF.md               design decisions, open items, verification log
 ```
