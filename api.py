@@ -61,11 +61,24 @@ from tools.perplexity_research import (
 from tools.stock_data import get_price_and_fundamentals, get_price_history
 from tools.xirr import xirr
 
-store.bootstrap()
-
 _STATIC_DIR = Path(__file__).parent / "static"
 
 logger = logging.getLogger(__name__)
+
+try:
+    store.bootstrap()
+except Exception as _bootstrap_exc:
+    # A failure here means the DB cannot be created or opened. uvicorn would
+    # otherwise surface a raw SQLite traceback buried in its import output.
+    # Exit loudly with a single actionable line instead.
+    logger.critical(
+        "Fatal: store.bootstrap() failed — server cannot start.\n"
+        "  Check the path set by ARGUS_DB (default: argus.db next to store.py),\n"
+        "  ensure the directory exists and is writable.\n"
+        "  Underlying error: %s",
+        _bootstrap_exc,
+    )
+    raise SystemExit(1) from _bootstrap_exc
 
 app = FastAPI(
     title="Stock Research Agent",

@@ -462,12 +462,12 @@ class goes stale — correct by construction, no listener to fail. Verified: at 
 |---|---|---|
 | ~~HIGH~~ | ~~Slide-in panels covered the header/command line~~ — **fixed 2026-08-07**, see §3 | `index.html`, `style.css`, `app.js` |
 | ~~CRITICAL~~ | ~~Twelve user-data routes had no auth — anonymous read and write of the book~~ — **fixed 2026-08-08**, see §2 | `api.py` |
-| **HIGH** | `X-Forwarded-For` spoofing bypasses the rate limiter, making `AGENT_SECRET` brute-forceable — **open**, see §3 | `api.py` `_client_ip` |
-| MEDIUM | Public routes are unmetered; `/api/portfolio` amplifies one request into 8 yfinance calls — **open**, see §3 | `api.py` |
-| MEDIUM | Stored `thesis`/`note` reach the provider prompt unsanitised — **open**, see §3 | `tools/perplexity_research.py` |
+| ~~HIGH~~ | ~~`X-Forwarded-For` spoofing bypasses the rate limiter, making `AGENT_SECRET` brute-forceable~~ — **fixed 2026-08-13**, see §3 | `api.py` `_client_ip` |
+| ~~MEDIUM~~ | ~~Public routes are unmetered; `/api/portfolio` amplifies one request into 8 yfinance calls~~ — **fixed 2026-08-13**, see §3 | `api.py` |
+| ~~MEDIUM~~ | ~~Stored `thesis`/`note` reach the provider prompt unsanitised~~ — **fixed 2026-08-13**, see §3 | `tools/perplexity_research.py` |
 | LOW | Unknown ticker returns HTTP 200 with all-null fields — `null` price is the only reliable signal | `tools/stock_data.py`, callers |
 | LOW | Rate limiter (20 req/min) only works with `--workers 1` — multi-worker deploys have no guard | `api.py` |
-| LOW | `requirements.txt` unpinned (`>=` floors, no lockfile); `pip-audit` never run | `requirements.txt` |
+| ~~LOW~~ | ~~`requirements.txt` unpinned (`>=` floors, no lockfile); `pip-audit` never run~~ — **fixed 2026-08-12**, see §3 | `requirements.txt` |
 | INFO | ROIC, FCF, and DCF are annual (as-of last fiscal close), not TTM — disclosed in UI but may surprise | `tools/fundamentals.py` |
 | INFO | `fcf_cagr()` declines with <3 data points or any sign change in the series — some tickers get no DCF | `tools/fundamentals.py` |
 
@@ -476,10 +476,11 @@ class goes stale — correct by construction, no listener to fail. Verified: at 
 ## 6. Next Implementation Steps
 
 ### Immediate (one session) — before any public deploy
-1. **Close the `X-Forwarded-For` bypass** (§3, HIGH) and **rotate `AGENT_SECRET`**.
-   The rotation is a one-liner and removes the risk on its own; do it even if the
-   code change waits.
-2. **Meter the public routes** (§3, MEDIUM).
+~~1. **Close the `X-Forwarded-For` bypass** (§3, HIGH) and **rotate `AGENT_SECRET`**.~~
+   ~~The rotation is a one-liner and removes the risk on its own; do it even if the~~
+   ~~code change waits.~~ — **done 2026-08-13**. `AGENT_SECRET` still needs rotation
+   locally; the bypass in the code is closed.
+~~2. **Meter the public routes** (§3, MEDIUM).~~ — **done 2026-08-13**.
 
 ### Short term (Tier 1 from the plan)
 3. **Citation persistence** — `research_runs` table or file store so the user can inspect the
