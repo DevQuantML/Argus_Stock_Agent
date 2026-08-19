@@ -371,6 +371,7 @@ python scripts/verify_ticker_validation.py
 python scripts/verify_proxy_trust.py      # 17 assertions — proxy trust boundary
 python scripts/verify_hardening.py        # 48 assertions — rate limiter + prompt fences
 python scripts/verify_consistency.py      # 12 assertions — one quantity, one value
+python scripts/verify_docs.py             # architecture table matches the actual file tree
 ```
 
 These live in the repo deliberately. A verification you cannot re-run is a rumour.
