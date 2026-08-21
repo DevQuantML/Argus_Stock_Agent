@@ -22,6 +22,7 @@ they were reading different books.
 Run:  python scripts/verify_consistency.py
 """
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -104,6 +105,32 @@ def main():
 
     check("stock_data.py no longer reads the config seed for position context",
           "if ticker in MY_PORTFOLIO:" in src, False)
+
+    # ── 3. One asset version, not several ─────────────────────────────────
+    # Same defect class as the P&L mismatch above, in the module graph rather
+    # than in arithmetic: ES modules are keyed by full URL, so api.js?v=15 and
+    # api.js?v=16 are two unrelated module instances with two unrelated copies
+    # of `auth`. views.js sat at ?v=15 while app.js/ui.js/index.html were at
+    # ?v=16, which meant SIGN OUT in the profile view cleared one auth cache
+    # while app.js kept reading the other and still believed the session was
+    # live. The accent swatches had the matching bug: prefs.set() fired the
+    # listener array of an instance the chart had never subscribed to, so the
+    # SVG kept the old colour.
+    #
+    # Guard the invariant, not the number: every ?v= in the tree must agree.
+    # This stays true across future bumps without editing the harness.
+    versions: dict[str, list[str]] = {}
+    for path in sorted((ROOT / "static").rglob("*")):
+        if path.suffix not in {".js", ".html"} or not path.is_file():
+            continue
+        for v in re.findall(r"\?v=(\d+)", path.read_text(encoding="utf-8")):
+            versions.setdefault(v, []).append(path.relative_to(ROOT).as_posix())
+
+    check(f"every ?v= asset version in static/ agrees (found: {sorted(versions) or 'none'})",
+          len(versions), 1)
+    if len(versions) > 1:
+        for v, files in sorted(versions.items()):
+            print(f"          v={v}: {', '.join(sorted(set(files)))}")
 
 
 try:
