@@ -256,12 +256,28 @@ js/tour.js            five-step coach-mark orientation (no imports, no network)
   dead instance to a cloud platform, and one page load pulls several assets.
   Buckets are namespaced, so the middleware and `require_auth` never charge the
   same request to one budget.
-- **Stored `thesis` / `note` / `sector` reach the provider prompt**, so they go
-  through `sanitize_prompt_text()` and arrive fenced in `<<<UNTRUSTED:…>>>`
-  markers that the text inside cannot forge. Inside that function, fence
-  stripping runs *before* the HTML strip: `_HTML_TAG_RE` is `<[^>]+>` and will
-  eat a `<<<END:X>` prefix, which destroys the evidence and makes the real guard
-  a no-op. `scripts/verify_hardening.py` asserts it.
+- **Everything caller-supplied that reaches a provider prompt is fenced**, and
+  there are now three such inputs: stored `thesis`/`note`/`sector`, the posted
+  synthesis body, and the `question` query parameter. All go through
+  `sanitize_prompt_text()` and arrive inside `<<<UNTRUSTED:…>>>` markers the
+  text cannot forge. Inside that function, fence stripping runs *before* the
+  HTML strip: `_HTML_TAG_RE` is `<[^>]+>` and will eat a `<<<END:X>` prefix,
+  which destroys the evidence and makes the real guard a no-op.
+  `scripts/verify_hardening.py` asserts it.
+
+  **That ordering is why `question` is fenced with ONE call, not
+  `sanitize_prompt_text(sanitize_question(q))`.** Chaining them puts the HTML
+  strip first, so a forged `<<<END:QUESTION>>>` is eaten down to a bare `>>`
+  before the fence-stripper ever sees it. The forged fence is broken either
+  way — but chained it is broken by accident of a regex's shape, and editing
+  that regex silently removes the protection. `sanitize_prompt_text` takes the
+  same length cap as a parameter (`max_len=_MAX_QUESTION_LEN`), so nothing is
+  lost by dropping the chain. The harness asserts both the neutralisation and
+  the absence of the chained form.
+
+  `question` is fenced inside `run_research_module`, not at the API boundary,
+  so the route and the CLI are both covered — a guard that runs for only some
+  callers is a guard waiting to be bypassed.
 - **A session is a tier, never a boolean.** `store.session_info()` returns
   `{tier, guest_key_id, expires_at}`; `api._auth_ctx()` turns that into an
   `AuthCtx`. The old `session_valid() -> bool` was the whole vulnerability:

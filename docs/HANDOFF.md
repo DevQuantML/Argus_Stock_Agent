@@ -787,6 +787,26 @@ steering three calls on the *owner's* provider account. Every field now goes
 through `sanitize_prompt_text()`, for every tier — a guard that runs for only
 some callers is a guard waiting to be bypassed.
 
+**The `question` parameter was the last raw input on the paid path.** The
+synthesis body was fenced when guests gained access to it, but its sibling on
+the same newly-guest-reachable pipeline —
+`GET /api/research/{t}/report?question=…` — still reached `_research_prompt()`
+through `sanitize_question()` alone, which caps length and strips tags but
+neither redacts injection phrases nor marks where the untrusted span ends. Now
+fenced with `sanitize_prompt_text(question, max_len=_MAX_QUESTION_LEN,
+label="QUESTION")`, inside `run_research_module` so the CLI is covered too, and
+the prompt states that the fenced block is data rather than instructions.
+
+The first attempt at this fix was wrong in an instructive way: it chained
+`sanitize_prompt_text(sanitize_question(q))`, which reverses the order that
+matters. `sanitize_question` strips HTML first, and `_HTML_TAG_RE` eats the
+`<<<END:QUESTION>` prefix of a forged fence, leaving `>>`. The forged fence ends
+up broken either way, so the chained version *looked* correct — but it was
+broken by accident of a regex's shape rather than on purpose, exactly the
+failure mode `sanitize_prompt_text`'s internal ordering was written to avoid.
+Caught by a test that captured the actual prompt and asserted the forged marker
+was replaced with `[removed]`, not merely absent.
+
 **A "free" harness could have spent real money.** `api.py` calls `load_dotenv()`
 at import with the default `override=False`, which fills any name *absent* from
 the environment. Popping `PERPLEXITY_API_KEY` before importing `api` therefore
