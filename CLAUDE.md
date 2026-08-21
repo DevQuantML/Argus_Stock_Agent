@@ -38,10 +38,11 @@ not.
 ## Architecture
 
 ```
-api.py                        FastAPI app — routes, auth, rate limit, CSP
+api.py                        FastAPI app — routes, tiered auth, rate limit, CSP
 config.py                     MY_PORTFOLIO, WATCHLIST, BRENT_LEVELS, GEO_TRANSMISSION
 main.py                       CLI: python main.py PLTR | scan | brent
-store.py                      SQLite — positions, watchlist, sessions, profile
+store.py                      SQLite — positions, watchlist, sessions, profile,
+                              guest keys + dive budget, access requests
 tools/perplexity_research.py  the ONLY AI path — prompts, modules, synthesis
 tools/quant.py                DCF, ROIC, FCF yield, PEG, Sharpe, Beta (pure Python)
 tools/fundamentals.py         annual statements with provenance (imported by quant.py)
@@ -74,15 +75,30 @@ freshness must declare that degradation in its own output when
 | `AGENT_SECRET` | `.env` **and** the browser Settings drawer | A password you choose. Gates `/api/research/*` so nobody else spends your credits. |
 | `PERPLEXITY_API_KEY` | `.env` only | Provider credential. Never sent to the browser. |
 | `GROQ_API_KEY` | `.env` only | Fallback provider credential. Never sent to the browser. |
+| a **guest key** (`gk_…`) | issued by the owner, stored **hashed** in `guest_keys` | A 24-hour credential handed to one other person. Redeemed at `POST /api/session` like `AGENT_SECRET`, but yields a `tier='guest'` session: read-only on the book, and worth exactly **one** 5-stage research dive on **one** ticker. The raw key exists only in the approve response — the database holds SHA-256 and a 6-char display prefix. |
 
 ## Cost
 
 **AI research spends real money — roughly $0.21 for a full 5-module run.**
 
 Never trigger a paid research call to "check something works". The free paths
-(`/api/demo`, `/api/portfolio`, `/api/history`, `/api/brent`, `/health`) cover
-almost all verification. The frontend deliberately shows a cost-confirmation
+(`/api/demo`, `/api/portfolio`, `/api/history`, `/api/brent`, `/api/meta`,
+`/api/news`, `/api/earnings`, `/health`) cover almost all verification. The frontend deliberately shows a cost-confirmation
 modal before any paid stage; do not add a code path that bypasses it.
+
+## Access tiers
+
+Three of them, and every gate keys off the tier rather than "has a session":
+
+| Tier | How they arrive | What they get |
+|---|---|---|
+| **visitor** | "Continue without a key" on the landing — no session at all | Quant, charts, history, news, earnings, the Brent gate. Frontend-only tier; the server never issues it. |
+| **guest** | A 24-hour `gk_…` key the owner issued | Visitor features, plus **read-only** sight of the owner's book, plus exactly one 5-stage dive on one ticker. |
+| **owner** | `AGENT_SECRET` | Everything, plus the admin view. |
+
+`state.tier` in `app.js` mirrors `api.auth.effectiveTier()`. The guest allowance
+is rendered as a **count** (`PLTR 2/5`), never a spent/unspent flag — the budget
+is five separately consumable stages, and a guest one stage in still has four.
 
 ## Frontend — ARGUS://TERMINAL
 
@@ -98,7 +114,9 @@ js/app.js             boot, state, command parser, staged pipeline
 js/ui.js              every renderer — panels, pipeline, verdict, modals
 js/chart.js           SVG price chart + sparklines
 js/md.js              XSS-safe markdown
-js/api.js             fetch layer, agent-key storage, error normalisation
+js/api.js             fetch layer, tiered auth state, error normalisation
+js/copy.js            disclaimer / privacy / freshness — defined once, imported everywhere
+js/tour.js            five-step coach-mark orientation (no imports, no network)
 ```
 
 - **No build step, no npm, no CDN.** Everything is same-origin — the CSP is
@@ -127,8 +145,12 @@ js/api.js             fetch layer, agent-key storage, error normalisation
 - **Init steps are individually try/caught** in `app.js`. A single missing
   alias in `wire()` once silently killed the whole command line while every
   panel still looked healthy — failures now toast loudly.
-- Bump the `?v=` on `style.css`, `app.js`, and the sub-module imports in
-  `app.js` and `ui.js` together whenever frontend files change.
+- Bump the `?v=` on `style.css`, `index.html` and **every** sub-module import
+  — `app.js`, `ui.js` and `views.js` each carry their own — together whenever
+  frontend files change. `grep -rn '?v=' static/` must show exactly one number,
+  and `verify_consistency.py` fails the build if it does not. This is not
+  housekeeping: two versions means two module instances and two `auth` objects,
+  which shipped once already (see the gotcha below).
 
 ## Gotchas
 
@@ -240,6 +262,88 @@ js/api.js             fetch layer, agent-key storage, error normalisation
   stripping runs *before* the HTML strip: `_HTML_TAG_RE` is `<[^>]+>` and will
   eat a `<<<END:X>` prefix, which destroys the evidence and makes the real guard
   a no-op. `scripts/verify_hardening.py` asserts it.
+- **A session is a tier, never a boolean.** `store.session_info()` returns
+  `{tier, guest_key_id, expires_at}`; `api._auth_ctx()` turns that into an
+  `AuthCtx`. The old `session_valid() -> bool` was the whole vulnerability:
+  `require_auth` accepted *any* valid session, so the moment a second credential
+  class existed its holder was indistinguishable from the operator and inherited
+  `POST /api/portfolio/outlook` — ~$0.06 a call with no budget concept at all.
+  **Never reintroduce a bare-boolean credential check.** `require_owner` guards
+  the five book-mutating routes plus the two unbudgeted paid ones, and answers a
+  guest with **403, not 401** — a 401 sends the frontend to the unlock screen and
+  asks a guest for an owner secret they were never given.
+- **The guest budget is per-module, and the PRIMARY KEY is the lock.** A dive is
+  five stages (4 module GETs + synthesis). A ticker-only budget would still let a
+  guest re-fire `/report` a hundred times. `guest_key_uses` has
+  `PRIMARY KEY (key_id, module)`, and `consume_guest_unit()` claims a stage with
+  one `INSERT` inside `BEGIN IMMEDIATE` — there is no read-then-write window,
+  which matters because the four module calls of a staged run overlap.
+  `scripts/verify_access.py` races 8 threads at one stage and asserts exactly one
+  winner. **Everything in that function talks to the raw connection**: `_lock` is
+  a plain non-reentrant `threading.Lock` and `_rows`/`_exec` both acquire it, so
+  calling either from inside the lock deadlocks on the first guest research call.
+  The surrounding file's idiom is the opposite.
+- **Refund only what provably cost nothing.** `_refund_if_free()` returns a stage
+  only when no provider was configured — that raises before any network call.
+  Any other failure keeps the stage: a mid-flight timeout may already have been
+  billed, and refunding it would be unlimited retries of a paid operation. A
+  refund never unbinds `dive_ticker`, so "one dive, one ticker" stays a rule with
+  no exception to explain in the UI.
+- **The sessions migration lives in `_connect()`, not `bootstrap()`.**
+  `bootstrap()` returns early once the `seeded` meta flag is set, so a migration
+  placed there would never run on exactly the established databases that need it.
+  `_migrate()` inspects `PRAGMA table_info` rather than tracking a version, so
+  running it twice is a no-op by construction.
+- **A "free" harness must set provider keys to `""`, never pop them.** `api.py`
+  calls `load_dotenv()` at import with the default `override=False`, which fills
+  any name *absent* from the environment — so popping `PERPLEXITY_API_KEY` and
+  then importing `api` hands the harness a live provider client off the real
+  `.env`. Setting the name to an empty string keeps it present, dotenv skips it,
+  and `_get_provider()` falls through to its `ValueError`. `verify_access.py`
+  does this, asserts the emptiness *after* import, and additionally counts
+  provider invocations — with a positive control proving the counter can fire, so
+  "never entered" is evidence rather than a monkeypatch that silently missed.
+- **`POST /api/research/{t}/synthesis` fences its body.** `_synthesis_prompt()`
+  interpolates the four posted module strings and `run_synthesis` fires three
+  paid calls off them. While the only caller was the operator's own browser
+  echoing back model output that was a trusted loop; guest access makes it
+  untrusted input steering three calls on the *owner's* provider account. Every
+  field goes through `sanitize_prompt_text()` for **every tier** — a guard that
+  runs for only some callers is a guard waiting to be bypassed.
+- **`/api/meta` is public; `/api/info` is not, and the difference is
+  `GEO_TRANSMISSION`.** `BRENT_LEVELS` is never overridden by `config_local.py`
+  (the override imports only `MY_PORTFOLIO`, `WATCHLIST`, `GEO_TRANSMISSION`), so
+  the Brent ladder is always the published framework and is safe to serve to a
+  keyless visitor. `GEO_TRANSMISSION` *is* overridden and its values name real
+  holdings by construction (`"AAPL (supply chain exposure)"`), which makes the
+  geo map a description of the book. **Do not loosen `/api/info` to feed visitor
+  mode** — add to `/api/meta` instead. `verify_access.py` plants a sentinel
+  ticker in `GEO_TRANSMISSION` and asserts it never reaches `/api/meta`.
+- **The tour sits at z-index 55 — below the modal layer at 60.** The
+  cost-confirmation dialog lives at 60 and is the project's guarantee against
+  unintended spend. Above it, `#tour` would dim that dialog and, since its root
+  takes pointer events across the viewport, swallow the click on CANCEL.
+  `startTour()` additionally refuses to run while any `.ov` or the gate is open.
+- **Request emails and notes are attacker-supplied and land in the owner's
+  authenticated page.** Everything in the admin view is written with
+  `textContent`/`el(tag, cls, text)` — never interpolated into a template,
+  escaped or not. The CSP would stop an injected `<script>` executing, but markup
+  injection could still deface the view, and there is no reason to lean on the
+  CSP for a value that has no business being markup.
+- **A denied access request is inert.** `email_norm` is UNIQUE and the conflict
+  clause only updates *pending* rows, so a denied person's resubmissions change
+  nothing and return the same cheerful body forever. That is deliberate
+  anti-enumeration — but it means one misclick is a silent permanent block, so
+  denied rows stay **visible and reopenable** in the admin view.
+- **Every `?v=` in `static/` must agree.** ES modules are keyed by full URL, so
+  `api.js?v=15` and `api.js?v=16` are two module instances with two separate
+  `auth` objects. This actually shipped: `views.js` sat a version behind, so SIGN
+  OUT in the profile view cleared one auth cache while `app.js` read the other
+  and still believed the session was live, and the accent swatches fired a
+  listener array the chart had never subscribed to. `verify_consistency.py` now
+  asserts agreement (not a specific number, so future bumps need no edit) — and
+  caught the same drift recurring during the very next change.
+
 - **`TRUST_PROXY` is a hop count, not a boolean.** It says how many reverse
   proxies you control sit in front of the app; 0/unset means none. `_client_ip()`
   and `_is_https()` index `X-Forwarded-*` that many entries *from the right*,
@@ -250,12 +354,33 @@ js/api.js             fetch layer, agent-key storage, error normalisation
 
 ## Verification harnesses
 
-Both spend nothing — yfinance statements, prices and FX crosses only.
+Every one of these spends nothing. The quant pair reads yfinance statements,
+prices and FX crosses; the rest use `TestClient` against a scratch `ARGUS_DB`
+with the provider keys blanked. **Run them all before any PR.**
 
 ```
 scripts/verify_quant.py           the numbers are right
 scripts/verify_metric_status.py   the absences are right, and FX converts
+scripts/verify_access.py          owner vs guest, the one-dive budget, request flow
+scripts/verify_hardening.py       limiter budgets, backstop, prompt fencing, launch flags
+scripts/verify_proxy_trust.py     TRUST_PROXY hop-count boundary
+scripts/verify_consistency.py     one quantity, one value — P&L rounding and ?v=
+scripts/verify_ticker_validation.py  every ticker write goes through the validator
+scripts/verify_docs.py            this file has not drifted from the tree
 ```
+
+One line to run the free set:
+
+```
+python scripts/verify_access.py && python scripts/verify_hardening.py && python scripts/verify_proxy_trust.py && python scripts/verify_consistency.py && python scripts/verify_docs.py && python scripts/verify_ticker_validation.py
+```
+
+`verify_access.py` is the one to extend when touching auth. Its cost safety is
+structural rather than intentional — see the `.env` re-injection gotcha above —
+and it holds a **positive control** that drives an entitled caller through the
+same stubbed provider, so a zero invocation count is evidence rather than a
+monkeypatch that silently failed to bind. A control that has stopped
+controlling is worse than no control.
 
 `verify_quant.py` lives on `fix/slide-in-panel-overlay`, not on this branch.
 Its `currency mismatch` assertion was inverted there as part of this work: it
