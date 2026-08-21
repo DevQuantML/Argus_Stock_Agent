@@ -412,7 +412,11 @@ input::placeholder{color:var(--txt-muted);opacity:.7;}
 .pl.run .mt{color:var(--accent);}
 .pl.fail{color:var(--red);}      .pl.fail .ic{color:var(--red);}
 .pl.cancel{color:var(--gold);}   .pl.cancel .ic{color:var(--gold);}
-.pl.skip,.pl.lock{opacity:.45;}
+.pl.skip,.pl.lock,
+/* pipeline.set() writes the status verbatim, so a row dimmed through
+   set() carries 'skipped'/'locked' while mount() writes 'skip'/'lock'.
+   Both spellings must dim, or a halted run looks like a running one. */
+.pl.skipped,.pl.locked{opacity:.45;}
 .spin{display:inline-block;animation:spin .8s linear infinite;}
 
 /* Verdict block */

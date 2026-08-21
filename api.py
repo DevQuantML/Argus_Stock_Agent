@@ -985,10 +985,22 @@ def _guest_gate(ctx: AuthCtx, ticker: str, module: str):
                      "detail": {"bound_ticker": usage["dive_ticker"]}},
         )
     if outcome == "used":
+        # Two different situations wear the same store-level outcome, and
+        # collapsing them strands a guest's allowance. "used" means THIS stage
+        # was already claimed — which, unless all five are gone, leaves the rest
+        # perfectly claimable. Reporting both as "budget exhausted" made the
+        # frontend halt the whole run, so a guest whose first run was cancelled
+        # or hit a transient failure could never claim the remaining stages.
+        if usage["exhausted"]:
+            return JSONResponse(
+                status_code=402,
+                content={"error": "your included deep dive is fully used",
+                         "code": "guest_budget_exhausted", "detail": usage},
+            )
         return JSONResponse(
             status_code=402,
-            content={"error": "this stage of your included deep dive is already used",
-                     "code": "guest_budget_exhausted", "detail": usage},
+            content={"error": f"the {module} stage of your dive already ran",
+                     "code": "guest_stage_used", "detail": usage},
         )
     # missing / revoked / expired
     return JSONResponse(
@@ -1006,8 +1018,13 @@ def _module_response(ticker: str, module: str, question: str = None,
 
     try:
         result = run_research_module(ticker.upper(), module, question)
-        if "error" in result and "ticker" not in result:
+        # Refund BEFORE the shape check. The no-provider failure returns its
+        # ticker alongside the error, so gating the refund on "ticker" not in
+        # result skipped the one case the refund was written for and charged a
+        # guest a stage for a call that never left the process.
+        if "error" in result:
             _refund_if_free(ctx, module, result)
+        if "error" in result and "ticker" not in result:
             return JSONResponse(status_code=500, content={"error": "internal server error"})
         return result
     except Exception as exc:
@@ -1085,8 +1102,9 @@ def api_research_synthesis(ticker: str, body: SynthesisBody,
 
     try:
         result = run_synthesis(ticker.upper(), fenced)
-        if "error" in result and "ticker" not in result:
+        if "error" in result:
             _refund_if_free(ctx, "synthesis", result)
+        if "error" in result and "ticker" not in result:
             return JSONResponse(status_code=500, content={"error": "internal server error"})
         return result
     except Exception as exc:

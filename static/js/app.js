@@ -640,6 +640,14 @@ async function research(rawSym, { paid = true } = {}) {
       const t = performance.now();
       try {
         const data = await api.getResearchModule(sym, key, { signal: controller.signal });
+        // A provider failure comes back 200 with an error body rather than a
+        // status code, so without this the stage gets a green tick and an empty
+        // body — a module that never ran, presented as one that did.
+        if (data.error && !data.output) {
+          ui.pipeline.set(key, 'failed');
+          ui.toast(`${key}: ${data.error}`, 'warn', 7000);
+          continue;
+        }
         texts[key] = data.output || '';
         ui.pipeline.done(key, performance.now() - t);
 
@@ -656,6 +664,13 @@ async function research(rawSym, { paid = true } = {}) {
            Without this the loop treats it like a flaky upstream and carries on
            to the next module — four more paid requests that cannot possibly
            succeed, four more red toasts, and the rate bucket burned. */
+        /* One stage of the dive was already claimed by an earlier run. The
+           rest are still theirs, so skip this one and carry on — halting here
+           is what stranded the remaining stages. */
+        else if (err.kind === 'stage') {
+          ui.pipeline.set(key, 'skipped', 'already run');
+          refreshTier();
+        }
         else if (err.kind === 'budget' || err.kind === 'bound') {
           ui.pipeline.set(key, 'failed');
           state.run.cancelled = true;

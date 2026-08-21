@@ -474,9 +474,94 @@ def main():
     check("/api/info is still gated for anonymous callers",
           TestClient(api.app).get("/api/info").status_code, 401)
 
+    # ── Partial dives, and the difference between a stage and the allowance ──
+    # These exist because the original harness asserted consume_guest_unit at
+    # the STORE level, where "used" is the correct answer, and never asserted
+    # what the ROUTE does with that outcome. The route collapsed "this one
+    # stage is spent" into "your whole allowance is gone", and the frontend
+    # halted the run — stranding four claimable stages behind one 402.
+    section("a partially used dive can still be finished")
+    part_key = store.create_guest_key("partial@example.com")[1]
+    rcp = TestClient(api.app)
+    rcp.post("/api/session", json={"key": part_key})
+    part_id = store.guest_key_for(part_key)["id"]
+
+    # Simulate a run that got one stage in and then stopped.
+    store.consume_guest_unit(part_id, "PLTR", "report")
+
+    calls.clear()
+    r = rcp.get("/api/research/PLTR/report")
+    check("re-running an already-claimed stage is refused", r.status_code, 402)
+    check("...as 'stage used', NOT 'budget exhausted'",
+          r.json().get("code"), "guest_stage_used")
+    check("...and the provider was never entered", calls, [])
+
+    # The claim is "this stage was allowed through", not "it succeeded" — the
+    # stub errors by design, so the route correctly 500s. Reaching the provider
+    # layer at all is the proof, and the consumed count confirms it.
+    calls.clear()
+    rcp.get("/api/research/PLTR/context")
+    check("a stage that has NOT run is still allowed through to the provider",
+          calls, ["module"])
+
+    usage = store.guest_usage(part_id)
+    check("two stages now used, three remain", usage["modules_used"], 2)
+    check("...and the key is not reported exhausted", usage["exhausted"], False)
+    calls.clear()   # deliberate stub hit — not a real provider call
+
+    section("only a fully spent dive reports the allowance gone")
+    for m in ("policy", "patterns", "synthesis"):
+        store.consume_guest_unit(part_id, "PLTR", m)
+    calls.clear()
+    r = rcp.get("/api/research/PLTR/report")
+    check("with all five spent the code IS budget_exhausted",
+          r.json().get("code"), "guest_budget_exhausted")
+    check("...still 402", r.status_code, 402)
+    check("...and still no provider call", calls, [])
+
+    # ── The refund must fire on the path it was written for ─────────────────
+    # run_research_module returns its ticker alongside the error when no
+    # provider is configured, so gating the refund on "ticker" not in result
+    # skipped exactly that case and charged a stage for a call that never left
+    # the process.
+    section("a $0 failure refunds the stage")
+    ref_key = store.create_guest_key("refund@example.com")[1]
+    rcr = TestClient(api.app)
+    rcr.post("/api/session", json={"key": ref_key})
+    ref_id = store.guest_key_for(ref_key)["id"]
+
+    def no_provider(*a, **k):
+        calls.append("module")
+        return {"error": "No AI provider configured — set PERPLEXITY_API_KEY "
+                         "or GROQ_API_KEY in .env",
+                "key": "PERPLEXITY_API_KEY or GROQ_API_KEY", "ticker": "PLTR"}
+
+    saved = api.run_research_module
+    api.run_research_module = no_provider
+    try:
+        rcr.get("/api/research/PLTR/report")
+    finally:
+        api.run_research_module = saved
+
+    check("a no-provider failure leaves the stage unspent",
+          store.guest_usage(ref_id)["modules_used"], 0)
+    check("...so the guest can claim it once a provider exists",
+          store.consume_guest_unit(ref_id, "PLTR", "report"), "ok")
+    calls.clear()   # deliberate stub hit — not a real provider call
+
+    # A real failure must NOT refund — the call may already have been billed.
+    section("a failure that may have cost money keeps the stage")
+    keep_key = store.create_guest_key("keep@example.com")[1]
+    keep_id = store.guest_key_for(keep_key)["id"]
+    store.consume_guest_unit(keep_id, "PLTR", "context")
+    api._refund_if_free(api.AuthCtx("guest", keep_id), "context",
+                        {"error": "upstream timeout after 30s", "ticker": "PLTR"})
+    check("a timeout does not hand the stage back",
+          store.guest_usage(keep_id)["modules_used"], 1)
+
     # ── Final cost assertion ───────────────────────────────────────────────
-    section("cost — nothing in this run reached a provider")
-    check("provider invocation count across the whole harness", calls, [])
+    section("cost — no unintended provider call remains outstanding")
+    check("provider invocation count since the last deliberate stub hit", calls, [])
 
 
 def _req_with(api_mod, cookies: dict):

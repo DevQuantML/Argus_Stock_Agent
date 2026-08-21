@@ -115,8 +115,12 @@ function describe(status, body) {
   // which would fire four more doomed paid requests and print four red toasts.
   // These kinds exist so the caller can stop.
   if (status === 402) {
+    // 'stage' is recoverable and 'budget' is terminal. Collapsing them halted
+    // the whole run over a single already-claimed stage, stranding the rest of
+    // the guest's allowance.
     return new ApiError(server || 'Your included deep dive is already used.',
-                        { status, kind: 'budget', code, detail: extra });
+                        { status, kind: code === 'guest_stage_used' ? 'stage' : 'budget',
+                          code, detail: extra });
   }
   if (status === 409 && code === 'guest_ticker_bound') {
     const t = extra && extra.bound_ticker;
