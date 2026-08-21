@@ -59,7 +59,12 @@ from tools.perplexity_research import (
     run_research_module,
     run_synthesis,
 )
-from tools.stock_data import get_price_and_fundamentals, get_price_history
+from tools.stock_data import (
+    get_news,
+    get_next_earnings,
+    get_price_and_fundamentals,
+    get_price_history,
+)
 from tools.validator import sanitize_prompt_text
 from tools.xirr import xirr
 
@@ -1203,6 +1208,40 @@ def api_session_status(request: Request):
         "tier": info["tier"],
         "guest": store.guest_usage(info["guest_key_id"]) if info["tier"] == "guest" else None,
     }
+
+
+# ── Free extras — public, yfinance only, no provider call ─────────────────
+# Standalone routes rather than extra fields on /api/demo. /api/demo is the hot
+# path behind every `quant` and `research` command, and folding two more network
+# round-trips into it would add latency and new failure modes to the one call
+# that must stay fast. The frontend fetches these lazily instead, so a slow or
+# missing headline feed never delays the numbers.
+
+@app.get("/api/earnings/{ticker}")
+def api_earnings(ticker: str):
+    """Next scheduled earnings date. A null date is normal, not an error."""
+    try:
+        result = get_next_earnings(ticker)
+        if "error" in result:
+            return JSONResponse(status_code=400, content=result)
+        return result
+    except Exception as exc:
+        logger.debug("api_earnings: error (type=%s): %s", type(exc).__name__, exc)
+        return JSONResponse(status_code=500, content={"error": "internal server error"})
+
+
+@app.get("/api/news/{ticker}")
+def api_news(ticker: str):
+    """Recent headlines, whitelist-mapped. Links that are not http(s) are dropped
+    server-side, so the browser is not the only thing checking them."""
+    try:
+        result = get_news(ticker)
+        if "error" in result:
+            return JSONResponse(status_code=400, content=result)
+        return result
+    except Exception as exc:
+        logger.debug("api_news: error (type=%s): %s", type(exc).__name__, exc)
+        return JSONResponse(status_code=500, content={"error": "internal server error"})
 
 
 # ── Access requests ────────────────────────────────────────────────────────

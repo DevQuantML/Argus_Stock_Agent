@@ -240,10 +240,21 @@ def main():
     # wasted. Source-level, because the branch lives in the browser.
     api_js   = (root / "static" / "js" / "api.js").read_text(encoding="utf-8")
     views_js = (root / "static" / "js" / "views.js").read_text(encoding="utf-8")
+    # Assert the behaviour, not one spelling of it. This used to grep for the
+    # literal `auth.authenticated = false`, which broke when the auth layer
+    # gained tiers and that assignment moved inside auth._apply(). The property
+    # being guarded never changed: a failed unlock must report WHY (so the UI
+    # can tell a lockout from a wrong key) and must leave the session cleared.
+    clears_auth = "auth._apply(null)" in api_js or "auth.authenticated = false" in api_js
     check("api.js surfaces the status instead of a bare boolean",
-          "status:" in api_js and "auth.authenticated = false" in api_js, True)
+          "status:" in api_js and clears_auth, True)
+    check("api.js also surfaces the server's machine-readable code",
+          "code:" in api_js, True)
     check("views.js branches on 429 rather than always saying 'Rejected.'",
           "429" in views_js, True)
+    # A guest whose key died must not be told to enter an owner secret.
+    check("views.js distinguishes an expired guest key from a wrong key",
+          "guest_expired" in views_js, True)
 
     launchers = {
         "Dockerfile":       root / "Dockerfile",

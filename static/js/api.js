@@ -11,13 +11,45 @@
 
 export const auth = {
   authenticated: false,
-  has() { return auth.authenticated; },
+  tier: null,          // 'owner' | 'guest' | null — null means no session at all
+  guest: null,         // {expires_at, dive_ticker, modules_total, modules_used, exhausted}
+
+  has()     { return auth.authenticated; },
+  isOwner() { return auth.tier === 'owner'; },
+  isGuest() { return auth.tier === 'guest'; },
+
+  /* 'visitor' is a frontend-only tier: someone browsing with no session at all.
+     The server never issues it, so it is derived here rather than read. */
+  effectiveTier() { return auth.tier || 'visitor'; },
+
+  /* Stages left in a guest's single included dive. Deliberately a count: the
+     allowance is five separately consumable stages, and a guest one stage in
+     still has four. Reporting that as a spent/unspent boolean tells them their
+     dive is gone while most of it remains. */
+  divesLeft() {
+    const g = auth.guest;
+    if (!g) return 0;
+    return Math.max(0, (g.modules_total || 0) - (g.modules_used || 0));
+  },
+
+  /* Hours until a guest key dies, from the SERVER's expires_at. Never assume
+     the two clocks agree — this is display only, and the server re-checks. */
+  hoursLeft() {
+    if (!auth.guest?.expires_at) return null;
+    const ms = Date.parse(auth.guest.expires_at) - Date.now();
+    return Number.isFinite(ms) ? Math.max(0, ms / 3.6e6) : null;
+  },
+
+  _apply(d) {
+    auth.authenticated = Boolean(d && d.authenticated);
+    auth.tier  = (d && d.tier) || null;
+    auth.guest = (d && d.guest) || null;
+  },
 
   async refresh() {
     try {
-      const d = await request('/api/session');
-      auth.authenticated = Boolean(d.authenticated);
-    } catch { auth.authenticated = false; }
+      auth._apply(await request('/api/session'));
+    } catch { auth._apply(null); }
     return auth.authenticated;
   },
 
@@ -30,14 +62,17 @@ export const auth = {
   // needs the status to say something true.
   async unlock(key) {
     try {
-      await request('/api/session', { method: 'POST', body: { key: String(key || '') } });
-      auth.authenticated = true;
-      return { ok: true };
+      const d = await request('/api/session', { method: 'POST', body: { key: String(key || '') } });
+      // POST returns the same shape as GET, so the tier and allowance are known
+      // immediately — no second round trip before painting the key chip.
+      auth._apply({ authenticated: true, tier: d.tier, guest: d.guest });
+      return { ok: true, tier: d.tier, guest: d.guest };
     } catch (err) {
-      auth.authenticated = false;
+      auth._apply(null);
       return {
         ok:      false,
         status:  (err && err.status) || 0,
+        code:    (err && err.code) || '',
         message: (err && err.message) || '',
       };
     }
@@ -45,16 +80,20 @@ export const auth = {
 
   async signOut() {
     try { await request('/api/session', { method: 'DELETE' }); } catch { /* already gone */ }
-    auth.authenticated = false;
+    auth._apply(null);
   },
 };
 
 export class ApiError extends Error {
-  constructor(message, { status = 0, kind = 'generic' } = {}) {
+  constructor(message, { status = 0, kind = 'generic', code = '', detail = null } = {}) {
     super(message);
     this.name   = 'ApiError';
     this.status = status;
-    this.kind   = kind;   // network | unauthorized | ratelimit | notfound | server | config
+    // network | unauthorized | forbidden | budget | bound | expired
+    // | ratelimit | notfound | server | config | aborted
+    this.kind   = kind;
+    this.code   = code;     // the server's machine-readable reason, when it sent one
+    this.detail = detail;   // structured extras, e.g. {bound_ticker}
   }
 }
 
@@ -62,14 +101,47 @@ export class ApiError extends Error {
    error strings are preferred when present — they name the actual problem
    (bad ticker suffix, missing key) better than a generic status message. */
 function describe(status, body) {
-  const detail = body && typeof body === 'object' ? body.detail : null;
-  const server = (body && body.error) || (detail && detail.error) || null;
+  const d = body && typeof body === 'object' ? body.detail : null;
+  const server = (body && body.error) || (d && d.error) || null;
 
-  if (status === 401) return new ApiError('Not authorised — unlock with your agent key.', { status, kind: 'unauthorized' });
-  if (status === 429) return new ApiError('Rate limit reached — 20 requests per minute. Wait a moment.', { status, kind: 'ratelimit' });
-  if (status === 400) return new ApiError(server || 'Ticker not found. Try adding .NS for NSE or .BO for BSE.', { status, kind: 'notfound' });
-  if (status === 503) return new ApiError(server || 'Upstream data feed unavailable.', { status, kind: 'server' });
-  return new ApiError(server || `Request failed (${status}).`, { status, kind: 'server' });
+  // FastAPI nests HTTPException payloads under `detail`, while our own
+  // JSONResponse bodies are flat. Look in both, or half the codes go missing.
+  const code   = (body && body.code) || (d && d.code) || '';
+  const extra  = (body && body.detail && !d?.error ? body.detail : null) || null;
+
+  // Status alone is not enough to act on. The staged research loop treats a
+  // generic failure as a per-module warning and CARRIES ON to the next stage —
+  // correct for a flaky upstream, badly wrong for "your allowance is spent",
+  // which would fire four more doomed paid requests and print four red toasts.
+  // These kinds exist so the caller can stop.
+  if (status === 402) {
+    return new ApiError(server || 'Your included deep dive is already used.',
+                        { status, kind: 'budget', code, detail: extra });
+  }
+  if (status === 409 && code === 'guest_ticker_bound') {
+    const t = extra && extra.bound_ticker;
+    return new ApiError(
+      t ? `Your guest key is committed to ${t} and cannot be moved to another ticker.`
+        : (server || 'Your guest key is committed to a different ticker.'),
+      { status, kind: 'bound', code, detail: extra });
+  }
+  if (status === 403) {
+    return new ApiError(server || 'That action belongs to the terminal\'s owner.',
+                        { status, kind: 'forbidden', code });
+  }
+  if (status === 401) {
+    // A guest whose key died must NOT be sent to the unlock screen to enter an
+    // operator secret they were never given.
+    if (code === 'guest_expired') {
+      return new ApiError(server || 'Your guest key has expired.',
+                          { status, kind: 'expired', code });
+    }
+    return new ApiError('Not authorised — unlock with your key.', { status, kind: 'unauthorized', code });
+  }
+  if (status === 429) return new ApiError(server || 'Rate limit reached. Wait a moment.', { status, kind: 'ratelimit', code });
+  if (status === 400) return new ApiError(server || 'Ticker not found. Try adding .NS for NSE or .BO for BSE.', { status, kind: 'notfound', code });
+  if (status === 503) return new ApiError(server || 'Upstream data feed unavailable.', { status, kind: 'server', code });
+  return new ApiError(server || `Request failed (${status}).`, { status, kind: 'server', code });
 }
 
 async function request(path, { method = 'GET', body = null, signal = null } = {}) {
@@ -166,6 +238,30 @@ export const delWatch     = (t)     => request(`/api/watchlist/${encodeURICompon
 
 export const getAnalytics = ()      => request('/api/portfolio/analytics');
 export const getOutlook   = ()      => request('/api/portfolio/outlook');
+
+/* ── Public: no session needed ───────────────────────────────────────────── */
+
+/* Framework + disclosures for a keyless visitor. Deliberately NOT /api/info,
+   which also carries the book and stays gated. */
+export const getMeta     = ()   => request('/api/meta');
+export const getNews     = (t)  => request(`/api/news/${encodeURIComponent(t)}`);
+export const getEarnings = (t)  => request(`/api/earnings/${encodeURIComponent(t)}`);
+
+/* Ask the operator for a key. The reply is deliberately identical whether the
+   address is new, pending, approved or previously denied — do not try to
+   distinguish them here, there is nothing to distinguish. */
+export const requestAccess = (email, note) =>
+  request('/api/access-request', { method: 'POST', body: { email, note: note || '' } });
+
+/* ── Owner-only administration ───────────────────────────────────────────── */
+
+export const adminRequests = ()    => request('/api/admin/requests');
+export const adminApprove  = (id)  => request(`/api/admin/requests/${id}/approve`, { method: 'POST' });
+export const adminDeny     = (id)  => request(`/api/admin/requests/${id}/deny`,    { method: 'POST' });
+export const adminReopen   = (id)  => request(`/api/admin/requests/${id}/reopen`,  { method: 'POST' });
+export const adminGuestKeys= ()    => request('/api/admin/guest-keys');
+export const adminRevoke   = (id)  => request(`/api/admin/guest-keys/${id}/revoke`, { method: 'POST' });
+export const adminRevokeAll= ()    => request('/api/admin/sessions/revoke-all', { method: 'POST' });
 export const runOutlook   = ({ signal } = {}) =>
   request('/api/portfolio/outlook', { method: 'POST', signal }).then(d => {
     if (d && d.error) throwIfErrorField(d);

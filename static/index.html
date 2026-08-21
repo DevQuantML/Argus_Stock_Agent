@@ -7,8 +7,8 @@
 <meta name="description" content="Brent-gated equity research terminal. Live quant, staged AI research, one clear verdict."/>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%23060810'/%3E%3Cpath d='M6 23 L16 7 L26 23' stroke='%23E8900A' stroke-width='2.5' fill='none' stroke-linejoin='round'/%3E%3Cpath d='M11 19 h10' stroke='%23E8900A' stroke-width='2.5'/%3E%3C/svg%3E"/>
 <!-- Blocking, non-module: applies accent/tempo/CRT before first paint. -->
-<script src="/static/js/theme-boot.js?v=16"></script>
-<link rel="stylesheet" href="/static/style.css?v=16"/>
+<script src="/static/js/theme-boot.js?v=17"></script>
+<link rel="stylesheet" href="/static/style.css?v=17"/>
 </head>
 <body>
 
@@ -87,7 +87,7 @@
 
     <!-- COLUMN 1 · BRENT + GEO -->
     <div id="col1" class="col">
-      <div class="blk">
+      <div class="blk" id="blk-brent">
         <div class="blk-h">
           <span class="panel-h"><button class="chev" type="button" data-panel="brent" aria-label="Collapse Brent">▾</button>BRENT://SIGNAL</span>
           <span style="display:flex;align-items:center;gap:6px">
@@ -111,7 +111,7 @@
 
     <!-- COLUMN 2 · WATCHLIST + COMMANDS -->
     <div id="col2" class="col">
-      <div class="blk-grow" style="border-bottom:1px solid var(--border)">
+      <div class="blk-grow" id="blk-watch" style="border-bottom:1px solid var(--border)">
         <div class="blk-h">
           <span class="panel-h"><button class="chev" type="button" data-panel="watch" aria-label="Collapse Watchlist">▾</button>WATCHLIST://ACTIVE</span>
           <span style="display:flex;align-items:center;gap:6px">
@@ -148,6 +148,8 @@
           <div data-cmd="profile"><b>profile</b> <span>holdings &amp; settings</span></div>
           <div data-cmd="focus"><b>focus</b> <span>hide side panels</span></div>
           <div data-cmd="clear"><b>clear</b> <span>reset output</span></div>
+          <div data-cmd="tour"><b>tour</b> <span>30-second orientation</span></div>
+          <div data-cmd="request"><b>request</b> <span>ask for an agent key</span></div>
           <div data-cmd="help"><b>help</b> <span>all commands</span></div>
         </div>
       </div>
@@ -195,6 +197,6 @@
 
 <div id="toasts" aria-live="polite"></div>
 
-<script type="module" src="/static/js/app.js?v=16"></script>
+<script type="module" src="/static/js/app.js?v=17"></script>
 </body>
 </html>
