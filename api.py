@@ -410,34 +410,77 @@ def _agent_key_ok(candidate: str | None) -> bool:
     return hmac.compare_digest(candidate.encode("utf-8"), secret.encode("utf-8"))
 
 
-def _credential_ok(request: Request, x_agent_key: str | None) -> bool:
-    """True when the caller presents a valid session cookie or agent key.
+class AuthCtx:
+    """Who the caller is, not merely whether they are someone.
+
+    This replaced a bool. The boolean was the entire vulnerability: every
+    session row looked alike to require_auth, so the moment a second class of
+    credential exists (a guest key), its holder is indistinguishable from the
+    operator and inherits routes that spend real money with no budget attached.
+    Carrying the tier means each route can decide for itself.
+    """
+
+    __slots__ = ("tier", "guest_key_id")
+
+    def __init__(self, tier: str, guest_key_id: int | None = None):
+        self.tier = tier                      # "owner" | "guest"
+        self.guest_key_id = guest_key_id
+
+    @property
+    def is_owner(self) -> bool:
+        return self.tier == "owner"
+
+    @property
+    def is_guest(self) -> bool:
+        return self.tier == "guest"
+
+
+def _auth_ctx(request: Request, x_agent_key: str | None) -> AuthCtx | None:
+    """Resolve the caller to an AuthCtx, or None when unauthenticated.
 
     Fail-closed: with AGENT_SECRET unset there is no credential that can be
     valid, so every caller is rejected rather than waved through.
+
+    X-Agent-Key is always the operator — it *is* AGENT_SECRET, and a guest is
+    never given it. Guest keys are redeemed for a cookie at POST /api/session
+    and travel no other way.
     """
     if not os.getenv("AGENT_SECRET"):
         # Log by name only — never the value.
         logger.warning("auth: AGENT_SECRET is not set — all auth requests rejected")
-        return False
+        return None
 
     token = request.cookies.get(SESSION_COOKIE)
-    if token and store.session_valid(token):
-        return True
+    if token:
+        info = store.session_info(token)
+        if info:
+            return AuthCtx(info["tier"], info["guest_key_id"])
 
-    return _agent_key_ok(x_agent_key)
+    if _agent_key_ok(x_agent_key):
+        return AuthCtx("owner")
+
+    return None
+
+
+def _credential_ok(request: Request, x_agent_key: str | None) -> bool:
+    """Back-compat wrapper: is the caller anyone at all?"""
+    return _auth_ctx(request, x_agent_key) is not None
 
 
 async def require_auth(
     request: Request,
     x_agent_key: str = Header(default=None, alias="X-Agent-Key"),
-) -> None:
+) -> AuthCtx:
     """
     FastAPI dependency guarding every paid route (/api/research/*).
 
     Accepts EITHER a valid session cookie (browser, set by POST /api/session)
     OR the X-Agent-Key header (curl and scripts). The cookie exists so the key
     never has to live in localStorage where any script could read it.
+
+    Returns the AuthCtx rather than None so a paid handler can ask *which*
+    tier is calling. Passing this as a dependency still gates the route; taking
+    it as a parameter additionally hands the handler the caller's identity.
 
     401 if neither credential is valid. 429 if the caller exceeds the limit.
     """
@@ -450,10 +493,52 @@ async def require_auth(
                        client_ip, _RATE_LIMIT_MAX, _RATE_LIMIT_WINDOW)
         raise HTTPException(status_code=429, detail={"error": "rate limit exceeded"})
 
-    if _credential_ok(request, x_agent_key):
-        return
+    ctx = _auth_ctx(request, x_agent_key)
+    if ctx is not None:
+        return ctx
 
     logger.warning("require_auth: rejected request from IP %s — no valid session or key", client_ip)
+    raise HTTPException(status_code=401, detail={"error": "unauthorized"})
+
+
+async def require_owner(
+    request: Request,
+    x_agent_key: str = Header(default=None, alias="X-Agent-Key"),
+) -> AuthCtx:
+    """
+    FastAPI dependency for routes only the operator may reach.
+
+    Two kinds of route need this. Writes to the book — positions, watchlist,
+    profile — because a guest is a reader in someone else's terminal and must
+    not be able to edit or delete holdings. And paid actions with no per-caller
+    budget, which a guest allowance cannot bound.
+
+    A guest gets 403, not 401: they are authenticated, just not entitled. The
+    distinction matters to the frontend, which sends a 401 back to the unlock
+    screen — exactly the wrong move for a guest, who would be asked for an
+    operator secret they were never given.
+    """
+    from fastapi import HTTPException
+
+    ctx = _auth_ctx(request, x_agent_key)
+    if ctx is not None and ctx.is_owner:
+        return ctx
+
+    client_ip = _client_ip(request)
+    if ctx is not None:
+        logger.warning("require_owner: guest session refused a owner-only route (IP %s)", client_ip)
+        raise HTTPException(
+            status_code=403,
+            detail={"error": "this action belongs to the terminal's owner",
+                    "code": "guest_read_only"},
+        )
+
+    if not _check_rate_limit(client_ip):
+        logger.warning("rate_limit: IP %s exceeded %d req/%ds on a failed owner-route auth",
+                       client_ip, _RATE_LIMIT_MAX, _RATE_LIMIT_WINDOW)
+        raise HTTPException(status_code=429, detail={"error": "rate limit exceeded"})
+
+    logger.warning("require_owner: rejected request from IP %s — no valid session or key", client_ip)
     raise HTTPException(status_code=401, detail={"error": "unauthorized"})
 
 
@@ -779,7 +864,7 @@ def api_history(ticker: str, period: str = "1y"):
 
 # ── Auth-gated JSON API ────────────────────────────────────────────────────
 
-@app.get("/api/research/{ticker}", dependencies=[Depends(require_auth)])
+@app.get("/api/research/{ticker}", dependencies=[Depends(require_owner)])
 def api_research(ticker: str, question: str = None):
     """
     Full Perplexity sonar-pro research. Requires X-Agent-Key header.
@@ -946,7 +1031,7 @@ def api_profile_get():
     return {"profile": store.profile()}
 
 
-@app.post("/api/profile", dependencies=[Depends(require_session)])
+@app.post("/api/profile", dependencies=[Depends(require_owner)])
 def api_profile_save(body: ProfileBody):
     try:
         return {"profile": store.save_profile(body.model_dump())}
@@ -978,7 +1063,7 @@ def api_positions_list():
     return {"positions": store.positions()}
 
 
-@app.post("/api/positions", dependencies=[Depends(require_session)])
+@app.post("/api/positions", dependencies=[Depends(require_owner)])
 def api_positions_upsert(body: PositionBody):
     try:
         # exclude_unset so a partial update touches only the fields the caller
@@ -997,7 +1082,7 @@ def api_positions_upsert(body: PositionBody):
         return JSONResponse(status_code=400, content={"error": str(exc)})
 
 
-@app.delete("/api/positions/{ticker}", dependencies=[Depends(require_session)])
+@app.delete("/api/positions/{ticker}", dependencies=[Depends(require_owner)])
 def api_positions_delete(ticker: str):
     try:
         removed = store.delete_position(ticker)
@@ -1011,7 +1096,7 @@ def api_watchlist_list():
     return {"watchlist": store.watchlist()}
 
 
-@app.post("/api/watchlist", dependencies=[Depends(require_session)])
+@app.post("/api/watchlist", dependencies=[Depends(require_owner)])
 def api_watchlist_add(body: WatchBody):
     try:
         t = store.add_watch(body.ticker, body.note)
@@ -1020,7 +1105,7 @@ def api_watchlist_add(body: WatchBody):
     return {"ok": True, "ticker": t, "watchlist": store.watchlist()}
 
 
-@app.delete("/api/watchlist/{ticker}", dependencies=[Depends(require_session)])
+@app.delete("/api/watchlist/{ticker}", dependencies=[Depends(require_owner)])
 def api_watchlist_delete(ticker: str):
     try:
         removed = store.delete_watch(ticker)
@@ -1138,7 +1223,7 @@ def api_outlook_get():
     return {"outlook": store.get_outlook()}
 
 
-@app.post("/api/portfolio/outlook", dependencies=[Depends(require_auth)])
+@app.post("/api/portfolio/outlook", dependencies=[Depends(require_owner)])
 def api_outlook_run():
     """PAID — one provider call covering every holding. Result is cached."""
     try:

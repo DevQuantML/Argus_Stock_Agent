@@ -70,7 +70,24 @@ CREATE TABLE IF NOT EXISTS watchlist (
 CREATE TABLE IF NOT EXISTS sessions (
     token_hash TEXT PRIMARY KEY,
     created_at TEXT NOT NULL,
-    expires_at TEXT NOT NULL
+    expires_at TEXT NOT NULL,
+    tier       TEXT NOT NULL DEFAULT 'owner',
+    guest_key_id INTEGER
+);
+-- Guest keys: time-boxed credentials the operator issues to other people.
+-- Only the SHA-256 of the key is stored, same rule as sessions above — a
+-- database read must not yield a usable credential. key_prefix is the first
+-- few characters, kept in the clear purely so the admin list can identify a
+-- row; it is far too short to be guessed back into a key.
+CREATE TABLE IF NOT EXISTS guest_keys (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    key_hash    TEXT NOT NULL UNIQUE,
+    key_prefix  TEXT NOT NULL DEFAULT '',
+    label       TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL,
+    expires_at  TEXT NOT NULL,
+    revoked_at  TEXT,
+    dive_ticker TEXT
 );
 CREATE TABLE IF NOT EXISTS outlook (
     id         INTEGER PRIMARY KEY CHECK (id = 1),
@@ -86,6 +103,31 @@ CREATE TABLE IF NOT EXISTS meta (
 _now = lambda: datetime.now(timezone.utc).isoformat()
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Additive column migrations for tables that already exist.
+
+    CREATE TABLE IF NOT EXISTS is a no-op on a table that is already there, so
+    it cannot add a column to a database created by an earlier version. This
+    inspects the live schema instead of tracking a version counter, which makes
+    running it twice a no-op by construction.
+
+    It lives here rather than in bootstrap() deliberately: bootstrap() returns
+    early once the "seeded" meta flag is set, so a migration placed there would
+    never run on exactly the established databases that need it.
+
+    DEFAULT 'owner' is load-bearing. Every session row predating this column
+    could only have been created by presenting AGENT_SECRET, so backfilling
+    them as owner sessions is correct — and SQLite only accepts ADD COLUMN
+    ... NOT NULL when a non-null default is supplied.
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(sessions)")}
+    if "tier" not in cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN tier TEXT NOT NULL DEFAULT 'owner'")
+    if "guest_key_id" not in cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN guest_key_id INTEGER")
+    conn.commit()
+
+
 def _connect() -> sqlite3.Connection:
     global _conn
     if _conn is None:
@@ -96,6 +138,7 @@ def _connect() -> sqlite3.Connection:
         _conn.execute("PRAGMA foreign_keys=ON")
         _conn.executescript(_SCHEMA)
         _conn.commit()
+        _migrate(_conn)
     return _conn
 
 
@@ -296,28 +339,85 @@ def _hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
-def create_session() -> tuple[str, datetime]:
-    """Return (raw_token, expires_at). Only the hash is persisted."""
+def create_session(tier: str = "owner", guest_key_id: int | None = None,
+                   expires_at: datetime | None = None) -> tuple[str, datetime]:
+    """Return (raw_token, expires_at). Only the hash is persisted.
+
+    Defaults reproduce the previous behaviour exactly — a 30-day owner session
+    — so existing callers need no change.
+
+    A guest session passes the *key's* expiry as expires_at rather than
+    now + 24h. Redeeming a key in its 23rd hour must yield a one-hour session,
+    never a fresh 24, or the key's lifetime would restart on every unlock.
+    """
+    if tier not in ("owner", "guest"):
+        raise ValueError(f"unknown session tier: {tier!r}")
     token = secrets.token_urlsafe(32)
-    expires = datetime.now(timezone.utc) + timedelta(days=SESSION_DAYS)
-    _exec("INSERT INTO sessions (token_hash, created_at, expires_at) VALUES (?,?,?)",
-          (_hash_token(token), _now(), expires.isoformat()))
+    expires = expires_at or (datetime.now(timezone.utc) + timedelta(days=SESSION_DAYS))
+    _exec("INSERT INTO sessions (token_hash, created_at, expires_at, tier, guest_key_id) "
+          "VALUES (?,?,?,?,?)",
+          (_hash_token(token), _now(), expires.isoformat(), tier, guest_key_id))
     return token, expires
 
 
-def session_valid(token: str) -> bool:
+def session_info(token: str) -> dict | None:
+    """Resolve a session token to {tier, guest_key_id, expires_at}, or None.
+
+    This replaced a bool-returning session_valid(). The boolean was the whole
+    problem: api.py treats any valid session as a full credential, so once
+    guest keys exist a guest would be indistinguishable from the operator and
+    could spend on routes that have no budget concept at all.
+
+    A guest session is valid only while its key is *also* valid. The LEFT JOIN
+    is what makes revocation and the 24-hour wall bite immediately rather than
+    at the cookie's own expiry — a revoked key kills its live sessions on their
+    very next request.
+    """
     if not token:
-        return False
-    rows = _rows("SELECT expires_at FROM sessions WHERE token_hash = ?", (_hash_token(token),))
+        return None
+    rows = _rows(
+        """SELECT s.expires_at, s.tier, s.guest_key_id,
+                  g.revoked_at AS key_revoked, g.expires_at AS key_expires
+             FROM sessions s
+             LEFT JOIN guest_keys g ON g.id = s.guest_key_id
+            WHERE s.token_hash = ?""",
+        (_hash_token(token),),
+    )
     if not rows:
-        return False
+        return None
+    r = rows[0]
+    now = datetime.now(timezone.utc)
+
     try:
-        if datetime.fromisoformat(rows[0]["expires_at"]) < datetime.now(timezone.utc):
+        if datetime.fromisoformat(r["expires_at"]) < now:
             destroy_session(token)
-            return False
+            return None
     except ValueError:
-        return False
-    return True
+        return None
+
+    if r["tier"] == "guest":
+        # A guest row whose key vanished is not a usable session. Fail closed:
+        # every one of these means the key is gone, dead, or past its wall.
+        if r["guest_key_id"] is None or r["key_expires"] is None:
+            destroy_session(token)
+            return None
+        if r["key_revoked"]:
+            destroy_session(token)
+            return None
+        try:
+            if datetime.fromisoformat(r["key_expires"]) < now:
+                destroy_session(token)
+                return None
+        except ValueError:
+            return None
+
+    return {"tier": r["tier"], "guest_key_id": r["guest_key_id"],
+            "expires_at": r["expires_at"]}
+
+
+def session_valid(token: str) -> bool:
+    """Kept so existing callers that only need a yes/no keep working."""
+    return session_info(token) is not None
 
 
 def destroy_session(token: str) -> None:
