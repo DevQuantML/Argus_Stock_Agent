@@ -31,6 +31,7 @@ Hardening applied:
 import hmac
 import logging
 import os
+import re
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -49,7 +50,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 
 import store
-from config import BRENT_LEVELS, GEO_TRANSMISSION
+from config import BRENT_LEVELS, GEO_EVENT_LIBRARY, GEO_TRANSMISSION
 from tools.oil_price import get_brent_price, get_brent_signal
 from tools.perplexity_research import (
     run_demo,
@@ -493,6 +494,109 @@ async def require_session(
     raise HTTPException(status_code=401, detail={"error": "unauthorized"})
 
 
+_SECTOR_WORD_RE = re.compile(r"[a-z0-9]+")
+
+
+def _sector_words(sector: str) -> set:
+    """Whole words in a sector string, lowercased.
+
+    Tokenised, not raw text: "Fintech" must not match keyword "tech" — a raw
+    `"tech" in sector.lower()` check would wrongly flag a LatAm fintech name
+    as having India/China tech exposure just because "fintech" contains the
+    letters "tech". Matching against these tokens happens in
+    _keyword_matches(), which uses prefix matching (not equality), so a
+    plural/suffixed sector like "Technology" or "Semiconductors" still
+    matches the singular keyword "tech"/"semiconductor" — see that
+    function's docstring for why "Fintech" still correctly stays excluded
+    under prefix matching too.
+    """
+    return set(_SECTOR_WORD_RE.findall(sector.lower()))
+
+
+def _keyword_matches(words: set, keywords: set) -> bool:
+    """
+    True if any keyword matches the tokenized sector words.
+
+    Keywords longer than 2 characters match by prefix, so a plural or
+    suffixed form ("Technology", "Semiconductors", "Industrials") matches a
+    singular/stem keyword ("tech", "semiconductor", "industrial") without
+    every inflection being spelled out in GEO_EVENT_LIBRARY. Crucially,
+    prefix still correctly excludes "Fintech" from keyword "tech": prefix
+    matching requires the WORD to start with the keyword, and "fintech"
+    does not start with "tech" — it merely contains it, which is exactly
+    the substring-match bug _sector_words() exists to avoid.
+
+    Keywords of 2 characters or fewer ("ai") require an exact whole-word
+    match instead — as a prefix, "ai" would match "airlines", "aircraft"
+    and "aid", which is the same false-positive shape in miniature.
+    """
+    for kw in keywords:
+        if len(kw) <= 2:
+            if kw in words:
+                return True
+        elif any(word.startswith(kw) for word in words):
+            return True
+    return False
+
+
+def _compute_geo_transmission() -> dict:
+    """
+    Merge the operator's hand-written GEO_TRANSMISSION with auto-generated
+    entries from GEO_EVENT_LIBRARY, matched against the actual book.
+
+    An event key already present in GEO_TRANSMISSION is left exactly as
+    written — the operator wrote it on purpose and it always wins. Every
+    other library event is scored against every held/watched ticker's stored
+    sector string; an event with zero matches is omitted entirely, so the
+    panel stays scoped to positions actually held or watched rather than a
+    global macro feed. Pure in-memory matching — no network call, no cost.
+
+    A held position's sector wins over a watchlist entry's on ticker
+    collision (positions merged in last) — a position is the richer,
+    operator-maintained record; a watchlist row's sector is usually blank
+    unless separately set. Each malformed GEO_EVENT_LIBRARY entry is caught
+    and skipped individually so one bad entry can't 500 the whole /api/info
+    response, which also carries portfolio/watchlist/brent_levels that have
+    nothing to do with the geo panel.
+    """
+    book = {**store.watchlist(), **store.positions()}
+    has_book = bool(book)
+    out = dict(GEO_TRANSMISSION)
+
+    for event, spec in GEO_EVENT_LIBRARY.items():
+        if event in out:
+            continue
+
+        try:
+            if spec.get("affects_all"):
+                if has_book:
+                    out[event] = [f"all — {spec.get('note', '')}"]
+                continue
+
+            keywords = set(spec.get("keywords", []))
+            matched = [
+                ticker for ticker, cfg in book.items()
+                if _keyword_matches(_sector_words(cfg.get("sector") or ""), keywords)
+            ]
+            if matched:
+                # The note explains the EVENT, not the ticker — put it on the
+                # first match only and leave the rest bare, matching how
+                # hand-written multi-ticker entries already render (e.g.
+                # GEO_TRANSMISSION's ai_export_controls: ["MSFT", "GOOGL"]).
+                # Repeating an identical note once per matching ticker would
+                # stack duplicate lines in the panel.
+                note = spec.get("note", "")
+                out[event] = [
+                    f"{ticker} — {note}" if i == 0 else ticker
+                    for i, ticker in enumerate(matched)
+                ]
+        except Exception:
+            logger.exception("geo event %r malformed in GEO_EVENT_LIBRARY — skipped", event)
+            continue
+
+    return out
+
+
 # ── API info — session required ──────────────────────────────────────────
 # Gated, not public: it returns the holdings list and the watchlist thesis
 # text, which is the operator's own research and not something to hand to an
@@ -518,7 +622,7 @@ def api_info():
             k: {"range": list(v["range"]), "signal": v["signal"], "action": v["action"]}
             for k, v in BRENT_LEVELS.items()
         },
-        "geo_transmission": GEO_TRANSMISSION,
+        "geo_transmission": _compute_geo_transmission(),
         "endpoints": {
             "GET /api/research/{ticker}":           "Full research brief in one call (auth required)",
             "GET /api/research/{ticker}/report":    "Stage 1 — institutional brief (auth required)",
@@ -971,6 +1075,7 @@ class PositionBody(BaseModel):
 class WatchBody(BaseModel):
     ticker: str = Field(max_length=16)
     note:   str = Field(default="", max_length=500)
+    sector: str = Field(default="", max_length=80)
 
 
 @app.get("/api/positions", dependencies=[Depends(require_session)])
@@ -1014,7 +1119,7 @@ def api_watchlist_list():
 @app.post("/api/watchlist", dependencies=[Depends(require_session)])
 def api_watchlist_add(body: WatchBody):
     try:
-        t = store.add_watch(body.ticker, body.note)
+        t = store.add_watch(body.ticker, body.note, body.sector)
     except ValueError as exc:
         return JSONResponse(status_code=400, content={"error": str(exc)})
     return {"ok": True, "ticker": t, "watchlist": store.watchlist()}

@@ -5,12 +5,12 @@
    Version query on each import so a redeploy can never pair a fresh app.js
    with a stale cached sub-module. Bump together with the ?v= in index.html. */
 
-import * as api from './api.js?v=16';
-import { drawChart, makeResponsive } from './chart.js?v=16';
-import { renderMarkdown } from './md.js?v=16';
-import * as prefs from './theme.js?v=16';
-import * as ui from './ui.js?v=16';
-import * as views from './views.js?v=16';
+import * as api from './api.js?v=17';
+import { drawChart, makeResponsive } from './chart.js?v=17';
+import { renderMarkdown } from './md.js?v=17';
+import * as prefs from './theme.js?v=17';
+import * as ui from './ui.js?v=17';
+import * as views from './views.js?v=17';
 
 const $  = ui.$;
 const $$ = ui.$$;
@@ -49,14 +49,18 @@ const FOCUS_KEY = 'argus.focus';
 async function bootSequence() {
   const lines = [{ t: '> ESTABLISHING SESSION…', c: 'txt' }];
 
-  // Everything the boot log claims is actually fetched here first.
-  const [info, health, brent, portfolio] = await Promise.all([
-    api.getInfo().catch(() => null),
+  // Everything the boot log claims is actually fetched here first. info's
+  // failure is captured rather than swallowed to null — an /api/info 500
+  // used to render identically to "you haven't mapped any geo events yet",
+  // which is a real backend failure reading as a normal empty state.
+  const [infoResult, health, brent, portfolio] = await Promise.all([
+    api.getInfo().then((v) => ({ ok: true, value: v })).catch((err) => ({ ok: false, error: err })),
     api.getHealth().catch(() => null),
     api.getBrent().catch(() => null),
     api.getPortfolio().catch(() => null),
   ]);
 
+  const info = infoResult.ok ? infoResult.value : null;
   state.info = info;
   state.health = health;
   state.brent = brent && !brent.error ? brent : null;
@@ -81,7 +85,9 @@ async function bootSequence() {
     : bad('EQUITY_PRICE_FEED … UNAVAILABLE'));
 
   const geoN = Object.keys(info?.geo_transmission || {}).length;
-  lines.push(geoN ? ok(`GEO_TRANSMISSION …… ${geoN} VECTORS MAPPED`) : warn('GEO_TRANSMISSION …… NOT CONFIGURED'));
+  lines.push(infoResult.ok
+    ? (geoN ? ok(`GEO_TRANSMISSION …… ${geoN} VECTORS MAPPED`) : warn('GEO_TRANSMISSION …… NOT CONFIGURED'))
+    : bad(`INFO_ENDPOINT ……… ${infoResult.error?.message || 'failed'}`));
 
   if (health?.checks?.perplexity_key)      lines.push(ok('PERPLEXITY_API …… CONFIGURED · LIVE WEB'));
   else if (health?.checks?.groq_key)       lines.push(warn('GROQ_API ………… FALLBACK · NO WEB SEARCH'));
@@ -416,7 +422,7 @@ const AI_MODULES = [
   ['patterns', 'HIDDEN PATTERNS'],
 ];
 
-async function research(rawSym, { paid = true } = {}) {
+async function research(rawSym, { paid = true, question } = {}) {
   if (state.busy) { ui.toast('A run is already in flight.', 'warn'); return; }
 
   const sym = String(rawSym || '').trim().toUpperCase().replace(/[^A-Z0-9.=-]/g, '');
@@ -430,7 +436,13 @@ async function research(rawSym, { paid = true } = {}) {
 
   openTab(sym);
   ui.clearOut();
+  // A question only narrows the report module's own prompt — context,
+  // policy, patterns and synthesis still run (and cost) exactly as before,
+  // so the title stays 'STAGED RESEARCH' rather than implying a cheaper or
+  // narrower run. The echoed line below is what confirms the question
+  // itself was actually captured.
   ui.writeTitle(`ARGUS://${sym} · ${paid ? 'STAGED RESEARCH' : 'QUANT ONLY'}`);
+  if (question) ui.writeLine(`❯ ${question}`, 'dim');
   const o = ui.out();
   ui.pipeline.mount(o, !hasKey);
   if (!paid) for (const [k] of AI_MODULES) ui.pipeline.set(k, 'skipped');
@@ -483,7 +495,10 @@ async function research(rawSym, { paid = true } = {}) {
       ui.pipeline.set(key, 'running');
       const t = performance.now();
       try {
-        const data = await api.getResearchModule(sym, key, { signal: controller.signal });
+        const data = await api.getResearchModule(sym, key, {
+          question: key === 'report' ? question : undefined,
+          signal: controller.signal,
+        });
         texts[key] = data.output || '';
         ui.pipeline.done(key, performance.now() - t);
 
@@ -671,6 +686,28 @@ async function inspect(sym) {
 const CMDS = ['research', 'quant', 'chart', 'scan', 'brent', 'pos', 'add', 'rm',
               'portfolio', 'profile', 'focus', 'clear', 'help'];
 
+/* Mirrors tools/validator.py's sanitize_question() cap — kept in sync
+   deliberately so a long question gets an instant client-side warning
+   instead of being silently truncated by the server with no feedback. */
+const MAX_QUESTION_LEN = 300;
+
+/** Anything typed after the ticker becomes a free-text research question,
+    instead of being silently dropped — see runCommand's ticker/question
+    split below. Returns undefined for no question, never an empty string.
+    Strips HTML tags before measuring length, mirroring the order
+    sanitize_question() applies server-side (strip, then truncate), so the
+    two truncation points can't disagree on a question containing
+    HTML-like characters. */
+function captureQuestion(words) {
+  const q = words.join(' ').replace(/<[^>]+>/g, '').trim();
+  if (!q) return undefined;
+  if (q.length > MAX_QUESTION_LEN) {
+    ui.toast(`Question truncated to ${MAX_QUESTION_LEN} characters.`, 'warn');
+    return q.slice(0, MAX_QUESTION_LEN);
+  }
+  return q;
+}
+
 async function runCommand(raw) {
   const line = String(raw || '').trim();
   if (!line) return;
@@ -738,12 +775,14 @@ async function runCommand(raw) {
 
     case 'research':
       if (!arg) { ui.toast('Usage: research <SYM>', 'warn'); return; }
-      await research(arg); return;
+      await research(arg, { question: captureQuestion(rest.slice(1)) }); return;
 
     default: {
       // Bare ticker is the most common input — treat it as research.
       const guess = head.toUpperCase().replace(/[^A-Z0-9.=-]/g, '');
-      if (guess && guess.length <= 12 && !CMDS.includes(cmd)) { await research(guess); return; }
+      if (guess && guess.length <= 12 && !CMDS.includes(cmd)) {
+        await research(guess, { question: captureQuestion(rest) }); return;
+      }
       ui.toast(`Unknown command "${head}". Type help.`, 'warn');
     }
   }

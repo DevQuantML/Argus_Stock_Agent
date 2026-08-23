@@ -101,10 +101,21 @@ def validate_ticker(s: str) -> str:
 
 def sanitize_question(s: str) -> str:
     """
-    Strip HTML tags and truncate to MAX_QUESTION_LEN characters.
+    Strip HTML tags, neutralise forged fence delimiters, redact known
+    injection phrases, and truncate to MAX_QUESTION_LEN characters.
 
     Call this on every user-supplied question before it enters the
-    agent's message history.
+    agent's message history. A question reaches the model in the same
+    prompt as fenced thesis/sector text (_research_prompt's question
+    branch interpolates `context`, which includes position_block's fenced
+    blocks, right below it) — so it needs the same two defences
+    sanitize_prompt_text() already applies to that fenced text: a forged
+    fence token in the question must not be able to prematurely close or
+    impersonate one of those blocks, and a known injection phrase must not
+    survive verbatim. It does not get the full <<<UNTRUSTED:...>>> wrapper
+    sanitize_prompt_text() adds, since a question is the operator's own
+    live instruction to the assistant they are already directly
+    commanding, not stored data replayed into a future prompt.
 
     Returns:
         Cleaned string (never raises).
@@ -112,8 +123,25 @@ def sanitize_question(s: str) -> str:
     if not s:
         return ""
 
+    # Neutralise forged fence tokens first — same order as
+    # sanitize_prompt_text() and for the same reason: this MUST run before
+    # the HTML strip below, or _HTML_TAG_RE eats the "<<<END:X>" prefix and
+    # leaves the guard a no-op.
+    cleaned = _FENCE_RE.sub("[removed]", s)
+
     # Strip HTML tags
-    cleaned = _HTML_TAG_RE.sub("", s)
+    cleaned = _HTML_TAG_RE.sub("", cleaned)
+
+    # Redact known injection phrases — same list sanitize_prompt_text() and
+    # guard_tool_output() use.
+    lowered = cleaned.lower()
+    injection_found = False
+    for phrase in _INJECTION_PHRASES:
+        if phrase in lowered:
+            injection_found = True
+            cleaned = re.compile(re.escape(phrase), re.IGNORECASE).sub(
+                "[content removed]", cleaned
+            )
 
     # Collapse runs of whitespace to a single space
     cleaned = " ".join(cleaned.split())
@@ -123,6 +151,12 @@ def sanitize_question(s: str) -> str:
         cleaned = cleaned[:_MAX_QUESTION_LEN]
         logger.warning(
             "sanitize_question: question truncated to %d characters.", _MAX_QUESTION_LEN
+        )
+
+    if injection_found:
+        logger.warning(
+            "sanitize_question: potential prompt-injection detected in question "
+            "and redacted. User text is data, not instructions."
         )
 
     return cleaned

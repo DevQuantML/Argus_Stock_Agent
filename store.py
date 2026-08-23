@@ -65,6 +65,7 @@ CREATE TABLE IF NOT EXISTS watchlist (
     tranches    TEXT NOT NULL DEFAULT '[]',
     brent_gated INTEGER NOT NULL DEFAULT 0,
     exchange    TEXT NOT NULL DEFAULT '',
+    sector      TEXT NOT NULL DEFAULT '',
     added_at    TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS sessions (
@@ -90,13 +91,55 @@ def _connect() -> sqlite3.Connection:
     global _conn
     if _conn is None:
         DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-        _conn.row_factory = sqlite3.Row
-        _conn.execute("PRAGMA journal_mode=WAL")
-        _conn.execute("PRAGMA foreign_keys=ON")
-        _conn.executescript(_SCHEMA)
-        _conn.commit()
+        # Built in a local variable and only published to the module global
+        # on full success — if any step below raises, _conn stays None and
+        # the next call retries initialisation from scratch, instead of
+        # every future caller silently reusing a half-set-up connection.
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.executescript(_SCHEMA)
+        _migrate(conn)
+        conn.commit()
+        _conn = conn
     return _conn
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Add columns introduced after a table's CREATE TABLE IF NOT EXISTS ran.
+
+    IF NOT EXISTS only creates a table on a fresh database — it is a no-op
+    against an existing file, so a new column needs an explicit ALTER TABLE
+    here or it silently never appears on any database that predates it.
+
+    The ALTER is wrapped because _connect() has no lock of its own; two
+    threads can both observe _conn is None and both reach this line before
+    either commits. Whichever loses that race hits "duplicate column name"
+    — which only ever means the other thread just added it — so it's caught
+    and ignored rather than left to fail the request. Only the thread that
+    actually adds the column runs the backfill below, so it never runs
+    twice.
+    """
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(watchlist)")}
+    if "sector" not in cols:
+        try:
+            conn.execute("ALTER TABLE watchlist ADD COLUMN sector TEXT NOT NULL DEFAULT ''")
+        except sqlite3.OperationalError:
+            return
+
+        # bootstrap() only seeds sector on first run and never re-runs, so a
+        # watchlist row that existed before this column did would otherwise
+        # be stuck at '' forever. Backfill from config for anything that
+        # matches and is still blank; anything already set (or not in
+        # config) is left alone.
+        for ticker, cfg in WATCHLIST.items():
+            sector = cfg.get("sector") or ""
+            if sector:
+                conn.execute(
+                    "UPDATE watchlist SET sector = ? WHERE ticker = ? AND sector = ''",
+                    (sector, ticker),
+                )
 
 
 def _rows(sql: str, args: tuple = ()) -> list[sqlite3.Row]:
@@ -155,10 +198,11 @@ def bootstrap() -> None:
             continue
         _exec(
             """INSERT OR IGNORE INTO watchlist
-               (ticker, note, tranches, brent_gated, exchange, added_at)
-               VALUES (?,?,?,?,?,?)""",
+               (ticker, note, tranches, brent_gated, exchange, sector, added_at)
+               VALUES (?,?,?,?,?,?,?)""",
             (t, cfg.get("thesis") or "", json.dumps(cfg.get("tranches") or []),
-             1 if cfg.get("brent_gated") else 0, cfg.get("exchange") or "", _now()),
+             1 if cfg.get("brent_gated") else 0, cfg.get("exchange") or "",
+             cfg.get("sector") or "", _now()),
         )
 
     _exec("INSERT OR REPLACE INTO meta (key, value) VALUES (?,?)", ("seeded", _now()))
@@ -225,17 +269,27 @@ def watchlist() -> dict[str, dict]:
             "tranches": _loads(r["tranches"], []) or None,
             "brent_gated": bool(r["brent_gated"]),
             "exchange": r["exchange"] or None,
+            "sector": r["sector"] or None,
         }
     return out
 
 
-def add_watch(ticker: str, note: str = "") -> str:
+def add_watch(ticker: str, note: str = "", sector: str = "") -> str:
     t = validate_ticker(ticker)
     _exec(
-        """INSERT INTO watchlist (ticker, note, tranches, brent_gated, exchange, added_at)
-           VALUES (?,?,'[]',0,'',?)
-           ON CONFLICT(ticker) DO UPDATE SET note=excluded.note""",
-        (t, (note or "")[:500], _now()),
+        """INSERT INTO watchlist (ticker, note, tranches, brent_gated, exchange, sector, added_at)
+           VALUES (?,?,'[]',0,'',?,?)
+           ON CONFLICT(ticker) DO UPDATE SET
+               note=excluded.note,
+               -- Only overwrite sector when a non-blank one was supplied.
+               -- add_watch(t, note) with no sector is the common re-add path
+               -- (the command line's `add PLTR "thesis"`), and excluded.sector
+               -- is '' there — assigning it unconditionally would silently wipe
+               -- a sector already set, and a blank sector matches no geo event
+               -- at all, so the ticker would quietly drop out of the panel.
+               sector=CASE WHEN excluded.sector != '' THEN excluded.sector
+                           ELSE watchlist.sector END""",
+        (t, (note or "")[:500], (sector or "")[:80], _now()),
     )
     return t
 

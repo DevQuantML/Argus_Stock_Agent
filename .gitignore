@@ -45,3 +45,6 @@ Thumbs.db
 argus.db
 argus.db-wal
 argus.db-shm
+argus-dev.db
+argus-dev.db-wal
+argus-dev.db-shm
