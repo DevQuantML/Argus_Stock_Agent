@@ -1,8 +1,15 @@
 # ARGUS://TERMINAL — Developer Handoff
 
-Last updated: 2026-08-08
+Last updated: 2026-08-21
 
-> **Most recent change (2026-08-08): the auth boundary moved.** Every route that
+> **Most recent change (2026-08-21): the terminal has three kinds of visitor.**
+> A session is no longer a yes/no — it carries a *tier*. `owner` is
+> `AGENT_SECRET` and can do everything; `guest` is a 24-hour key worth exactly
+> one research dive and is read-only on the book; `visitor` has no session at
+> all and gets the free tools. If you are holding a mental model where "holds a
+> session" means "may spend money", it is out of date — see §10.
+>
+> **Previous change (2026-08-08): the auth boundary moved.** Every route that
 > reads or writes the book now requires a session. If you are holding a mental
 > model where `/api/positions` and `/api/portfolio` are open, it is out of date —
 > see §2 and §4. Sections are dated because "this session" in an undated handoff
@@ -16,9 +23,13 @@ Last updated: 2026-08-08
 api.py                        FastAPI app — routes, auth (AGENT_SECRET), per-path-class rate limits
                               applied in middleware (see _budget_for; catch-all for any /api/*),
                               CSP (script-src 'self' for pages, default-src 'none' for API routes).
-                              TWO auth dependencies, do not conflate:
-                                require_auth    — paid routes, metered on every call
-                                require_session — user-data routes, meters failures only
+                              THREE auth dependencies, do not conflate:
+                                require_auth    — paid routes, metered; returns an
+                                                  AuthCtx so the handler sees the tier
+                                require_session — readable user-data routes; a guest
+                                                  passes, failures only are metered
+                                require_owner   — book WRITES and unbudgeted paid
+                                                  routes; a guest gets 403, not 401
 config.py                     MY_PORTFOLIO, WATCHLIST, BRENT_LEVELS, GEO_TRANSMISSION
 main.py                       CLI: python main.py PLTR | scan | brent
 tools/
@@ -33,7 +44,8 @@ tools/
                               statement in KRW/DKK/INR is comparable to a USD market cap
   xirr.py                     XIRR calculation for portfolio analytics
 store.py                      SQLite over argus.db — positions, watchlist, profile,
-                              sessions, outlook. Persistent state already lives here.
+                              sessions (tiered), outlook, guest_keys + guest_key_uses
+                              (the one-dive budget), access_requests.
 scripts/                      All free — no Perplexity, no Groq, no API spend.
   verify_quant.py             Quant engine end to end, 121 assertions. In the repo
                               deliberately — the previous scratchpad harness was lost.
@@ -465,6 +477,8 @@ class goes stale — correct by construction, no listener to fail. Verified: at 
 | ~~HIGH~~ | ~~`X-Forwarded-For` spoofing bypasses the rate limiter, making `AGENT_SECRET` brute-forceable~~ — **fixed 2026-08-13**, see §3 | `api.py` `_client_ip` |
 | ~~MEDIUM~~ | ~~Public routes are unmetered; `/api/portfolio` amplifies one request into 8 yfinance calls~~ — **fixed 2026-08-13**, see §3 | `api.py` |
 | ~~MEDIUM~~ | ~~Stored `thesis`/`note` reach the provider prompt unsanitised~~ — **fixed 2026-08-13**, see §3 | `tools/perplexity_research.py` |
+| ~~HIGH~~ | ~~`views.js` imported at `?v=15` while the rest of the tree was `?v=16`, loading two `api.js` instances with two `auth` objects: profile-view SIGN OUT left `app.js` still showing "AI ARMED", and accent swatches never repainted the chart~~ — **fixed 2026-08-21**, guarded by `verify_consistency.py`, see §10.5 | `static/js/views.js` |
+| ~~HIGH~~ | ~~`POST /api/research/{t}/synthesis` interpolated the caller's four module strings into the prompt unfenced, steering three paid calls on the owner's account — harmless while only the owner's browser called it, an injection path the moment guests could~~ — **fixed 2026-08-21**, see §10.5 | `api.py`, `tools/perplexity_research.py` |
 | LOW | Unknown ticker returns HTTP 200 with all-null fields — `null` price is the only reliable signal | `tools/stock_data.py`, callers |
 | LOW | Rate limiter (20 req/min) only works with `--workers 1` — multi-worker deploys have no guard | `api.py` |
 | ~~LOW~~ | ~~`requirements.txt` unpinned (`>=` floors, no lockfile); `pip-audit` never run~~ — **fixed 2026-08-12**, see §3 | `requirements.txt` |
@@ -690,3 +704,188 @@ Without `AGENT_SECRET` the app is fail-closed: every gated route returns 401 and
 the terminal cannot be unlocked. `/health` and the market-data routes still serve.
 
 The UI requires an unlock on every visit. That is deliberate — see §4.
+
+---
+
+## 10. Public access — landing, guest keys, tour (2026-08-21)
+
+### 10.1 Why
+
+The front door was a password box for `AGENT_SECRET`, with no way past it, under
+hint text promising that "quant, charts and P&L work without it" — which stopped
+being true the moment those routes gained `require_session` (§2). A visitor
+arriving from a link saw a locked door and nothing else, and had no way to ask
+for a key.
+
+### 10.2 The tier boundary, and why it landed first
+
+`store.session_valid() -> bool` became `session_info() -> {tier, guest_key_id,
+expires_at}`, and `api._credential_ok()` became `_auth_ctx() -> AuthCtx`.
+
+This shipped as its own commit, before any guest credential could exist, because
+the boolean *was* the vulnerability: `require_auth` accepted any valid session
+row, so a guest would have been indistinguishable from the operator and would
+have inherited `POST /api/portfolio/outlook` — ~$0.06 a call, over the owner's
+whole book, with no budget concept anywhere in it.
+
+`require_owner` now guards the five book-mutating routes plus the two unbudgeted
+paid ones. It answers an authenticated guest with **403, not 401**: a 401 sends
+the frontend back to the unlock screen, which would ask a guest for an owner
+secret they were never given.
+
+A guest session is valid only while its key is — `session_info()` LEFT JOINs
+`guest_keys`, so revocation and the 24-hour wall bite on the next request rather
+than at the cookie's own expiry.
+
+### 10.3 The one-dive budget
+
+A dive is five paid stages: four module GETs plus the synthesis POST.
+
+The budget is **per-module**, not per-ticker. A ticker-only budget would still
+let a guest re-fire `/report` a hundred times at ~$0.05 each. `guest_key_uses`
+carries `PRIMARY KEY (key_id, module)`, and that key *is* the check-and-set:
+`consume_guest_unit()` claims a stage with one `INSERT` inside `BEGIN IMMEDIATE`,
+so there is no read-then-write window — which matters, because the four module
+calls of a staged run overlap. `verify_access.py` races eight threads at one
+stage and asserts exactly one winner.
+
+`dive_ticker` is bound by a conditional `UPDATE ... WHERE dive_ticker IS NULL`
+and then read back, so two simultaneous first-calls for different tickers cannot
+both win.
+
+Everything inside `consume_guest_unit()` talks to the raw connection. `store._lock`
+is a plain non-reentrant `threading.Lock` and `_rows`/`_exec` both acquire it, so
+calling either from inside the lock deadlocks the process on the first guest
+research call. The file's usual idiom is the opposite, which is why it is
+commented at the call site.
+
+**Refunds are narrow on purpose.** A stage is returned only when no provider was
+configured — that raises before any network call, so it provably cost nothing.
+Any other failure keeps the stage: a mid-flight timeout may already have been
+billed, and refunding it would be unlimited retries of a paid operation. A refund
+never unbinds the ticker, so "one dive, one ticker" stays a rule with no
+exception to explain in the interface.
+
+### 10.4 Migration, and the trap in it
+
+`sessions` gained `tier` and `guest_key_id`. The migration lives in
+`store._connect()`, **not** `bootstrap()` — `bootstrap()` returns early once the
+`seeded` meta flag is set, so a migration placed there would never run on exactly
+the established databases that need it. `_migrate()` inspects
+`PRAGMA table_info` rather than tracking a version number, so running it twice is
+a no-op by construction. `DEFAULT 'owner'` backfills correctly, because every
+pre-existing session could only have come from `AGENT_SECRET`.
+
+### 10.5 Security fixes found while building this
+
+**The synthesis body was an unfenced prompt path.** `_synthesis_prompt()`
+interpolates the four posted module strings raw, and `run_synthesis` fires three
+paid calls off them. While the only caller was the operator's own browser echoing
+back model output, that was a trusted loop. Granting guests
+`POST /api/research/{t}/synthesis` would have turned it into untrusted input
+steering three calls on the *owner's* provider account. Every field now goes
+through `sanitize_prompt_text()`, for every tier — a guard that runs for only
+some callers is a guard waiting to be bypassed.
+
+**The `question` parameter was the last raw input on the paid path.** The
+synthesis body was fenced when guests gained access to it, but its sibling on
+the same newly-guest-reachable pipeline —
+`GET /api/research/{t}/report?question=…` — still reached `_research_prompt()`
+through `sanitize_question()` alone, which caps length and strips tags but
+neither redacts injection phrases nor marks where the untrusted span ends. Now
+fenced with `sanitize_prompt_text(question, max_len=_MAX_QUESTION_LEN,
+label="QUESTION")`, inside `run_research_module` so the CLI is covered too, and
+the prompt states that the fenced block is data rather than instructions.
+
+The first attempt at this fix was wrong in an instructive way: it chained
+`sanitize_prompt_text(sanitize_question(q))`, which reverses the order that
+matters. `sanitize_question` strips HTML first, and `_HTML_TAG_RE` eats the
+`<<<END:QUESTION>` prefix of a forged fence, leaving `>>`. The forged fence ends
+up broken either way, so the chained version *looked* correct — but it was
+broken by accident of a regex's shape rather than on purpose, exactly the
+failure mode `sanitize_prompt_text`'s internal ordering was written to avoid.
+Caught by a test that captured the actual prompt and asserted the forged marker
+was replaced with `[removed]`, not merely absent.
+
+**A "free" harness could have spent real money.** `api.py` calls `load_dotenv()`
+at import with the default `override=False`, which fills any name *absent* from
+the environment. Popping `PERPLEXITY_API_KEY` before importing `api` therefore
+lets dotenv put the real key straight back from `.env`. Harnesses set the name to
+an **empty string** instead, assert the emptiness after import, and additionally
+count provider invocations — with a positive control proving the counter can
+fire, so a zero count is evidence rather than a monkeypatch that silently failed
+to bind.
+
+**A module version drift had shipped.** `views.js` sat at `?v=15` while
+everything else was `?v=16`. ES modules are keyed by full URL, so two instances
+of `api.js` existed with two separate `auth` objects: SIGN OUT in the profile
+view cleared one while `app.js` read the other and still showed "AI ARMED", and
+the accent swatches fired a listener array the chart had never subscribed to.
+Fixed, and `verify_consistency.py` now asserts every `?v=` agrees — which caught
+the same drift recurring during the very next change.
+
+### 10.6 What a visitor may know
+
+`/api/meta` is public and carries `brent_levels`, the data-source disclosure and
+the disclaimer. `/api/info` stays gated exactly as it was.
+
+The line between them is `GEO_TRANSMISSION`. `BRENT_LEVELS` is never overridden
+by `config_local.py` — the override imports only `MY_PORTFOLIO`, `WATCHLIST` and
+`GEO_TRANSMISSION` — so the Brent ladder is always the published framework.
+`GEO_TRANSMISSION` *is* overridden, and its values name real holdings by
+construction (`"AAPL (supply chain exposure)"`). **Do not loosen `/api/info` to
+feed visitor mode.** `verify_access.py` plants a sentinel ticker in
+`GEO_TRANSMISSION` and asserts it never reaches `/api/meta`.
+
+### 10.7 Interface decisions worth keeping
+
+- **The cost modal forces all five stages for a guest.** The owner picks à la
+  carte because they pay per call and can run the rest tomorrow. A guest
+  unchecking three modules still binds their key to that ticker and can never
+  recover the rest, so forcing the full pipeline makes "one deep dive" mean one
+  thing and deletes the forfeiture case rather than explaining it. The dollar
+  column is replaced by an allowance strip — showing "$0.21" to someone who is
+  not paying reads as a charge about to be made to them.
+- **A run is refused with under 45 minutes of key life left.** A dive that cannot
+  finish spends the owner's money for a partial result.
+- **The staged loop breaks on a budget or bound denial.** It previously treated
+  any non-`unauthorized` error as a per-stage hiccup and carried on, which for an
+  exhausted guest meant four more doomed paid requests and four red toasts.
+- **The tour is z-index 55, below the modal layer at 60**, and refuses to start
+  while a modal or the gate is open. Above it, it would dim the
+  cost-confirmation dialog and swallow the click on CANCEL.
+- **Denied requests stay visible and reopenable.** `email_norm` is UNIQUE and the
+  conflict clause only touches pending rows, so a denied person's resubmissions
+  change nothing and return the same cheerful body forever. That is deliberate
+  anti-enumeration, but it makes one misclick a silent permanent block.
+- **Approve reveals the key exactly once**, with a `mailto:` draft that
+  deliberately omits it — a URL lands in history, logs and the OS handler chain.
+- **The guest allowance is rendered as a count**, never a flag. Five separately
+  consumable stages means a guest one stage in still has four; a boolean would
+  tell them their dive was gone while most of it remained.
+
+### 10.8 Verification
+
+All six free harnesses pass. Deliberately not quoting the assertion counts:
+they were wrong within a day of being written, and each harness prints its own
+total, so a number here adds nothing a reader can act on and one more thing that
+can be stale.
+
+Exercised in a browser against the real uvicorn server, since `TestClient` skips
+the middleware where the rate limiting lives: landing → free mode → `quant AAPL`
+with a live earnings chip and news → an access request whose note was
+`<img src=x onerror=…><script>…</script>` → that string present in the owner's
+admin view **as text**, zero `img` tags, zero `script` tags, payload did not fire
+→ approve → one-time reveal → guest redeem → chip reads `GUEST · 1 DIVE · 24H` →
+cost modal forced and priced as an allowance → tour refused to launch over it,
+CANCEL still hit-testable → cancel consumed no stage and bound no ticker.
+
+No paid provider call at any point; the dev server runs with no provider key, so
+research is structurally impossible there.
+
+### 10.9 Not built, deliberately
+
+Per-user sandboxes (each guest with their own book), any outbound email or SMTP
+integration, automated key issuance, payment or credit metering beyond the
+one-dive counter, and OAuth. The model here is a trusted circle around one
+operator's terminal, and each of those is a different product.

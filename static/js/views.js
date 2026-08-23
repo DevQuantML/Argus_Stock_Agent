@@ -8,77 +8,272 @@ import * as api from './api.js?v=17';
 import { renderMarkdown, escapeHtml } from './md.js?v=17';
 import * as ui from './ui.js?v=17';
 import * as prefs from './theme.js?v=17';
+import { DISCLAIMER, PRIVACY_NOTE, FRESHNESS_NOTE, guestAllowanceLine } from './copy.js?v=17';
 
 const $ = ui.$;
-const el = (tag, cls, text) => {
-  const n = document.createElement(tag);
-  if (cls) n.className = cls;
-  if (text !== undefined && text !== null) n.textContent = text;
-  return n;
-};
+const el = ui.el;
 
-/* ── Unlock ──────────────────────────────────────────────────────────────
-   Takes AGENT_SECRET, not a decorative PIN. On success the server sets an
-   HttpOnly cookie; nothing sensitive is stored client-side. */
+/* ── Landing ─────────────────────────────────────────────────────────────
+   The front door. It used to be a bare password box for a secret that only the
+   operator could possibly hold, with no way past it — a visitor arriving from a
+   link saw a locked door and nothing else, under hint text promising that
+   "quant, charts and P&L work without it" which had stopped being true when
+   those routes gained require_session.
 
-export function showUnlock(onDone) {
-  const host = $('gate');
-  host.className = 'gate on';
-  host.innerHTML = `
-    <div class="gate-box">
-      <pre class="boot-art" aria-hidden="true"> █████╗ ██████╗  ██████╗ ██╗   ██╗███████╗
+   Three ways in now: browse free, ask for a key, or use one.
+
+   The panes live in one gate box and swap by mode, the same render()/wire()
+   shape showOnboarding() uses. */
+
+const ART = ` █████╗ ██████╗  ██████╗ ██╗   ██╗███████╗
 ██╔══██╗██╔══██╗██╔════╝ ██║   ██║██╔════╝
 ███████║██████╔╝██║  ███╗██║   ██║███████╗
 ██╔══██║██╔══██╗██║   ██║██║   ██║╚════██║
 ██║  ██║██║  ██║╚██████╔╝╚██████╔╝███████║
-╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝  ╚═════╝ ╚══════╝</pre>
-      <div class="gate-hd">ARGUS://LOCKED</div>
-      <div class="fld">
-        <div class="fld-l">Agent key</div>
-        <input id="gate-key" class="inp" type="password" autocomplete="current-password"
-               spellcheck="false" placeholder="AGENT_SECRET from your server .env"/>
-        <div id="gate-err" class="gate-err"></div>
-      </div>
-      <button id="gate-go" class="btn" type="button" style="width:100%;padding:10px">UNLOCK ▸</button>
-      <p class="hint" style="margin-top:14px;line-height:1.8">
-        This is the <b>AGENT_SECRET</b> you set in <code>.env</code> — not a provider key.
-        It is exchanged for a 30-day session cookie your browser stores but page
-        scripts cannot read. Quant, charts and P&amp;L work without it; only paid
-        research is gated.</p>
-    </div>`;
+╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝  ╚═════╝ ╚══════╝`;
 
-  const input = $('gate-key');
-  const err = $('gate-err');
-  const box = host.querySelector('.gate-box');
-  let busy = false;
+const LAST_TIER_KEY = 'argus.lastTier';
 
-  const go = async () => {
-    if (busy) return;
-    const v = input.value.trim();
-    if (!v) { input.focus(); return; }
-    busy = true;
-    err.textContent = '';
-    const res = await api.auth.unlock(v);
-    busy = false;
-    if (res.ok) { host.className = 'gate'; host.innerHTML = ''; onDone && onDone(); return; }
-    // Still deliberately generic about a WRONG key — never hint at how close
-    // the attempt was. But a lockout or an unreachable server is not a wrong
-    // key, and saying "Rejected." for those sends the user to retry, which on
-    // a lockout makes it worse. Distinguish the cause, not the closeness.
-    if (res.status === 429) {
-      err.textContent = 'Too many attempts. Locked for ~15 min — the key may still be right.';
-    } else if (res.status === 0) {
-      err.textContent = 'Cannot reach the server. Is uvicorn still running?';
-    } else {
-      err.textContent = 'Rejected.';
-    }
-    box.classList.remove('shake'); void box.offsetWidth; box.classList.add('shake');
-    input.select();
+export function showLanding({ mode = 'landing', onUnlocked, onVisitor } = {}) {
+  const host = $('gate');
+  let cur = mode;
+
+  /* A browser that has unlocked as the operator before goes straight to the key
+     field. Only the WORD 'owner' is remembered — never a secret. Without this
+     the person who uses this terminal daily pays a click and a context switch
+     on every single visit to accommodate first-time visitors. */
+  if (cur === 'landing') {
+    try {
+      if (localStorage.getItem(LAST_TIER_KEY) === 'owner') cur = 'unlock';
+    } catch { /* private mode — just show the landing */ }
+  }
+
+  const render = () => {
+    host.className = 'gate on';
+    host.innerHTML =
+      `<div class="gate-box ld">
+         <pre class="boot-art" aria-hidden="true">${ART}</pre>
+         ${cur === 'landing' ? paneLanding() : cur === 'request' ? paneRequest() : paneUnlock()}
+       </div>`;
+    wire();
   };
 
-  $('gate-go').onclick = go;
-  input.addEventListener('keydown', e => { if (e.key === 'Enter') go(); });
-  input.focus();
+  /* Order is deliberate. For the audience of this screen — someone who arrived
+     with no key — the free path is the only one that works right now, so it is
+     the primary action. "I have a key" is last because almost nobody does. */
+  const paneLanding = () => `
+    <div class="gate-hd">ARGUS://TERMINAL</div>
+    <p class="ld-pitch">Free live valuation, price history and a macro gate for any
+      listed company. Deeper AI research runs on the owner's account and needs a key.</p>
+    <div class="ld-actions">
+      <button id="ld-free" class="btn" type="button">CONTINUE WITHOUT A KEY ▸</button>
+      <button id="ld-request" class="btn-g" type="button">REQUEST ACCESS</button>
+      <button id="ld-unlock" class="btn-g" type="button">I HAVE A KEY</button>
+    </div>
+    <p class="ld-disc" id="ld-disc"></p>`;
+
+  const paneUnlock = () => `
+    <div class="gate-hd">ARGUS://UNLOCK</div>
+    <div class="fld">
+      <div class="fld-l">Key</div>
+      <input id="gate-key" class="inp" type="password" autocomplete="off"
+             spellcheck="false" placeholder="Owner key, or a guest key (gk_…)"/>
+      <button id="gate-eye" class="btn-g gate-eye" type="button"
+              aria-label="Show or hide the key">SHOW</button>
+      <div id="gate-err" class="gate-err"></div>
+    </div>
+    <button id="gate-go" class="btn" type="button" style="width:100%;padding:10px">UNLOCK ▸</button>
+    <p class="hint" style="margin-top:14px;line-height:1.8">
+      The owner's <b>AGENT_SECRET</b>, or a <b>guest key</b> they issued you — not a
+      provider key. It is exchanged for a session cookie your browser stores but
+      page scripts cannot read. Free quant, charts and the Brent gate work without
+      any key; the owner's book and paid AI research do not.</p>
+    <button id="ld-back" class="btn-g ld-back" type="button">◂ OTHER OPTIONS</button>`;
+
+  const paneRequest = () => `
+    <div class="gate-hd">ARGUS://REQUEST ACCESS</div>
+    <div class="fld">
+      <div class="fld-l">Email</div>
+      <input id="rq-email" class="inp" type="email" autocomplete="email"
+             spellcheck="false" placeholder="you@example.com"/>
+    </div>
+    <div class="fld">
+      <div class="fld-l">Who are you? (optional)</div>
+      <textarea id="rq-note" class="inp" rows="3" maxlength="280"
+                placeholder="A line about why you'd like access."></textarea>
+    </div>
+    <p class="hint ld-priv" id="rq-priv"></p>
+    <div id="rq-err" class="gate-err"></div>
+    <button id="rq-send" class="btn" type="button" style="width:100%;padding:10px">SEND REQUEST ▸</button>
+    <button id="ld-back" class="btn-g ld-back" type="button">◂ OTHER OPTIONS</button>`;
+
+  const go = (m) => { cur = m; render(); };
+
+  function wire() {
+    // textContent for every standing disclosure — one definition in copy.js.
+    const disc = $('ld-disc'); if (disc) disc.textContent = DISCLAIMER;
+    const priv = $('rq-priv'); if (priv) priv.textContent = PRIVACY_NOTE;
+
+    $('ld-request')?.addEventListener('click', () => go('request'));
+    $('ld-unlock')?.addEventListener('click',  () => go('unlock'));
+    $('ld-back')?.addEventListener('click',    () => go('landing'));
+
+    $('ld-free')?.addEventListener('click', () => {
+      // Remembered for this tab only. A brand-new tab gets the landing again,
+      // which is the right default for a shared or public machine.
+      try { sessionStorage.setItem('argus.visitor', '1'); } catch { /* fine */ }
+      host.className = 'gate';
+      host.innerHTML = '';
+      onVisitor && onVisitor();
+    });
+
+    wireUnlock();
+    wireRequest();
+  }
+
+  function wireUnlock() {
+    const input = $('gate-key');
+    if (!input) return;
+    const err = $('gate-err');
+    const box = host.querySelector('.gate-box');
+    let busy = false;
+
+    // A long opaque guest key pasted into a masked field is exactly how someone
+    // burns the 10-failures-per-15-minutes lockout — which is keyed on the
+    // socket peer, so it takes out everyone behind the same NAT, the operator
+    // included. Let them see what they pasted.
+    $('gate-eye').onclick = () => {
+      const showing = input.type === 'text';
+      input.type = showing ? 'password' : 'text';
+      $('gate-eye').textContent = showing ? 'SHOW' : 'HIDE';
+      input.focus();
+    };
+
+    const submit = async () => {
+      if (busy) return;
+      const v = input.value.trim();     // trimmed: a trailing newline off a
+      if (!v) { input.focus(); return; } // paste is a free failed attempt
+      busy = true;
+      err.textContent = '';
+      const res = await api.auth.unlock(v);
+      busy = false;
+
+      if (res.ok) {
+        try { localStorage.setItem(LAST_TIER_KEY, res.tier || 'owner'); } catch { /* fine */ }
+        host.className = 'gate';
+        host.innerHTML = '';
+        onUnlocked && onUnlocked(res);
+        return;
+      }
+
+      // Still deliberately generic about a WRONG key — never hint at how close
+      // the attempt was. But a lockout, a dead guest key and an unreachable
+      // server are not wrong keys, and reporting them as "Rejected." sends the
+      // user to retry, which on a lockout makes it worse.
+      if (res.status === 429) {
+        err.textContent = 'Too many attempts. Locked for ~15 min — the key may still be right.';
+      } else if (res.status === 0) {
+        err.textContent = 'Cannot reach the server. Is it still running?';
+      } else if (res.code === 'guest_expired') {
+        err.textContent = res.message || 'That guest key has expired. Ask the owner for a new one.';
+      } else {
+        err.textContent = 'Rejected.';
+      }
+      box.classList.remove('shake'); void box.offsetWidth; box.classList.add('shake');
+      input.select();
+    };
+
+    $('gate-go').onclick = submit;
+    input.addEventListener('keydown', e => { if (e.key === 'Enter') submit(); });
+    input.focus();
+  }
+
+  function wireRequest() {
+    const send = $('rq-send');
+    if (!send) return;
+    const email = $('rq-email');
+    const note = $('rq-note');
+    const err = $('rq-err');
+    let busy = false;
+
+    // fetch(), never a form submit: _PAGE_CSP sets form-action 'none', so a
+    // native <form action=…> is silently blocked by the browser.
+    const submit = async () => {
+      if (busy) return;
+      const v = (email.value || '').trim();
+      if (!/.+@.+\..+/.test(v)) {
+        err.textContent = 'Enter a valid email address.';
+        email.focus();
+        return;
+      }
+      busy = true;
+      err.textContent = '';
+      send.disabled = true;
+      send.textContent = 'SENDING…';
+      try {
+        await api.requestAccess(v, (note.value || '').trim());
+        host.querySelector('.gate-box').innerHTML =
+          `<pre class="boot-art" aria-hidden="true">${ART}</pre>
+           <div class="gate-hd">ARGUS://REQUEST SENT</div>
+           <p class="ld-pitch" id="rq-done"></p>
+           <button id="ld-back" class="btn-g" type="button"
+                   style="width:100%;padding:10px">◂ BACK</button>`;
+        // Say what actually happens. There is no mail server here: a person
+        // reads this and writes back by hand, which can take a day or two.
+        $('rq-done').textContent =
+          'Recorded. The owner reviews requests personally and will email your key '
+          + 'from their own address — nothing is sent automatically, so it may take '
+          + 'a day or two. Nothing else will ever be sent to you. In the meantime '
+          + 'you can keep using the free tools.';
+        $('ld-back').onclick = () => go('landing');
+      } catch (e) {
+        busy = false;
+        send.disabled = false;
+        send.textContent = 'SEND REQUEST ▸';
+        err.textContent = e.kind === 'ratelimit'
+          ? 'Too many requests from this connection. Try again later.'
+          : e.message || 'Could not send the request.';
+      }
+    };
+
+    send.onclick = submit;
+    email.addEventListener('keydown', e => { if (e.key === 'Enter') submit(); });
+    email.focus();
+  }
+
+  render();
+}
+
+/* Kept for the re-unlock path used by the config modal. */
+export function showUnlock(onDone) {
+  showLanding({ mode: 'unlock', onUnlocked: onDone });
+}
+
+/* Shown where a view needs the book but the viewer has no claim to it. Better
+   than letting the view 401 and print an error — the reader is not doing
+   anything wrong, they simply are not the owner. */
+export function renderLockedView(host, { title = 'ARGUS://LOCKED', body = '', onUnlock, onRequest } = {}) {
+  host.innerHTML = '';
+  host.appendChild(el('div', 'r-title', title));
+  const p = el('p', 'hint');
+  p.style.cssText = 'line-height:1.9;margin:10px 0 16px';
+  p.textContent = body;
+  host.appendChild(p);
+
+  const row = el('div', 'ld-actions');
+  row.style.maxWidth = '360px';
+  const req = el('button', 'btn', 'REQUEST ACCESS');
+  req.type = 'button';
+  req.onclick = () => onRequest && onRequest();
+  const unl = el('button', 'btn-g', 'I HAVE A KEY');
+  unl.type = 'button';
+  unl.onclick = () => onUnlock && onUnlock();
+  row.append(req, unl);
+  host.appendChild(row);
+
+  const d = el('p', 'ld-disc');
+  d.textContent = DISCLAIMER;
+  host.appendChild(d);
 }
 
 /* ── Onboarding ──────────────────────────────────────────────────────────
@@ -232,7 +427,7 @@ export function showOnboarding(positions, onDone) {
 
 const money = (v, c) => ui.money(v, c);
 
-export async function renderPortfolio(host, { onOutlook } = {}) {
+export async function renderPortfolio(host, { onOutlook, tier = 'owner' } = {}) {
   host.innerHTML = '';
   const title = el('div', 'r-title', 'ARGUS://PORTFOLIO');
   host.appendChild(title);
@@ -330,10 +525,10 @@ export async function renderPortfolio(host, { onOutlook } = {}) {
   const box = el('div');
   box.id = 'outlook-box';
   host.appendChild(box);
-  await paintOutlook(box, onOutlook);
+  await paintOutlook(box, onOutlook, tier);
 }
 
-export async function paintOutlook(box, onOutlook) {
+export async function paintOutlook(box, onOutlook, tier = 'owner') {
   box.innerHTML = '';
   let cached = null;
   try { cached = (await api.getOutlook()).outlook; } catch { /* free call; ignore */ }
@@ -346,10 +541,17 @@ export async function paintOutlook(box, onOutlook) {
          holding — firm, rating, price target and date — then builds a
          position-weighted bear / base / bull band.<br>
          One provider call covering every holding.</p>`;
-    const btn = el('button', 'btn', 'RUN OUTLOOK  ~$0.06');
-    btn.type = 'button';
-    btn.onclick = () => onOutlook && onOutlook(box);
-    empty.appendChild(btn);
+    // Owner only. The button is hidden rather than disabled for a guest: an
+    // inert control invites a click and then explains why it did nothing.
+    if (tier === 'owner') {
+      const btn = el('button', 'btn', 'RUN OUTLOOK  ~$0.06');
+      btn.type = 'button';
+      btn.onclick = () => onOutlook && onOutlook(box);
+      empty.appendChild(btn);
+    } else {
+      empty.appendChild(el('p', 'hint',
+        'No outlook has been generated yet. Only the terminal owner can run one.'));
+    }
     box.appendChild(empty);
     return;
   }
@@ -359,10 +561,12 @@ export async function paintOutlook(box, onOutlook) {
             : cached.age_days === 1 ? 'yesterday'
             : cached.age_days != null ? `${cached.age_days} days ago` : '';
   head.appendChild(el('span', 'dim', `Generated ${age} · ${cached.provider === 'groq' ? 'GROQ · no live web' : 'Perplexity · live web'}`));
-  const refresh = el('button', 'btn-g', '↻ REFRESH  ~$0.06');
-  refresh.type = 'button';
-  refresh.onclick = () => onOutlook && onOutlook(box);
-  head.appendChild(refresh);
+  if (tier === 'owner') {
+    const refresh = el('button', 'btn-g', '↻ REFRESH  ~$0.06');
+    refresh.type = 'button';
+    refresh.onclick = () => onOutlook && onOutlook(box);
+    head.appendChild(refresh);
+  }
   box.appendChild(head);
 
   const text = cached.outlook || '';
@@ -394,7 +598,7 @@ export async function paintOutlook(box, onOutlook) {
 
 /* ── Profile view ────────────────────────────────────────────────────────── */
 
-export async function renderProfile(host, { onChanged } = {}) {
+export async function renderProfile(host, { onChanged, tier = 'owner' } = {}) {
   host.innerHTML = '';
   host.appendChild(el('div', 'r-title', 'ARGUS://PROFILE'));
 
@@ -404,6 +608,22 @@ export async function renderProfile(host, { onChanged } = {}) {
     positions = (await api.getPositions()).positions;
     watch     = (await api.getWatchlist()).watchlist;
   } catch (err) { host.appendChild(el('div', 'dim', err.message)); return; }
+
+  /* A guest reads this page; they do not edit it. The server refuses their
+     writes with a 403 regardless, so this is about not offering a control that
+     cannot work — every save button here would fail, and an interface that
+     invites an action it will then refuse is worse than one that does not
+     offer it. Appearance settings stay live: those are localStorage, theirs. */
+  const ro = tier !== 'owner';
+  if (ro) {
+    const banner = el('p', 'hint');
+    banner.style.cssText = 'margin:6px 0 4px;line-height:1.8';
+    banner.textContent =
+      'Guest access is read-only. This is the owner\'s book — you can see it, '
+      + 'but positions, watchlist and tailoring cannot be changed from here. '
+      + 'Appearance settings below are yours and are saved in this browser.';
+    host.appendChild(banner);
+  }
 
   // Tailoring
   host.appendChild(el('div', 'r-head', 'TAILORING'));
@@ -442,6 +662,13 @@ export async function renderProfile(host, { onChanged } = {}) {
     };
   });
 
+  if (ro) {
+    // Freeze the tailoring controls rather than hiding them: the guest should
+    // still be able to SEE how this terminal is configured.
+    host.querySelectorAll('#pf-name, .seg button, .chip-t')
+        .forEach(n => { n.disabled = true; });
+  }
+
   const save = el('button', 'btn', 'SAVE TAILORING');
   save.type = 'button';
   save.onclick = async () => {
@@ -451,14 +678,14 @@ export async function renderProfile(host, { onChanged } = {}) {
       onChanged && onChanged();
     } catch (err) { ui.toast(err.message, 'error'); }
   };
-  host.appendChild(save);
+  if (!ro) host.appendChild(save);
 
   // Positions
   host.appendChild(el('div', 'r-head', 'POSITIONS'));
   const ptab = el('div', 'ed-tab');
   ptab.appendChild(rowHead(['TICKER', 'SHARES', 'AVG COST', 'BUY DATE', 'STOP', 'TRIM', '']));
   for (const [t, p] of Object.entries(positions)) {
-    ptab.appendChild(positionRow(t, p, onChanged));
+    ptab.appendChild(positionRow(t, p, onChanged, false, ro));
   }
   host.appendChild(ptab);
 
@@ -469,7 +696,7 @@ export async function renderProfile(host, { onChanged } = {}) {
     const blank = el('div');
     ptab.appendChild(positionRow('', {}, onChanged, true));
   };
-  host.appendChild(addP);
+  if (!ro) host.appendChild(addP);
 
   // Watchlist
   host.appendChild(el('div', 'r-head', 'WATCHLIST'));
@@ -481,6 +708,7 @@ export async function renderProfile(host, { onChanged } = {}) {
     const del = el('button', 'btn-danger', '✕');
     del.type = 'button';
     del.title = `Remove ${t}`;
+    if (ro) del.style.display = 'none';
     del.onclick = async () => {
       try { await api.delWatch(t); r.remove(); ui.toast(`${t} removed.`, 'success', 2200); onChanged && onChanged(); }
       catch (err) { ui.toast(err.message, 'error'); }
@@ -523,12 +751,194 @@ export async function renderProfile(host, { onChanged } = {}) {
   out.type = 'button';
   out.style.marginTop = '10px';
   out.onclick = async () => {
-    await api.auth.signOut();
-    ui.renderKeyState(false);
-    ui.toast('Signed out. Paid research is locked until you unlock again.', 'info', 4000);
+    const done = await api.auth.signOut();
+    ui.renderKeyState('visitor', null);
+    ui.toast(done ? 'Signed out. Paid research is locked until you unlock again.'
+                  : 'Could not confirm sign-out — the server did not respond. Close this browser to be safe.',
+             done ? 'info' : 'warn', done ? 4000 : 9000);
     onChanged && onChanged();
   };
   host.appendChild(out);
+
+  if (tier === 'owner') await renderAdmin(host);
+}
+
+/* ── Owner administration ─────────────────────────────────────────────────
+   Requests and issued keys.
+
+   SECURITY: `email` and `note` are typed by strangers into a public form and
+   land here, inside the owner's authenticated page. Every one of them is
+   written with textContent or el(tag, cls, text) — never interpolated into a
+   template, escaped or otherwise. The CSP would stop an injected <script> from
+   running, but markup injection could still deface this view or smuggle in
+   something clickable, and there is no reason to rely on the CSP for a value
+   that has no business being markup in the first place. */
+
+async function renderAdmin(host) {
+  host.appendChild(el('div', 'r-head', 'ACCESS://REQUESTS'));
+  const reqBox = el('div');
+  reqBox.id = 'adm-req';
+  host.appendChild(reqBox);
+
+  host.appendChild(el('div', 'r-head', 'ACCESS://GUEST KEYS'));
+  const keyBox = el('div');
+  keyBox.id = 'adm-keys';
+  host.appendChild(keyBox);
+
+  const panic = el('button', 'btn-danger', 'REVOKE ALL GUEST ACCESS');
+  panic.type = 'button';
+  panic.style.marginTop = '10px';
+  panic.onclick = async () => {
+    const ok = await ui.confirmAction(
+      'REVOKE ALL GUEST ACCESS',
+      'Revokes every issued guest key and signs out every guest immediately. '
+      + 'Your own session is unaffected. Note that rotating AGENT_SECRET does NOT '
+      + 'do this — sessions are checked before the secret is, so this is the only '
+      + 'way to actually cut guests off.',
+      'REVOKE ALL');
+    if (!ok) return;
+    try {
+      const r = await api.adminRevokeAll();
+      ui.toast(`Revoked ${r.revoked} key(s). All guest sessions ended.`, 'success', 5000);
+      await paintRequests(reqBox);
+      await paintKeys(keyBox);
+    } catch (err) { ui.toast(err.message, 'error'); }
+  };
+  host.appendChild(panic);
+
+  await paintRequests(reqBox);
+  await paintKeys(keyBox);
+}
+
+/* Approve and reveal, shared by the pending row's ✓ and the approved row's +KEY.
+   Both mint a key, and the raw key exists in that ONE response and nowhere else
+   — two hand-copied reveal calls is one of them quietly losing the reveal and
+   minting a key nobody can ever read. Only the repaint differs: re-approving an
+   already-approved row does not change its status, so that list stays put. */
+async function approveAndReveal(r, box, { repaintRequests }) {
+  try {
+    const res = await api.adminApprove(r.id);
+    ui.showKeyReveal({ email: r.email, key: res.guest_key,
+                       expiresAt: (res.expires_at || '').slice(0, 16).replace('T', ' ') });
+    if (repaintRequests) await paintRequests(box);
+    await paintKeys($('adm-keys'));
+  } catch (err) { ui.toast(err.message, 'error'); }
+}
+
+async function paintRequests(box) {
+  box.innerHTML = '';
+  let rows = [];
+  try { rows = (await api.adminRequests()).requests || []; }
+  catch (err) { box.appendChild(el('div', 'adm-empty', err.message)); return; }
+
+  if (!rows.length) { box.appendChild(el('div', 'adm-empty', 'No requests yet.')); return; }
+
+  const tab = el('div', 'ed-tab');
+  tab.appendChild(rowHead(['EMAIL', 'NOTE', 'STATUS', '']));
+
+  for (const r of rows) {
+    const row = el('div', 'ed-row rq');
+    if (r.status !== 'pending') row.classList.add('gk-dead');
+
+    row.appendChild(el('span', 'ed-t', r.email));            // untrusted → text
+    row.appendChild(el('span', 'rq-note', (r.note || '—')));  // untrusted → text
+    row.appendChild(el('span', `rq-st ${r.status}`, r.status.toUpperCase()));
+
+    const acts = el('div', 'ed-a');
+    if (r.status === 'pending') {
+      const ok = el('button', 'btn-g', '✓');
+      ok.type = 'button'; ok.title = `Approve ${r.email} and mint a key`;
+      // The reveal inside is the only moment this key exists in readable form.
+      ok.onclick = () => approveAndReveal(r, box, { repaintRequests: true });
+      const no = el('button', 'btn-danger', '✕');
+      no.type = 'button'; no.title = `Deny ${r.email}`;
+      no.onclick = async () => {
+        const sure = await ui.confirmAction('DENY REQUEST',
+          `Deny access for ${r.email}? They are not told, and resubmitting will not `
+          + 'reach you again — but you can reopen it from this list.', 'DENY');
+        if (!sure) return;
+        try { await api.adminDeny(r.id); await paintRequests(box); }
+        catch (err) { ui.toast(err.message, 'error'); }
+      };
+      acts.append(ok, no);
+    } else if (r.status === 'denied') {
+      // Denied rows stay visible and reopenable. Hidden, a misclick becomes an
+      // invisible permanent block: their resubmissions collide with the unique
+      // email and silently change nothing.
+      const re = el('button', 'btn-g', '↺');
+      re.type = 'button'; re.title = `Reopen ${r.email}`;
+      re.onclick = async () => {
+        try { await api.adminReopen(r.id); await paintRequests(box); ui.toast('Reopened.', 'success', 2600); }
+        catch (err) { ui.toast(err.message, 'error'); }
+      };
+      acts.appendChild(re);
+    } else {
+      const again = el('button', 'btn-g', '+KEY');
+      again.type = 'button'; again.title = `Issue ${r.email} a fresh key`;
+      again.onclick = () => approveAndReveal(r, box, { repaintRequests: false });
+      acts.appendChild(again);
+    }
+    row.appendChild(acts);
+    tab.appendChild(row);
+  }
+  box.appendChild(tab);
+}
+
+async function paintKeys(box) {
+  if (!box) return;
+  box.innerHTML = '';
+  let keys = [];
+  try { keys = (await api.adminGuestKeys()).keys || []; }
+  catch (err) { box.appendChild(el('div', 'adm-empty', err.message)); return; }
+
+  if (!keys.length) { box.appendChild(el('div', 'adm-empty', 'No keys issued.')); return; }
+
+  const tab = el('div', 'ed-tab');
+  tab.appendChild(rowHead(['KEY', 'ISSUED TO', 'EXPIRES', 'DIVE', 'USED', '']));
+
+  for (const k of keys) {
+    const row = el('div', 'ed-row gk');
+    const dead = k.revoked || k.expired;
+    if (dead) row.classList.add('gk-dead');
+
+    // key_prefix only — the full key exists nowhere on the server.
+    row.appendChild(el('span', 'ed-t', `${k.key_prefix}…`));
+    row.appendChild(el('span', 'rq-note', k.label || '—'));   // untrusted → text
+
+    const when = k.revoked ? 'revoked'
+               : k.expired ? 'expired'
+               : relWhen(k.expires_at);
+    row.appendChild(el('span', 'rq-note', when));
+    row.appendChild(el('span', 'rq-note', k.dive_ticker || '—'));
+    row.appendChild(el('span', 'rq-note', `${k.modules_used}/${k.modules_total}`));
+
+    const acts = el('div', 'ed-a');
+    if (!dead) {
+      const rv = el('button', 'btn-danger', '✕');
+      rv.type = 'button'; rv.title = 'Revoke this key';
+      rv.onclick = async () => {
+        const sure = await ui.confirmAction('REVOKE KEY',
+          `Revoke the key issued to ${k.label || 'this person'}? Their session ends `
+          + 'on their next request.', 'REVOKE');
+        if (!sure) return;
+        try { await api.adminRevoke(k.id); await paintKeys(box); ui.toast('Key revoked.', 'success', 2600); }
+        catch (err) { ui.toast(err.message, 'error'); }
+      };
+      acts.appendChild(rv);
+    }
+    row.appendChild(acts);
+    tab.appendChild(row);
+  }
+  box.appendChild(tab);
+}
+
+function relWhen(iso) {
+  const t = Date.parse(iso || '');
+  if (!Number.isFinite(t)) return '—';
+  const hrs = (t - Date.now()) / 3.6e6;
+  if (hrs <= 0) return 'expired';
+  if (hrs < 1) return '<1h left';
+  return `${Math.round(hrs)}h left`;
 }
 
 function rowHead(cols) {
@@ -537,7 +947,7 @@ function rowHead(cols) {
   return r;
 }
 
-function positionRow(ticker, p, onChanged, isNew = false) {
+function positionRow(ticker, p, onChanged, isNew = false, readOnly = false) {
   const r = el('div', 'ed-row');
   const f = (val, type, ph, w) => {
     const i = el('input', 'inp ed-i');
@@ -554,6 +964,12 @@ function positionRow(ticker, p, onChanged, isNew = false) {
   const stop = f(p.stop_loss, 'number', 'stop');
   const trim = f(p.trim_at, 'number', 'trim');
   r.append(tIn, sh, cost, date, stop, trim);
+
+  // A guest sees the book exactly as it is, and cannot edit a field of it.
+  if (readOnly) {
+    [tIn, sh, cost, date, stop, trim].forEach(n => { n.disabled = true; });
+    return r;
+  }
 
   const actions = el('div', 'ed-a');
   const save = el('button', 'btn-g', '✓');

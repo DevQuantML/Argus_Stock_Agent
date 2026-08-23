@@ -87,7 +87,7 @@
 
     <!-- COLUMN 1 · BRENT + GEO -->
     <div id="col1" class="col">
-      <div class="blk">
+      <div class="blk" id="blk-brent">
         <div class="blk-h">
           <span class="panel-h"><button class="chev" type="button" data-panel="brent" aria-label="Collapse Brent">▾</button>BRENT://SIGNAL</span>
           <span style="display:flex;align-items:center;gap:6px">
@@ -111,7 +111,7 @@
 
     <!-- COLUMN 2 · WATCHLIST + COMMANDS -->
     <div id="col2" class="col">
-      <div class="blk-grow" style="border-bottom:1px solid var(--border)">
+      <div class="blk-grow" id="blk-watch" style="border-bottom:1px solid var(--border)">
         <div class="blk-h">
           <span class="panel-h"><button class="chev" type="button" data-panel="watch" aria-label="Collapse Watchlist">▾</button>WATCHLIST://ACTIVE</span>
           <span style="display:flex;align-items:center;gap:6px">
@@ -148,6 +148,8 @@
           <div data-cmd="profile"><b>profile</b> <span>holdings &amp; settings</span></div>
           <div data-cmd="focus"><b>focus</b> <span>hide side panels</span></div>
           <div data-cmd="clear"><b>clear</b> <span>reset output</span></div>
+          <div data-cmd="tour"><b>tour</b> <span>30-second orientation</span></div>
+          <div data-cmd="request"><b>request</b> <span>ask for an agent key</span></div>
           <div data-cmd="help"><b>help</b> <span>all commands</span></div>
         </div>
       </div>

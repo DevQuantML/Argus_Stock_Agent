@@ -22,6 +22,7 @@ they were reading different books.
 Run:  python scripts/verify_consistency.py
 """
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -104,6 +105,54 @@ def main():
 
     check("stock_data.py no longer reads the config seed for position context",
           "if ticker in MY_PORTFOLIO:" in src, False)
+
+    # ── 3. One asset version, not several ─────────────────────────────────
+    # Same defect class as the P&L mismatch above, in the module graph rather
+    # than in arithmetic: ES modules are keyed by full URL, so api.js?v=15 and
+    # api.js?v=16 are two unrelated module instances with two unrelated copies
+    # of `auth`. views.js sat at ?v=15 while app.js/ui.js/index.html were at
+    # ?v=16, which meant SIGN OUT in the profile view cleared one auth cache
+    # while app.js kept reading the other and still believed the session was
+    # live. The accent swatches had the matching bug: prefs.set() fired the
+    # listener array of an instance the chart had never subscribed to, so the
+    # SVG kept the old colour.
+    #
+    # Guard the invariant, not the number: every ?v= in the tree must agree.
+    # This stays true across future bumps without editing the harness.
+    versions: dict[str, list[str]] = {}
+    for path in sorted((ROOT / "static").rglob("*")):
+        if path.suffix not in {".js", ".html"} or not path.is_file():
+            continue
+        for v in re.findall(r"\?v=(\d+)", path.read_text(encoding="utf-8")):
+            versions.setdefault(v, []).append(path.relative_to(ROOT).as_posix())
+
+    # ── 4. The tier has one source, not two ───────────────────────────────
+    # app.js used to keep `state.tier` in step with api.auth via a syncTier()
+    # call after every refresh, and one call site forgot — unlocking through the
+    # config modal left the mirror reading 'visitor' while the auth layer said
+    # 'owner', so the real owner's own add/rm were refused as a stranger's.
+    # Same defect class as the ?v= drift above: one quantity, two copies.
+    # It is now derived by a getter, which cannot drift. Guard that.
+    app_js = (ROOT / "static" / "js" / "app.js").read_text(encoding="utf-8")
+    # Strip comments properly. A line-prefix filter does not work here: a /* */
+    # block's continuation lines start with ordinary prose, and the comment
+    # explaining this very invariant names both `state.tier` and `syncTier` —
+    # so a naive scan matches the explanation and reports the bug it warns
+    # about. That false positive has now bitten this project three times.
+    app_code = re.sub(r"/\*.*?\*/", "", app_js, flags=re.S)
+    app_code = re.sub(r"//.*$", "", app_code, flags=re.M)
+    check("app.js derives the tier rather than storing it",
+          "const tier      = () => api.auth.effectiveTier();" in app_code, True)
+    check("...so no state.tier field survives to drift",
+          "state.tier" in app_code, False)
+    check("...and syncTier() is gone with it",
+          "syncTier" in app_code, False)
+
+    check(f"every ?v= asset version in static/ agrees (found: {sorted(versions) or 'none'})",
+          len(versions), 1)
+    if len(versions) > 1:
+        for v, files in sorted(versions.items()):
+            print(f"          v={v}: {', '.join(sorted(set(files)))}")
 
 
 try:

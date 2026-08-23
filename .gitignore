@@ -41,10 +41,10 @@ Thumbs.db
 # broad `git add` would otherwise commit a second copy of the tree.
 .claude/
 
-# Local database — profile, positions, watchlist, sessions
-argus.db
-argus.db-wal
-argus.db-shm
-argus-dev.db
-argus-dev.db-wal
-argus-dev.db-shm
+# Local database — profile, positions, watchlist, sessions.
+# Globbed rather than listed: a dev/scratch database (argus-dev.db, and the
+# -wal/-shm SQLite writes beside it) is still a database full of real holdings
+# and session hashes, and listing exact names would not cover it.
+argus*.db
+argus*.db-wal
+argus*.db-shm

@@ -218,6 +218,9 @@ your account, so Argus is built to make it deliberate:
 | `/api/demo/{ticker}` — quant metrics | **free** |
 | `/api/brent` — the oil gate | **free** |
 | `/api/history/{ticker}` — price chart | **free** |
+| `/api/earnings/{ticker}` — next earnings date | **free** |
+| `/api/news/{ticker}` — recent headlines | **free** |
+| `/api/meta` — framework + disclosures, no session needed | **free** |
 | `/health` | **free** |
 | `python main.py brent` | **free** |
 | `scripts/verify_*.py` | **free** |
@@ -278,16 +281,18 @@ docker build -t argus .
 docker run -p 8000:8000 --env-file .env argus
 ```
 
-### The three keys — don't confuse them
+### The keys — don't confuse them
 
 | Key | Lives in | What it's for |
 |---|---|---|
 | `AGENT_SECRET` | `.env` **and** the browser Settings drawer | A password *you invent*. Gates the app so nobody else can spend your credits. |
 | `PERPLEXITY_API_KEY` | `.env` only | Provider credential. **Never sent to the browser.** |
 | `GROQ_API_KEY` | `.env` only | Fallback provider. **Never sent to the browser.** |
+| a **guest key** (`gk_…`) | issued from the app, stored **hashed** | A 24-hour key you hand to someone else. Read-only on your book, and worth exactly one AI deep dive on one ticker. You mint it by approving their request in the terminal; the raw key is shown to you once and never stored. |
 
-Without `AGENT_SECRET` the app is fail-closed: gated routes return 401 and the
-terminal cannot be unlocked. The free market-data routes still work.
+Without `AGENT_SECRET` the app is fail-closed: gated routes return 401 and no
+key of any kind can be redeemed. The free market-data routes still work, and a
+visitor can still browse them without a key at all.
 
 Generate a strong one:
 

@@ -35,6 +35,7 @@ import re
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -45,12 +46,13 @@ try:
 except ImportError:
     pass  # dotenv optional — fall back to real env vars
 
-from fastapi import Depends, FastAPI, Header, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 
 import store
 from config import BRENT_LEVELS, GEO_EVENT_LIBRARY, GEO_TRANSMISSION
+from tools.notify import notify_telegram, start_telegram_reply_listener
 from tools.oil_price import get_brent_price, get_brent_signal
 from tools.perplexity_research import (
     run_demo,
@@ -59,7 +61,13 @@ from tools.perplexity_research import (
     run_research_module,
     run_synthesis,
 )
-from tools.stock_data import get_price_and_fundamentals, get_price_history
+from tools.stock_data import (
+    get_news,
+    get_next_earnings,
+    get_price_and_fundamentals,
+    get_price_history,
+)
+from tools.validator import sanitize_prompt_text, validate_ticker
 from tools.xirr import xirr
 
 _STATIC_DIR = Path(__file__).parent / "static"
@@ -81,10 +89,29 @@ except Exception as _bootstrap_exc:
     )
     raise SystemExit(1) from _bootstrap_exc
 
+# The Telegram reply listener (approve-by-replying-with-the-email) starts
+# here rather than at import time. FastAPI's lifespan only runs when the ASGI
+# app is actually served — a bare `import api`, and TestClient(api.app) used
+# without a `with` block (this project's whole verify_access.py harness),
+# never trigger it. That is what keeps a "spends nothing, touches nothing
+# external" test run from spawning a background thread that long-polls a real
+# Telegram API. _handle_telegram_reply is defined further down, near the rest
+# of the access-request code; referencing it here by name is fine because
+# this coroutine only runs (and only looks the name up) at real startup, long
+# after the whole module has finished importing.
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    stop = start_telegram_reply_listener(_handle_telegram_reply)
+    yield
+    if stop is not None:
+        stop.set()
+
+
 app = FastAPI(
     title="Stock Research Agent",
     description="Personal institutional-grade research agent with Brent crude framework",
     version="1.0.0",
+    lifespan=_lifespan,
 )
 
 # ── No CORS, deliberately ─────────────────────────────────────────────────
@@ -333,6 +360,15 @@ _PATH_BUDGETS: tuple[tuple[str, str, int, int], ...] = (
     ("/api/demo",       "market", 30, 60),
     ("/api/history",    "market", 30, 60),
     ("/api/brent",      "market", 30, 60),
+    ("/api/meta",       "market", 30, 60),
+    ("/api/news",       "market", 30, 60),
+    ("/api/earnings",   "market", 30, 60),
+    # A public form that writes to disk needs a far tighter bound than the
+    # default 60/min. The hour-long window means these bucket keys live an hour
+    # in _rate_limit_store, so a wide flood can fill the 500-key cap and start
+    # fail-closing new IPs — acceptable here, and the persistent caps in
+    # store.create_access_request() are the defence that survives a restart.
+    ("/api/access-request", "signup", 5, 3600),
 )
 _API_DEFAULT_BUDGET = ("default", 60, 60)
 
@@ -411,34 +447,99 @@ def _agent_key_ok(candidate: str | None) -> bool:
     return hmac.compare_digest(candidate.encode("utf-8"), secret.encode("utf-8"))
 
 
-def _credential_ok(request: Request, x_agent_key: str | None) -> bool:
-    """True when the caller presents a valid session cookie or agent key.
+class AuthCtx:
+    """Who the caller is, not merely whether they are someone.
+
+    This replaced a bool. The boolean was the entire vulnerability: every
+    session row looked alike to require_auth, so the moment a second class of
+    credential exists (a guest key), its holder is indistinguishable from the
+    operator and inherits routes that spend real money with no budget attached.
+    Carrying the tier means each route can decide for itself.
+    """
+
+    __slots__ = ("tier", "guest_key_id")
+
+    def __init__(self, tier: str, guest_key_id: int | None = None):
+        self.tier = tier                      # "owner" | "guest"
+        self.guest_key_id = guest_key_id
+
+    @property
+    def is_owner(self) -> bool:
+        return self.tier == "owner"
+
+    @property
+    def is_guest(self) -> bool:
+        return self.tier == "guest"
+
+
+def _auth_ctx(request: Request, x_agent_key: str | None) -> AuthCtx | None:
+    """Resolve the caller to an AuthCtx, or None when unauthenticated.
 
     Fail-closed: with AGENT_SECRET unset there is no credential that can be
     valid, so every caller is rejected rather than waved through.
+
+    X-Agent-Key is always the operator — it *is* AGENT_SECRET, and a guest is
+    never given it. Guest keys are redeemed for a cookie at POST /api/session
+    and travel no other way.
     """
     if not os.getenv("AGENT_SECRET"):
         # Log by name only — never the value.
         logger.warning("auth: AGENT_SECRET is not set — all auth requests rejected")
-        return False
+        return None
 
     token = request.cookies.get(SESSION_COOKIE)
-    if token and store.session_valid(token):
-        return True
+    if token:
+        info = store.session_info(token)
+        if info:
+            return AuthCtx(info["tier"], info["guest_key_id"])
 
-    return _agent_key_ok(x_agent_key)
+    if _agent_key_ok(x_agent_key):
+        return AuthCtx("owner")
+
+    return None
+
+
+def _credential_ok(request: Request, x_agent_key: str | None) -> bool:
+    """Back-compat wrapper: is the caller anyone at all?"""
+    return _auth_ctx(request, x_agent_key) is not None
+
+
+def _unauthorized_detail(request: Request) -> dict:
+    """Distinguish "your session died" from "you never had one".
+
+    A revoked or expired guest key makes session_info() destroy the row and
+    return None, which is indistinguishable at this layer from an anonymous
+    caller — so both produced a bare 401. The frontend answers a code-less 401
+    by opening the unlock dialog, which asks a guest for an operator secret
+    they were never given.
+
+    The cookie's presence is the tell. It is not proof the session was a
+    guest's, but it is proof there WAS one, which is enough for the UI to send
+    them somewhere useful instead of somewhere impossible.
+    """
+    if request.cookies.get(SESSION_COOKIE):
+        return {"error": "your session has expired or been revoked",
+                "code": "session_expired"}
+    return {"error": "unauthorized"}
 
 
 async def require_auth(
     request: Request,
     x_agent_key: str = Header(default=None, alias="X-Agent-Key"),
-) -> None:
+) -> AuthCtx:
     """
-    FastAPI dependency guarding every paid route (/api/research/*).
+    FastAPI dependency guarding the five BUDGETED paid stages. The unbudgeted
+    paid routes — the legacy one-shot GET /api/research/{t} and
+    POST /api/portfolio/outlook — use require_owner instead, because a guest
+    allowance cannot bound them.
 
     Accepts EITHER a valid session cookie (browser, set by POST /api/session)
     OR the X-Agent-Key header (curl and scripts). The cookie exists so the key
     never has to live in localStorage where any script could read it.
+
+    Returns the AuthCtx rather than None so a paid handler can ask *which*
+    tier is calling. Passing this as a dependency still gates the route; taking
+    it as a parameter additionally hands the handler the caller's identity.
 
     401 if neither credential is valid. 429 if the caller exceeds the limit.
     """
@@ -451,11 +552,53 @@ async def require_auth(
                        client_ip, _RATE_LIMIT_MAX, _RATE_LIMIT_WINDOW)
         raise HTTPException(status_code=429, detail={"error": "rate limit exceeded"})
 
-    if _credential_ok(request, x_agent_key):
-        return
+    ctx = _auth_ctx(request, x_agent_key)
+    if ctx is not None:
+        return ctx
 
     logger.warning("require_auth: rejected request from IP %s — no valid session or key", client_ip)
-    raise HTTPException(status_code=401, detail={"error": "unauthorized"})
+    raise HTTPException(status_code=401, detail=_unauthorized_detail(request))
+
+
+async def require_owner(
+    request: Request,
+    x_agent_key: str = Header(default=None, alias="X-Agent-Key"),
+) -> AuthCtx:
+    """
+    FastAPI dependency for routes only the operator may reach.
+
+    Two kinds of route need this. Writes to the book — positions, watchlist,
+    profile — because a guest is a reader in someone else's terminal and must
+    not be able to edit or delete holdings. And paid actions with no per-caller
+    budget, which a guest allowance cannot bound.
+
+    A guest gets 403, not 401: they are authenticated, just not entitled. The
+    distinction matters to the frontend, which sends a 401 back to the unlock
+    screen — exactly the wrong move for a guest, who would be asked for an
+    operator secret they were never given.
+    """
+    from fastapi import HTTPException
+
+    ctx = _auth_ctx(request, x_agent_key)
+    if ctx is not None and ctx.is_owner:
+        return ctx
+
+    client_ip = _client_ip(request)
+    if ctx is not None:
+        logger.warning("require_owner: guest session refused a owner-only route (IP %s)", client_ip)
+        raise HTTPException(
+            status_code=403,
+            detail={"error": "this action belongs to the terminal's owner",
+                    "code": "guest_read_only"},
+        )
+
+    if not _check_rate_limit(client_ip):
+        logger.warning("rate_limit: IP %s exceeded %d req/%ds on a failed owner-route auth",
+                       client_ip, _RATE_LIMIT_MAX, _RATE_LIMIT_WINDOW)
+        raise HTTPException(status_code=429, detail={"error": "rate limit exceeded"})
+
+    logger.warning("require_owner: rejected request from IP %s — no valid session or key", client_ip)
+    raise HTTPException(status_code=401, detail=_unauthorized_detail(request))
 
 
 async def require_session(
@@ -595,6 +738,50 @@ def _compute_geo_transmission() -> dict:
             continue
 
     return out
+
+
+# ── Public metadata ───────────────────────────────────────────────────────
+# What a keyless visitor is allowed to know. This exists so /api/info can stay
+# gated exactly as it is: that route also carries the book, and loosening it
+# would be a much larger blast radius than adding a small deliberate one.
+
+DISCLAIMER = (
+    "ARGUS is an educational research tool, not investment advice. Its output is "
+    "generated by AI from public data — it can be wrong, incomplete, or out of date, "
+    "and it is never a personalised recommendation to buy or sell anything. Make your "
+    "own decisions and consult a licensed financial professional before acting."
+)
+
+
+@app.get("/api/meta")
+def api_meta():
+    """Framework config and disclosures for callers with no session.
+
+    Carries BRENT_LEVELS but never GEO_TRANSMISSION. The distinction is not
+    cosmetic: config.py's placeholder BRENT_LEVELS is never overridden by
+    config_local.py — the local override imports only MY_PORTFOLIO, WATCHLIST
+    and GEO_TRANSMISSION — so the Brent ladder is always the published
+    framework and is safe to serve. GEO_TRANSMISSION *is* overridden, and its
+    values name real holdings by construction ("AAPL (supply chain exposure)"),
+    which makes the operator's geo map a description of their book.
+    """
+    try:
+        return {
+            "status": "online",
+            "brent_levels": BRENT_LEVELS,
+            "data_sources": {
+                "quotes": "Yahoo Finance via yfinance — delayed, not real-time",
+                "research": ("Perplexity sonar-pro with live web search"
+                             if os.getenv("PERPLEXITY_API_KEY")
+                             else "Groq fallback — model knowledge only, no live web search"
+                             if os.getenv("GROQ_API_KEY")
+                             else "no AI provider configured"),
+            },
+            "disclaimer": DISCLAIMER,
+        }
+    except Exception as exc:
+        logger.debug("api_meta: error (type=%s): %s", type(exc).__name__, exc)
+        return JSONResponse(status_code=500, content={"error": "internal server error"})
 
 
 # ── API info — session required ──────────────────────────────────────────
@@ -883,7 +1070,7 @@ def api_history(ticker: str, period: str = "1y"):
 
 # ── Auth-gated JSON API ────────────────────────────────────────────────────
 
-@app.get("/api/research/{ticker}", dependencies=[Depends(require_auth)])
+@app.get("/api/research/{ticker}", dependencies=[Depends(require_owner)])
 def api_research(ticker: str, question: str = None):
     """
     Full Perplexity sonar-pro research. Requires X-Agent-Key header.
@@ -917,52 +1104,216 @@ class SynthesisBody(BaseModel):
     patterns: str = Field(default="", max_length=24000)
 
 
-def _module_response(ticker: str, module: str, question: str = None):
+def _validated_ticker(ticker: str):
+    """Return (symbol, None) or (None, 400-response).
+
+    Hoisted ahead of the guest gate deliberately. consume_guest_unit() calls
+    validate_ticker() as its first statement, and the gate runs before
+    _module_response's try — so a malformed symbol raised straight out of the
+    handler for a guest while the owner, who skips the gate, got a clean
+    response. Same request, two tiers, two behaviours, one of them a 500.
+
+    400 matches what /api/demo and /api/history already return for a bad
+    symbol, so the frontend's existing `notfound` mapping applies unchanged.
+    """
+    try:
+        return validate_ticker(ticker), None
+    except ValueError as exc:
+        return None, JSONResponse(status_code=400, content={"error": str(exc)})
+
+
+def _guest_gate(ctx: AuthCtx, ticker: str, module: str):
+    """Claim one stage of a guest's dive, or explain why not. None means proceed.
+
+    Runs BEFORE the provider is touched, so a refused guest never costs money.
+
+    Each refusal carries a machine-readable `code` beside the human string. The
+    frontend needs it: a spent allowance and a wrong-ticker claim are different
+    conversations, and neither should be reported as a generic failure that the
+    staged loop then retries four more times.
+    """
+    # Tested positively, so an unrecognised tier DENIES rather than proceeds.
+    # `if not ctx.is_guest: return None` reads the same for owner and guest but
+    # differs for anything else: a tier that is neither would have sailed
+    # straight past the budget onto a paid route, unmetered. require_owner
+    # already tests positively (`ctx.is_owner`), so the two dependencies
+    # disagreed — and the permissive one guarded the money. Not reachable today
+    # (create_session validates the tier and both SQL defaults are 'owner'), but
+    # the whole point of the AuthCtx rewrite was that a credential check must
+    # not fail open.
+    if ctx.is_owner:
+        return None
+    if not ctx.is_guest:
+        logger.warning("_guest_gate: refusing unrecognised session tier %r", ctx.tier)
+        return JSONResponse(
+            status_code=403,
+            content={"error": "this action belongs to the terminal's owner",
+                     "code": "guest_read_only"},
+        )
+
+    outcome = store.consume_guest_unit(ctx.guest_key_id, ticker, module)
+    if outcome == "ok":
+        return None
+
+    usage = store.guest_usage(ctx.guest_key_id)
+
+    if outcome == "other_ticker":
+        return JSONResponse(
+            status_code=409,
+            content={"error": f"your guest key is committed to {usage['dive_ticker']}",
+                     "code": "guest_ticker_bound",
+                     "detail": {"bound_ticker": usage["dive_ticker"]}},
+        )
+    if outcome == "used":
+        # Two different situations wear the same store-level outcome, and
+        # collapsing them strands a guest's allowance. "used" means THIS stage
+        # was already claimed — which, unless all five are gone, leaves the rest
+        # perfectly claimable. Reporting both as "budget exhausted" made the
+        # frontend halt the whole run, so a guest whose first run was cancelled
+        # or hit a transient failure could never claim the remaining stages.
+        if usage["exhausted"]:
+            return JSONResponse(
+                status_code=402,
+                content={"error": "your included deep dive is fully used",
+                         "code": "guest_budget_exhausted", "detail": usage},
+            )
+        return JSONResponse(
+            status_code=402,
+            content={"error": f"the {module} stage of your dive already ran",
+                     "code": "guest_stage_used", "detail": usage},
+        )
+    # missing / revoked / expired
+    return JSONResponse(
+        status_code=401,
+        content={"error": "your guest key is no longer valid", "code": "guest_expired"},
+    )
+
+
+def _module_response(ticker: str, module: str, question: str = None,
+                     ctx: AuthCtx = None):
     """Shared wrapper — mirrors api_research's error handling."""
+    sym, bad = _validated_ticker(ticker)
+    if bad is not None:
+        return bad
+
+    gate = _guest_gate(ctx, sym, module) if ctx else None
+    if gate is not None:
+        return gate
+
     try:
         result = run_research_module(ticker.upper(), module, question)
-        if "error" in result and "ticker" not in result:
-            return JSONResponse(status_code=500, content={"error": "internal server error"})
+        # Refund BEFORE the shape check. The no-provider failure returns its
+        # ticker alongside the error, so gating the refund on "ticker" not in
+        # result skipped the one case the refund was written for and charged a
+        # guest a stage for a call that never left the process.
+        if "error" in result:
+            _refund_if_free(ctx, module, result)
+            # 502, not 200-with-an-error-body. The caller ticked the stage green
+            # and stored an apology as the report when this returned success.
+            # `code` lets the staged loop stop rather than fire four more
+            # requests at a provider that is plainly down.
+            return JSONResponse(
+                status_code=502,
+                content={"error": result["error"], "code": "provider_unavailable"},
+            )
         return result
     except Exception as exc:
         logger.debug("api_research_%s: error (type=%s): %s", module, type(exc).__name__, exc)
+        _refund_if_free(ctx, module, None)
         return JSONResponse(status_code=500, content={"error": "internal server error"})
 
 
-@app.get("/api/research/{ticker}/report", dependencies=[Depends(require_auth)])
-def api_research_report(ticker: str, question: str = None):
+def _refund_if_free(ctx: AuthCtx | None, module: str, result: dict | None) -> None:
+    """Return a guest's stage only when the failure provably cost nothing.
+
+    _get_provider() raises before any network call when no provider key is
+    configured, so that specific failure spent $0 and charging a stage for it
+    would be taking an allowance for nothing. Every other failure keeps the
+    stage: the call may already have been billed upstream, and refunding on a
+    mid-flight timeout would hand out unlimited retries of a paid operation.
+    """
+    if ctx is None or not ctx.is_guest:
+        return
+
+    # Structured flag, not a substring match on English prose. The old test
+    # ("api_key" in text or …) inferred "this cost nothing" from wording, which
+    # was brittle against a provider changing its message and — once a
+    # caller-controlled ticker could appear in an error string — would have let
+    # a guest reclaim a stage by requesting /api/research/API_KEY/report.
+    # The layer that made (or did not make) the network call now says so.
+    if (result or {}).get("cost_incurred") is False:
+        logger.info("refunding guest stage %s (reason=%s, nothing was billed)",
+                    module, (result or {}).get("reason"))
+        store.refund_guest_unit(ctx.guest_key_id, module)
+
+
+@app.get("/api/research/{ticker}/report")
+def api_research_report(ticker: str, question: str = None,
+                        ctx: AuthCtx = Depends(require_auth)):
     """Main institutional research brief — situation, quant read, catalysts, verdict."""
-    return _module_response(ticker, "report", question)
+    return _module_response(ticker, "report", question, ctx)
 
 
-@app.get("/api/research/{ticker}/context", dependencies=[Depends(require_auth)])
-def api_research_context(ticker: str):
+@app.get("/api/research/{ticker}/context")
+def api_research_context(ticker: str, ctx: AuthCtx = Depends(require_auth)):
     """Company deep context — business model, financials, customers, competitors, future fit."""
-    return _module_response(ticker, "context")
+    return _module_response(ticker, "context", None, ctx)
 
 
-@app.get("/api/research/{ticker}/policy", dependencies=[Depends(require_auth)])
-def api_research_policy(ticker: str):
+@app.get("/api/research/{ticker}/policy")
+def api_research_policy(ticker: str, ctx: AuthCtx = Depends(require_auth)):
     """U.S. politician and government-official trading activity, and portfolio overlap."""
-    return _module_response(ticker, "policy")
+    return _module_response(ticker, "policy", None, ctx)
 
 
-@app.get("/api/research/{ticker}/patterns", dependencies=[Depends(require_auth)])
-def api_research_patterns(ticker: str):
+@app.get("/api/research/{ticker}/patterns")
+def api_research_patterns(ticker: str, ctx: AuthCtx = Depends(require_auth)):
     """Cross-source hidden patterns — insider, 13F, options, supply chain, hiring."""
-    return _module_response(ticker, "patterns")
+    return _module_response(ticker, "patterns", None, ctx)
 
 
-@app.post("/api/research/{ticker}/synthesis", dependencies=[Depends(require_auth)])
-def api_research_synthesis(ticker: str, body: SynthesisBody):
+@app.post("/api/research/{ticker}/synthesis")
+def api_research_synthesis(ticker: str, body: SynthesisBody,
+                           ctx: AuthCtx = Depends(require_auth)):
     """Stitch the module outputs into one BUY/SELL/HOLD verdict plus bull/bear debate."""
+    sym, bad = _validated_ticker(ticker)
+    if bad is not None:
+        return bad
+
+    gate = _guest_gate(ctx, sym, "synthesis")
+    if gate is not None:
+        return gate
+
+    # Fence the posted module text before it reaches a prompt.
+    #
+    # _synthesis_prompt() interpolates these four fields raw, and run_synthesis
+    # fires three paid calls off them. While the only caller was the operator's
+    # own browser echoing back model output, that was a trusted loop. Guest
+    # access makes it an untrusted one: a caller could post "ignore prior
+    # instructions..." as `report` and steer all three calls on the operator's
+    # provider account. Stored thesis/note/sector have always been fenced this
+    # way (perplexity_research.py) — this closes the same hole on the one input
+    # that comes straight off the wire.
+    #
+    # Applied for every tier, not just guests: it costs the operator nothing and
+    # a guard that only runs for some callers is a guard waiting to be bypassed.
+    fenced = {
+        k: sanitize_prompt_text(v, label=f"MODULE_{k.upper()}") if v else v
+        for k, v in body.model_dump().items()
+    }
+
     try:
-        result = run_synthesis(ticker.upper(), body.model_dump())
-        if "error" in result and "ticker" not in result:
-            return JSONResponse(status_code=500, content={"error": "internal server error"})
+        result = run_synthesis(ticker.upper(), fenced)
+        if "error" in result:
+            _refund_if_free(ctx, "synthesis", result)
+            return JSONResponse(
+                status_code=502,
+                content={"error": result["error"], "code": "provider_unavailable"},
+            )
         return result
     except Exception as exc:
         logger.debug("api_research_synthesis: error (type=%s): %s", type(exc).__name__, exc)
+        _refund_if_free(ctx, "synthesis", None)
         return JSONResponse(status_code=500, content={"error": "internal server error"})
 
 
@@ -996,25 +1347,54 @@ def api_session_create(request: Request, body: SessionBody, response: Response):
     if not _check_rate_limit(client_ip):
         return JSONResponse(status_code=429, content={"error": "rate limit exceeded"})
 
-    if not _agent_key_ok(body.key):
-        _record_auth_failure(socket_ip)
-        logger.warning("api_session_create: rejected unlock from IP %s", client_ip)
-        # Deliberately identical for "wrong key" and "no key configured" —
-        # never confirm to a caller which of the two it hit.
-        return JSONResponse(status_code=401, content={"error": "unauthorized"})
+    # The operator's secret is tried first and in constant time. A guest key is
+    # only consulted once that fails, so the common path is unchanged.
+    if _agent_key_ok(body.key):
+        store.purge_expired_sessions()
+        token, expires = store.create_session("owner")
+        max_age = store.SESSION_DAYS * 86400
+        payload = {"ok": True, "tier": "owner", "expires_at": expires.isoformat(),
+                   "guest": None}
+    else:
+        gk = store.guest_key_for(body.key)
+        if gk is None or gk["dead"]:
+            # Every miss feeds the socket backstop, so guest-key guessing gets
+            # the same brute-force ceiling as operator-secret guessing for free.
+            _record_auth_failure(socket_ip)
+            logger.warning("api_session_create: rejected unlock from IP %s", client_ip)
+            if gk is not None:
+                # Saying "expired" reveals nothing: the caller already holds the
+                # key. Saying "unauthorized" would send them to ask for a new
+                # key they in fact already had, which helps nobody.
+                return JSONResponse(
+                    status_code=401,
+                    content={"error": f"this guest key has been {gk['dead']}",
+                             "code": "guest_expired"},
+                )
+            # Deliberately identical for "wrong key" and "no key configured" —
+            # never confirm to a caller which of the two it hit.
+            return JSONResponse(status_code=401, content={"error": "unauthorized"})
 
-    store.purge_expired_sessions()
-    token, expires = store.create_session()
+        key_expires = datetime.fromisoformat(gk["expires_at"])
+        store.purge_expired_sessions()
+        token, expires = store.create_session("guest", gk["id"], expires_at=key_expires)
+        # Cookie life is the key's remaining life, never a flat 24h. Redeeming
+        # in the key's last hour must not hand out a fresh day.
+        remaining = (key_expires - datetime.now(key_expires.tzinfo)).total_seconds()
+        max_age = max(1, int(remaining))
+        payload = {"ok": True, "tier": "guest", "expires_at": expires.isoformat(),
+                   "guest": store.guest_usage(gk["id"])}
+
     response.set_cookie(
         key=SESSION_COOKIE,
         value=token,
-        max_age=store.SESSION_DAYS * 86400,
+        max_age=max_age,
         httponly=True,                       # JS cannot read it — that is the point
         samesite="strict",                   # not sent on cross-site requests
         secure=_is_https(request),
         path="/",
     )
-    return {"ok": True, "expires_at": expires.isoformat()}
+    return payload
 
 
 @app.delete("/api/session")
@@ -1029,9 +1409,266 @@ def api_session_destroy(request: Request, response: Response):
 
 @app.get("/api/session")
 def api_session_status(request: Request):
-    """Whether this browser currently holds a valid session. Never echoes the token."""
+    """Who this browser is, and what allowance it has left. Never echoes the token.
+
+    This is the single contract the frontend paints every tier-dependent
+    element from — the key chip, the cost modal's guest strip, the boot log —
+    so GET and POST /api/session deliberately return the same shape:
+
+        {authenticated, tier: "owner"|"guest"|null, guest: {...}|null}
+
+    `guest.modules_used` is a COUNT, not a flag. The allowance is five
+    separately consumable stages; collapsing it to a boolean tells a guest one
+    stage in that their whole dive is spent.
+    """
     token = request.cookies.get(SESSION_COOKIE)
-    return {"authenticated": bool(token and store.session_valid(token))}
+    info = store.session_info(token) if token else None
+    if not info:
+        return {"authenticated": False, "tier": None, "guest": None}
+    return {
+        "authenticated": True,
+        "tier": info["tier"],
+        "guest": store.guest_usage(info["guest_key_id"]) if info["tier"] == "guest" else None,
+    }
+
+
+# ── Free extras — public, yfinance only, no provider call ─────────────────
+# Standalone routes rather than extra fields on /api/demo. /api/demo is the hot
+# path behind every `quant` and `research` command, and folding two more network
+# round-trips into it would add latency and new failure modes to the one call
+# that must stay fast. The frontend fetches these lazily instead, so a slow or
+# missing headline feed never delays the numbers.
+
+@app.get("/api/earnings/{ticker}")
+def api_earnings(ticker: str):
+    """Next scheduled earnings date. A null date is normal, not an error."""
+    try:
+        result = get_next_earnings(ticker)
+        if "error" in result:
+            return JSONResponse(status_code=400, content=result)
+        return result
+    except Exception as exc:
+        logger.debug("api_earnings: error (type=%s): %s", type(exc).__name__, exc)
+        return JSONResponse(status_code=500, content={"error": "internal server error"})
+
+
+@app.get("/api/news/{ticker}")
+def api_news(ticker: str):
+    """Recent headlines, whitelist-mapped. Links that are not http(s) are dropped
+    server-side, so the browser is not the only thing checking them."""
+    try:
+        result = get_news(ticker)
+        if "error" in result:
+            return JSONResponse(status_code=400, content=result)
+        return result
+    except Exception as exc:
+        logger.debug("api_news: error (type=%s): %s", type(exc).__name__, exc)
+        return JSONResponse(status_code=500, content={"error": "internal server error"})
+
+
+# ── Access requests ────────────────────────────────────────────────────────
+# Public. Someone who reached the landing page with no key asks the operator
+# for one; the operator reviews by hand in the admin view and delivers the key
+# personally. There is no outbound MAIL path here by design — the owner is
+# pinged on Telegram (optional; see tools/notify.py) that a request landed,
+# but the key itself is still always hand-delivered, never emailed by the app.
+
+# Deliberately a stdlib regex, not pydantic's EmailStr — that would pull in the
+# email-validator package, and this project ships no new dependencies.
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+class AccessRequestBody(BaseModel):
+    email: str = Field(default="", max_length=254)
+    note:  str = Field(default="", max_length=280)
+
+
+@app.post("/api/access-request")
+def api_access_request(body: AccessRequestBody, background_tasks: BackgroundTasks):
+    """Record a request for access.
+
+    The success body is byte-identical whether the address is new, already
+    pending, already approved, or previously denied. Anything else turns this
+    into an oracle for whether a given person has asked for access, which is
+    exactly the kind of question a public endpoint must refuse to answer.
+    """
+    email = (body.email or "").strip()
+    norm = email.lower()
+    if not _EMAIL_RE.match(norm):
+        return JSONResponse(status_code=400,
+                            content={"error": "enter a valid email address"})
+
+    try:
+        outcome, is_new = store.create_access_request(email, norm, body.note or "")
+    except Exception as exc:
+        logger.debug("api_access_request: error (type=%s): %s", type(exc).__name__, exc)
+        return JSONResponse(status_code=500, content={"error": "internal server error"})
+
+    if outcome == "closed":
+        # Depends on global queue state, not on this address, so it still tells
+        # the caller nothing about themselves.
+        return JSONResponse(
+            status_code=503,
+            content={"error": "access requests are closed at the moment — try again later"},
+        )
+
+    if is_new:
+        # Runs after the response is sent (BackgroundTasks), and notify_telegram
+        # itself swallows every failure — Telegram being down must never affect
+        # what this public endpoint returns. is_new keeps a denied address on a
+        # retry timer from paging the owner forever over a submission that
+        # changes nothing (see create_access_request's docstring).
+        note = (body.note or "").strip()
+        text = (f"ARGUS: new access request\n{email}" + (f"\n{note}" if note else "")
+                + "\n\nReply with this email to approve.")
+        background_tasks.add_task(notify_telegram, text)
+
+    return {"ok": True, "status": "received"}
+
+
+_TELEGRAM_EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
+
+
+def _mint_and_approve(req: dict) -> tuple[int, str, datetime]:
+    """Mint a guest key for a pending request and mark it approved.
+
+    Shared by the admin web route and the Telegram approve-by-reply handler
+    below so the two paths cannot drift into different behaviour.
+    """
+    key_id, raw, expires = store.create_guest_key(label=req["email"])
+    store.decide_access_request(req["id"], "approved")
+    return key_id, raw, expires
+
+
+def _handle_telegram_reply(text: str) -> None:
+    """Approve-by-reply: the owner replies to the push with the email (any
+    surrounding words are fine — "yes bob@x.com go ahead" works) and this
+    mints the same kind of key the admin view's APPROVE button would.
+
+    Runs on the poller's background thread (tools/notify.py), so every path
+    here replies via notify_telegram rather than raising — there is no HTTP
+    caller to hand an error response to. Matches ONLY pending requests: an
+    already-approved or already-denied row cannot be re-matched by email,
+    which is what stops a stale or duplicate reply from minting a second key
+    for the same address.
+    """
+    m = _TELEGRAM_EMAIL_RE.search(text)
+    if not m:
+        return
+    norm = m.group(0).strip().lower()
+
+    try:
+        pending = [r for r in store.list_access_requests("pending")
+                   if r["email_norm"] == norm]
+        if not pending:
+            notify_telegram(f"No pending request for {norm}.")
+            return
+        req = pending[0]
+        _, raw, expires = _mint_and_approve(req)
+        notify_telegram(
+            f"Approved {req['email']}.\nKey: {raw}\nExpires: {expires.isoformat()}\n"
+            "Shown once, here — deliver it to them yourself."
+        )
+    except Exception as exc:
+        logger.error("telegram approve-by-reply failed (type=%s): %s",
+                     type(exc).__name__, exc, exc_info=True)
+        notify_telegram(f"Approving {norm} failed — check server logs.")
+
+
+# ── Admin — owner only ─────────────────────────────────────────────────────
+
+@app.get("/api/admin/requests", dependencies=[Depends(require_owner)])
+def api_admin_requests(status: str = None):
+    """Every request, newest first. Denied rows are included deliberately —
+    hidden, a misclicked DENY becomes an invisible permanent block."""
+    try:
+        return {"requests": store.list_access_requests(status)}
+    except Exception as exc:
+        logger.debug("api_admin_requests: error (type=%s): %s", type(exc).__name__, exc)
+        return JSONResponse(status_code=500, content={"error": "internal server error"})
+
+
+@app.post("/api/admin/requests/{req_id}/approve", dependencies=[Depends(require_owner)])
+def api_admin_approve(req_id: int):
+    """Approve a request and mint its key.
+
+    The raw key appears in THIS RESPONSE AND NOWHERE ELSE — only its SHA-256 is
+    stored. The operator copies it here and delivers it themselves.
+    """
+    try:
+        req = store.get_access_request(req_id)
+        if req is None:
+            return JSONResponse(status_code=404, content={"error": "no such request"})
+        key_id, raw, expires = _mint_and_approve(req)
+        return {"ok": True, "guest_key": raw, "key_id": key_id,
+                "expires_at": expires.isoformat(),
+                "request": store.get_access_request(req_id)}
+    except Exception as exc:
+        logger.debug("api_admin_approve: error (type=%s): %s", type(exc).__name__, exc)
+        return JSONResponse(status_code=500, content={"error": "internal server error"})
+
+
+@app.post("/api/admin/requests/{req_id}/deny", dependencies=[Depends(require_owner)])
+def api_admin_deny(req_id: int):
+    try:
+        if not store.decide_access_request(req_id, "denied"):
+            return JSONResponse(status_code=404, content={"error": "no such request"})
+        return {"ok": True}
+    except Exception as exc:
+        logger.debug("api_admin_deny: error (type=%s): %s", type(exc).__name__, exc)
+        return JSONResponse(status_code=500, content={"error": "internal server error"})
+
+
+@app.post("/api/admin/requests/{req_id}/reopen", dependencies=[Depends(require_owner)])
+def api_admin_reopen(req_id: int):
+    """Undo a denial. Without this, one misclick blackholes a person silently:
+    their resubmissions collide with the UNIQUE email and change nothing."""
+    try:
+        if not store.reopen_access_request(req_id):
+            return JSONResponse(status_code=404,
+                                content={"error": "no denied request with that id"})
+        return {"ok": True}
+    except Exception as exc:
+        logger.debug("api_admin_reopen: error (type=%s): %s", type(exc).__name__, exc)
+        return JSONResponse(status_code=500, content={"error": "internal server error"})
+
+
+@app.get("/api/admin/guest-keys", dependencies=[Depends(require_owner)])
+def api_admin_guest_keys():
+    """Issued keys. Never includes key_hash — only the short display prefix."""
+    try:
+        return {"keys": store.list_guest_keys()}
+    except Exception as exc:
+        logger.debug("api_admin_guest_keys: error (type=%s): %s", type(exc).__name__, exc)
+        return JSONResponse(status_code=500, content={"error": "internal server error"})
+
+
+@app.post("/api/admin/guest-keys/{key_id}/revoke", dependencies=[Depends(require_owner)])
+def api_admin_revoke(key_id: int):
+    try:
+        if not store.revoke_guest_key(key_id):
+            return JSONResponse(status_code=404,
+                                content={"error": "no active key with that id"})
+        return {"ok": True}
+    except Exception as exc:
+        logger.debug("api_admin_revoke: error (type=%s): %s", type(exc).__name__, exc)
+        return JSONResponse(status_code=500, content={"error": "internal server error"})
+
+
+@app.post("/api/admin/sessions/revoke-all", dependencies=[Depends(require_owner)])
+def api_admin_revoke_all():
+    """Kill switch for every guest at once.
+
+    Worth knowing why this exists: rotating AGENT_SECRET does NOT log anyone
+    out. Sessions are validated from the cookie before the secret is consulted,
+    so a rotated secret leaves every existing session — owner and guest — alive.
+    This is the actual revocation path.
+    """
+    try:
+        return {"ok": True, "revoked": store.revoke_all_guest_access()}
+    except Exception as exc:
+        logger.debug("api_admin_revoke_all: error (type=%s): %s", type(exc).__name__, exc)
+        return JSONResponse(status_code=500, content={"error": "internal server error"})
 
 
 # ── Profile ────────────────────────────────────────────────────────────────
@@ -1050,7 +1687,7 @@ def api_profile_get():
     return {"profile": store.profile()}
 
 
-@app.post("/api/profile", dependencies=[Depends(require_session)])
+@app.post("/api/profile", dependencies=[Depends(require_owner)])
 def api_profile_save(body: ProfileBody):
     try:
         return {"profile": store.save_profile(body.model_dump())}
@@ -1083,7 +1720,7 @@ def api_positions_list():
     return {"positions": store.positions()}
 
 
-@app.post("/api/positions", dependencies=[Depends(require_session)])
+@app.post("/api/positions", dependencies=[Depends(require_owner)])
 def api_positions_upsert(body: PositionBody):
     try:
         # exclude_unset so a partial update touches only the fields the caller
@@ -1102,7 +1739,7 @@ def api_positions_upsert(body: PositionBody):
         return JSONResponse(status_code=400, content={"error": str(exc)})
 
 
-@app.delete("/api/positions/{ticker}", dependencies=[Depends(require_session)])
+@app.delete("/api/positions/{ticker}", dependencies=[Depends(require_owner)])
 def api_positions_delete(ticker: str):
     try:
         removed = store.delete_position(ticker)
@@ -1116,7 +1753,7 @@ def api_watchlist_list():
     return {"watchlist": store.watchlist()}
 
 
-@app.post("/api/watchlist", dependencies=[Depends(require_session)])
+@app.post("/api/watchlist", dependencies=[Depends(require_owner)])
 def api_watchlist_add(body: WatchBody):
     try:
         t = store.add_watch(body.ticker, body.note, body.sector)
@@ -1125,7 +1762,7 @@ def api_watchlist_add(body: WatchBody):
     return {"ok": True, "ticker": t, "watchlist": store.watchlist()}
 
 
-@app.delete("/api/watchlist/{ticker}", dependencies=[Depends(require_session)])
+@app.delete("/api/watchlist/{ticker}", dependencies=[Depends(require_owner)])
 def api_watchlist_delete(ticker: str):
     try:
         removed = store.delete_watch(ticker)
@@ -1243,7 +1880,7 @@ def api_outlook_get():
     return {"outlook": store.get_outlook()}
 
 
-@app.post("/api/portfolio/outlook", dependencies=[Depends(require_auth)])
+@app.post("/api/portfolio/outlook", dependencies=[Depends(require_owner)])
 def api_outlook_run():
     """PAID — one provider call covering every holding. Result is cached."""
     try:

@@ -298,3 +298,142 @@ def get_price_history(ticker: str, period: str = "1y") -> dict:
             ticker, type(exc).__name__, exc,
         )
         return {"ticker": ticker, "error": "price history fetch failed"}
+
+
+# ── Free extras: earnings date and news headlines ─────────────────────────
+# Both come off the same yfinance feed as everything else here, so they cost
+# nothing per call. Both are also the first place in this file where THIRD-PARTY
+# text (headlines, publisher names, URLs) reaches the response, so both are
+# whitelist-mapped rather than passed through: yfinance returns a large nested
+# blob whose shape changes between releases, and forwarding it wholesale would
+# ship whatever the upstream happens to include today.
+
+_NEWS_LIMIT = 8
+_TITLE_CAP = 200
+
+
+def _first(d: dict, *names):
+    """Return the first present, non-empty key. yfinance renamed several of
+    these between versions, and a missing headline is not worth an exception."""
+    for n in names:
+        v = d.get(n)
+        if v:
+            return v
+    return None
+
+
+def get_next_earnings(ticker: str) -> dict:
+    """Next scheduled earnings date, best-effort.
+
+    Yahoo publishes this two different ways — `calendar` (which may carry a
+    date RANGE when only the week is known) and `get_earnings_dates()` — and
+    either can be missing entirely for a given symbol. A missing date is a
+    normal outcome, not an error, so it returns None rather than raising.
+    """
+    try:
+        t = validate_ticker(ticker)
+    except ValueError as exc:
+        return {"ticker": ticker, "error": str(exc)}
+
+    try:
+        tk = yf.Ticker(t)
+        date = None
+
+        try:
+            cal = tk.calendar
+            if isinstance(cal, dict):
+                v = _first(cal, "Earnings Date", "EarningsDate")
+                if isinstance(v, (list, tuple)) and v:
+                    v = v[0]
+                date = v
+        except Exception:  # noqa: BLE001 — one shape failing is not fatal
+            pass
+
+        if date is None:
+            try:
+                df = tk.get_earnings_dates(limit=8)
+                if df is not None and not df.empty:
+                    import pandas as pd  # noqa: PLC0415 — already a yfinance dep
+                    now = pd.Timestamp.now(tz=df.index.tz)
+                    future = df[df.index >= now]
+                    if not future.empty:
+                        date = future.index.min()
+            except Exception:  # noqa: BLE001
+                pass
+
+        iso = None
+        if date is not None:
+            try:
+                iso = date.date().isoformat() if hasattr(date, "date") else str(date)[:10]
+            except Exception:  # noqa: BLE001
+                iso = None
+
+        return {"ticker": t, "next_earnings": iso}
+
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("get_next_earnings: error for '%s' (type=%s): %s",
+                     ticker, type(exc).__name__, exc)
+        return {"ticker": ticker, "next_earnings": None}
+
+
+def get_news(ticker: str, limit: int = _NEWS_LIMIT) -> dict:
+    """Recent headlines, whitelist-mapped to four fields.
+
+    Every value here is written by someone else. Two rules follow:
+
+      * Only title, publisher, link and published_at survive; everything else
+        in the upstream payload is dropped.
+      * A link is kept ONLY if it parses as http or https. Dropping a
+        `javascript:` or `data:` URL at the boundary means the frontend is not
+        the only thing standing between a hostile URL and an anchor's href.
+
+    Newer yfinance nests the interesting fields under `content`, older versions
+    keep them flat; both shapes are read.
+    """
+    try:
+        t = validate_ticker(ticker)
+    except ValueError as exc:
+        return {"ticker": ticker, "error": str(exc)}
+
+    try:
+        from urllib.parse import urlparse  # noqa: PLC0415
+
+        raw = yf.Ticker(t).news or []
+        items = []
+
+        for entry in raw[: max(1, int(limit))]:
+            if not isinstance(entry, dict):
+                continue
+            body = entry.get("content") if isinstance(entry.get("content"), dict) else entry
+
+            title = _first(body, "title", "headline")
+            if not title:
+                continue
+
+            link = _first(body, "link", "canonicalUrl", "clickThroughUrl") or ""
+            if isinstance(link, dict):
+                link = link.get("url") or ""
+            try:
+                if urlparse(str(link)).scheme not in ("http", "https"):
+                    link = ""
+            except Exception:  # noqa: BLE001
+                link = ""
+
+            pub = _first(body, "publisher", "provider") or ""
+            if isinstance(pub, dict):
+                pub = pub.get("displayName") or pub.get("name") or ""
+
+            items.append({
+                "title":        str(title)[:_TITLE_CAP],
+                "publisher":    str(pub)[:80],
+                "link":         str(link)[:500],
+                "published_at": str(_first(body, "pubDate", "providerPublishTime",
+                                           "displayTime") or "")[:40],
+            })
+
+        return {"ticker": t, "items": items}
+
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("get_news: error for '%s' (type=%s): %s",
+                     ticker, type(exc).__name__, exc)
+        return {"ticker": t if "t" in dir() else ticker, "items": []}

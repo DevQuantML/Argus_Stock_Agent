@@ -47,7 +47,11 @@ export function compact(v) {
 }
 
 const tone = (v) => (num(v) === null ? '' : num(v) >= 0 ? 'pos' : 'neg');
-const el = (tag, cls, text) => {
+
+/* Exported: app.js and views.js both build DOM this way, and three byte-identical
+   copies of the same four lines is three places for the textContent rule to be
+   quietly relaxed in one of them. */
+export const el = (tag, cls, text) => {
   const n = document.createElement(tag);
   if (cls) n.className = cls;
   if (text !== undefined && text !== null) n.textContent = text;
@@ -137,14 +141,52 @@ export function renderStatus(health, providerLabel) {
   if (geo) geo.className = 'stat ok';
 }
 
-export function renderKeyState(hasKey) {
+/* Three tiers, and for a guest three distinct states within their tier.
+   The allowance is five separately consumable stages, so "used" is a count,
+   never a flag: a guest one stage into a dive still has four, and telling them
+   the dive is spent would be false. */
+export function renderKeyState(tier, guest) {
   const n = $('key-state');
   if (!n) return;
-  n.textContent = hasKey ? 'AI ARMED' : 'QUANT ONLY';
-  n.className = `hdr-key${hasKey ? ' on' : ''}`;
-  n.title = hasKey
-    ? 'Agent key stored — AI research modules unlocked'
-    : 'No agent key — quant, charts and P&L still work';
+
+  if (tier === 'owner') {
+    n.textContent = 'AI ARMED';
+    n.className = 'hdr-key on';
+    n.title = 'Owner session — AI research unlocked, no allowance limit';
+    return;
+  }
+
+  if (tier === 'guest' && guest) {
+    const total = guest.modules_total || 5;
+    const used = guest.modules_used || 0;
+    const left = Math.max(0, total - used);
+    const ms = Date.parse(guest.expires_at || '') - Date.now();
+    const hrs = Number.isFinite(ms) ? Math.max(0, ms / 3.6e6) : null;
+    const when = hrs === null ? '' : hrs < 1 ? ' · <1H' : ` · ${Math.round(hrs)}H`;
+
+    if (guest.exhausted) {
+      n.textContent = 'GUEST · DIVE COMPLETE';
+      n.className = 'hdr-key guest off';
+      n.title = 'Your included deep dive is complete. Everything free stays '
+              + 'unlimited until the key expires.';
+    } else if (guest.dive_ticker) {
+      n.textContent = `GUEST · ${guest.dive_ticker} ${used}/${total}${when}`;
+      n.className = 'hdr-key guest';
+      n.title = `Your dive is committed to ${guest.dive_ticker}; ${left} of ${total} `
+              + 'stages remain and it cannot be moved to another ticker.';
+    } else {
+      n.textContent = `GUEST · 1 DIVE${when}`;
+      n.className = 'hdr-key guest';
+      n.title = `One full ${total}-stage AI deep dive on a single ticker of your `
+              + 'choice. Everything else is free and unlimited.';
+    }
+    return;
+  }
+
+  n.textContent = 'FREE MODE';
+  n.className = 'hdr-key';
+  n.title = 'No key — quant, charts, history, news and the Brent gate are free. '
+          + 'Paid AI research is locked.';
 }
 
 /* ── Ticker tape ─────────────────────────────────────────────────────── */
@@ -328,13 +370,16 @@ export function setSort(key) {
   return { sortKey, sortDir };
 }
 
-export function renderWatchlist(rows, onSelect, onInspect) {
+export function renderWatchlist(rows, onSelect, onInspect, emptyText) {
   const host = $('watch-rows');
   if (!host) return;
   host.innerHTML = '';
 
   if (!rows.length) {
-    host.appendChild(el('div', 'wl-empty', 'No instruments loaded.'));
+    // The caller supplies the reason. An empty panel means something different
+    // to a visitor (the book is private) than to the owner (nothing tracked
+    // yet), and only the caller knows which.
+    host.appendChild(el('div', 'wl-empty', emptyText || 'No instruments loaded.'));
     return;
   }
 
@@ -1148,60 +1193,250 @@ function loadSelection() {
   return Object.fromEntries(MODULES.map(m => [m.key, true]));
 }
 
-export function showCostModal(sym, provider) {
+export function showCostModal(sym, provider, { tier = 'owner', guest = null } = {}) {
   return new Promise((resolve) => {
-    const sel = loadSelection();
+    const isGuest = tier === 'guest';
+
+    /* A guest's dive is indivisible.
+       The owner picks modules à la carte because they pay per call and can run
+       the rest tomorrow. A guest's allowance is one dive: unchecking three
+       modules still binds the key to this ticker on the first consumed stage,
+       and the forfeited stages can never be recovered or moved elsewhere. So
+       for a guest the selection is the full pipeline, fixed and disabled —
+       "one deep dive" then means exactly one thing, and the forfeiture case
+       stops existing rather than being explained. */
+    const sel = isGuest
+      ? MODULES.reduce((o, m) => (o[m.key] = true, o), { synthesis: true })
+      : loadSelection();
+
     const rows = MODULES.map(m => `
       <label class="cf${sel[m.key] ? ' on' : ''}" data-k="${m.key}">
-        <input type="checkbox" ${sel[m.key] ? 'checked' : ''} aria-label="${escapeHtml(m.name)}">
+        <input type="checkbox" ${sel[m.key] ? 'checked' : ''} ${isGuest ? 'disabled' : ''}
+               aria-label="${escapeHtml(m.name)}">
         <span><span class="n">${escapeHtml(m.name)}</span><span class="d">${escapeHtml(m.desc)}</span></span>
-        <span class="c">~$${m.cost.toFixed(2)}</span>
+        ${isGuest ? '' : `<span class="c">~$${m.cost.toFixed(2)}</span>`}
       </label>`).join('');
 
     const note = provider === 'groq'
       ? 'Running on GROQ — fast and free, but with no live web search the politician-trade and news modules fall back to model knowledge.'
       : 'Running on PERPLEXITY sonar-pro with live web search. Costs are estimates and vary with response length.';
 
+    // The dollar column is the owner's concern. Showing "$0.21" to a guest who
+    // is not paying reads as a charge about to be made to them.
+    const guestStrip = isGuest ? `
+      <div class="gk-note">
+        <span class="gk-c">GUEST KEY</span>
+        <span class="gk-t">This runs your <b>single included deep dive</b> — the full
+        ${MODULES.length}-stage pipeline, at no charge to you.<br>
+        It permanently commits your key to <b>${escapeHtml(sym)}</b>; you cannot
+        switch tickers afterwards. Quant, charts, history and news stay free and
+        unlimited either way.</span>
+      </div>` : '';
+
+    const totalRow = isGuest
+      ? `<div class="cf-tot"><span class="l">YOUR ALLOWANCE</span><span class="v">1 of 1 deep dive</span></div>`
+      : `<div class="cf-tot"><span class="l">ESTIMATED TOTAL</span><span class="v" id="cf-total">$0.00</span></div>`;
+
     const { box, close } = modal(`
       <div class="mdl-hd"><span>ARGUS://CONFIRM · ${escapeHtml(sym)}</span><button data-close type="button">✕</button></div>
       <div class="mdl-b">
-        <p class="hint" style="margin:0 0 12px">Each module is a separate paid call. Uncheck anything you do not need —
-        quant, chart and P&amp;L are already loaded and always free.</p>
+        ${guestStrip}
+        <p class="hint" style="margin:0 0 12px">${isGuest
+          ? 'Your included dive runs every stage. Quant, chart and P&amp;L are already loaded and always free.'
+          : 'Each module is a separate paid call. Uncheck anything you do not need — quant, chart and P&amp;L are already loaded and always free.'}</p>
         ${rows}
-        <div class="cf-tot"><span class="l">ESTIMATED TOTAL</span><span class="v" id="cf-total">$0.00</span></div>
+        ${totalRow}
         <p class="hint" style="margin-top:12px">${escapeHtml(note)}</p>
       </div>
       <div class="mdl-f">
         <button class="btn-g" data-cancel type="button" style="padding:7px 14px">CANCEL</button>
-        <button class="btn" data-run type="button">RUN RESEARCH ▸</button>
+        <button class="btn" data-run type="button">${isGuest ? 'USE MY DEEP DIVE ▸' : 'RUN RESEARCH ▸'}</button>
       </div>`);
 
     const totalEl = box.querySelector('#cf-total');
     const runBtn  = box.querySelector('[data-run]');
     const recalc = () => {
+      if (!totalEl) return;                 // guest: no dollar column to update
       const t = MODULES.filter(m => sel[m.key]).reduce((s, m) => s + m.cost, 0);
       totalEl.textContent = `$${t.toFixed(2)}`;
       runBtn.disabled = t === 0;
     };
     recalc();
 
-    box.querySelectorAll('.cf').forEach(rowEl => {
-      const cb = rowEl.querySelector('input');
-      cb.addEventListener('change', () => {
-        sel[rowEl.dataset.k] = cb.checked;
-        rowEl.classList.toggle('on', cb.checked);
-        recalc();
+    if (!isGuest) {
+      box.querySelectorAll('.cf').forEach(rowEl => {
+        const cb = rowEl.querySelector('input');
+        cb.addEventListener('change', () => {
+          sel[rowEl.dataset.k] = cb.checked;
+          rowEl.classList.toggle('on', cb.checked);
+          recalc();
+        });
       });
-    });
+    }
 
     const finish = (v) => { close(); resolve(v); };
     box.querySelector('[data-cancel]').onclick = () => finish(null);
     box.querySelector('[data-close]').onclick  = () => finish(null);
     runBtn.onclick = () => {
-      try { localStorage.setItem(MODULES_KEY, JSON.stringify(sel)); } catch { /* private mode */ }
+      // A guest's forced selection is not a preference — never persist it over
+      // the owner's own choices in this browser.
+      if (!isGuest) {
+        try { localStorage.setItem(MODULES_KEY, JSON.stringify(sel)); } catch { /* private mode */ }
+      }
       finish(sel);
     };
     runBtn.focus();
+  });
+}
+
+/* ── News ─────────────────────────────────────────────────────────────────
+   Every value here was written by a third party. Titles and publisher names go
+   in as text nodes, and an href is only built after re-checking the scheme —
+   the server already drops non-http(s) links, and this is the second lock on
+   the same door rather than a substitute for it. */
+
+function relTime(v) {
+  if (!v) return '';
+  const t = Date.parse(v);
+  if (!Number.isFinite(t)) return '';
+  const mins = Math.round((Date.now() - t) / 60000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.round(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  return `${Math.round(hrs / 24)}d ago`;
+}
+
+export function renderNews(host, items) {
+  if (!host) return;
+  host.innerHTML = '';
+  if (!items || !items.length) { host.remove(); return; }
+
+  host.appendChild(el('div', 'r-head', 'NEWS · HEADLINES'));
+  const list = el('div', 'news');
+
+  for (const it of items.slice(0, 8)) {
+    const row = el('div', 'news-i');
+    const link = String(it.link || '');
+
+    if (/^https?:\/\//i.test(link)) {
+      const a = el('a', 'news-t');
+      a.textContent = String(it.title || '');   // text node — never parsed as markup
+      a.href = link;
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer';
+      row.appendChild(a);
+    } else {
+      row.appendChild(el('span', 'news-t', String(it.title || '')));
+    }
+
+    const meta = [it.publisher, relTime(it.published_at)].filter(Boolean).join(' · ');
+    if (meta) row.appendChild(el('span', 'news-m dim', meta));
+    list.appendChild(row);
+  }
+
+  host.appendChild(list);
+}
+
+/* ── Owner: one-time key reveal ───────────────────────────────────────────
+   Only the hash is stored, so this is the single moment the key exists in
+   readable form. The mailto template deliberately does NOT carry the key —
+   a URL ends up in history, logs and the OS handler chain. */
+
+export function showKeyReveal({ email, key, expiresAt }) {
+  const { box, close } = modal(`
+    <div class="mdl-hd"><span>GUEST KEY · SHOWN ONCE</span><button data-close type="button">✕</button></div>
+    <div class="mdl-b">
+      <p class="hint" id="kr-for" style="margin:0 0 10px"></p>
+      <input id="kr-val" class="inp key-reveal" readonly>
+      <div style="display:flex;gap:8px">
+        <button id="kr-copy" class="btn" type="button" style="flex:1">COPY KEY</button>
+        <a id="kr-mail" class="btn-g" style="flex:1;text-align:center;padding:8px 12px;text-decoration:none">DRAFT EMAIL</a>
+      </div>
+      <p class="hint" id="kr-warn" style="margin-top:12px"></p>
+    </div>
+    <div class="mdl-f"><button id="kr-done" class="btn" type="button">DONE</button></div>`);
+
+  // Untrusted: the address came from a public form.
+  box.querySelector('#kr-for').textContent =
+    `Issued to ${email}. Valid 24 hours from now${expiresAt ? ` (until ${expiresAt})` : ''}.`;
+  box.querySelector('#kr-warn').textContent =
+    'Copy it now — only a hash is stored, so it cannot be shown again. Deliver it '
+    + 'yourself; this app sends no email. If you lose it, deny and re-approve the '
+    + 'request to mint a new one.';
+
+  const input = box.querySelector('#kr-val');
+  input.value = key;                       // .value — immune to markup injection
+
+  const mail = box.querySelector('#kr-mail');
+  mail.href = 'mailto:' + encodeURIComponent(email)
+    + '?subject=' + encodeURIComponent('Your ARGUS guest key')
+    + '&body=' + encodeURIComponent(
+        'Your ARGUS guest key is below, pasted separately.\n\n'
+        + 'It is valid for 24 hours and includes one full AI deep dive on a single '
+        + 'ticker. Everything else in the terminal is free and unlimited.\n\n'
+        + 'Key: ');
+
+  const copy = box.querySelector('#kr-copy');
+  copy.onclick = async () => {
+    /* Verify before claiming. navigator.clipboard is undefined on plain HTTP —
+       which this app explicitly supports — and the execCommand fallback
+       returns FALSE on failure rather than throwing, so the old catch never
+       fired and the button went green regardless.
+
+       This modal is the only moment the key exists in readable form; only its
+       hash is stored. A false "COPIED ✓" means the operator pastes whatever
+       was already on their clipboard, the request is already marked approved
+       and gone from the pending list, and the person who asked never gets a
+       key — with no signal to anyone. */
+    let ok = false;
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(key);
+        ok = true;
+      }
+    } catch { ok = false; }
+
+    if (!ok) {
+      input.select();
+      try { ok = document.execCommand('copy'); } catch { ok = false; }
+    }
+
+    copy.textContent = ok ? 'COPIED ✓' : 'COPY FAILED — PRESS CTRL+C';
+    copy.classList.toggle('btn-danger', !ok);
+    if (!ok) input.select();     // leave it selected so Ctrl+C works
+    setTimeout(() => {
+      copy.textContent = 'COPY KEY';
+      copy.classList.remove('btn-danger');
+    }, ok ? 1500 : 6000);
+  };
+
+  // modal() wires only the FIRST [data-close], and this is the only dialog in
+  // the file with two. DONE is the button an operator actually clicks after
+  // copying the key, so an inert one reads as "the key was not issued".
+  box.querySelector('#kr-done').onclick = () => close();
+
+  input.focus();
+  input.select();
+}
+
+/* A plain yes/no. confirmSpend() is for money and says so; this is for
+   destructive-but-free actions like denying a request or revoking a key. */
+export function confirmAction(title, detail, confirmLabel = 'CONFIRM') {
+  return new Promise((resolve) => {
+    const { box, close } = modal(`
+      <div class="mdl-hd"><span>${escapeHtml(title)}</span><button data-close type="button">✕</button></div>
+      <div class="mdl-b"><p class="hint" id="ca-d" style="margin:0;line-height:1.8"></p></div>
+      <div class="mdl-f">
+        <button class="btn-g" data-cancel type="button" style="padding:7px 14px">CANCEL</button>
+        <button class="btn-danger" data-ok type="button">${escapeHtml(confirmLabel)}</button>
+      </div>`);
+    box.querySelector('#ca-d').textContent = detail;
+    const done = (v) => { close(); resolve(v); };
+    box.querySelector('[data-cancel]').onclick = () => done(false);
+    box.querySelector('[data-close]').onclick  = () => done(false);
+    box.querySelector('[data-ok]').onclick     = () => done(true);
+    box.querySelector('[data-ok]').focus();
   });
 }
 
