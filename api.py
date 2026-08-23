@@ -35,6 +35,7 @@ import re
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -51,7 +52,7 @@ from pydantic import BaseModel, Field
 
 import store
 from config import BRENT_LEVELS, GEO_TRANSMISSION
-from tools.notify import notify_telegram
+from tools.notify import notify_telegram, start_telegram_reply_listener
 from tools.oil_price import get_brent_price, get_brent_signal
 from tools.perplexity_research import (
     run_demo,
@@ -88,10 +89,29 @@ except Exception as _bootstrap_exc:
     )
     raise SystemExit(1) from _bootstrap_exc
 
+# The Telegram reply listener (approve-by-replying-with-the-email) starts
+# here rather than at import time. FastAPI's lifespan only runs when the ASGI
+# app is actually served — a bare `import api`, and TestClient(api.app) used
+# without a `with` block (this project's whole verify_access.py harness),
+# never trigger it. That is what keeps a "spends nothing, touches nothing
+# external" test run from spawning a background thread that long-polls a real
+# Telegram API. _handle_telegram_reply is defined further down, near the rest
+# of the access-request code; referencing it here by name is fine because
+# this coroutine only runs (and only looks the name up) at real startup, long
+# after the whole module has finished importing.
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    stop = start_telegram_reply_listener(_handle_telegram_reply)
+    yield
+    if stop is not None:
+        stop.set()
+
+
 app = FastAPI(
     title="Stock Research Agent",
     description="Personal institutional-grade research agent with Brent crude framework",
     version="1.0.0",
+    lifespan=_lifespan,
 )
 
 # ── No CORS, deliberately ─────────────────────────────────────────────────
@@ -1396,10 +1416,60 @@ def api_access_request(body: AccessRequestBody, background_tasks: BackgroundTask
         # retry timer from paging the owner forever over a submission that
         # changes nothing (see create_access_request's docstring).
         note = (body.note or "").strip()
-        text = f"ARGUS: new access request\n{email}" + (f"\n{note}" if note else "")
+        text = (f"ARGUS: new access request\n{email}" + (f"\n{note}" if note else "")
+                + "\n\nReply with this email to approve.")
         background_tasks.add_task(notify_telegram, text)
 
     return {"ok": True, "status": "received"}
+
+
+_TELEGRAM_EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
+
+
+def _mint_and_approve(req: dict) -> tuple[int, str, datetime]:
+    """Mint a guest key for a pending request and mark it approved.
+
+    Shared by the admin web route and the Telegram approve-by-reply handler
+    below so the two paths cannot drift into different behaviour.
+    """
+    key_id, raw, expires = store.create_guest_key(label=req["email"])
+    store.decide_access_request(req["id"], "approved")
+    return key_id, raw, expires
+
+
+def _handle_telegram_reply(text: str) -> None:
+    """Approve-by-reply: the owner replies to the push with the email (any
+    surrounding words are fine — "yes bob@x.com go ahead" works) and this
+    mints the same kind of key the admin view's APPROVE button would.
+
+    Runs on the poller's background thread (tools/notify.py), so every path
+    here replies via notify_telegram rather than raising — there is no HTTP
+    caller to hand an error response to. Matches ONLY pending requests: an
+    already-approved or already-denied row cannot be re-matched by email,
+    which is what stops a stale or duplicate reply from minting a second key
+    for the same address.
+    """
+    m = _TELEGRAM_EMAIL_RE.search(text)
+    if not m:
+        return
+    norm = m.group(0).strip().lower()
+
+    try:
+        pending = [r for r in store.list_access_requests("pending")
+                   if r["email_norm"] == norm]
+        if not pending:
+            notify_telegram(f"No pending request for {norm}.")
+            return
+        req = pending[0]
+        _, raw, expires = _mint_and_approve(req)
+        notify_telegram(
+            f"Approved {req['email']}.\nKey: {raw}\nExpires: {expires.isoformat()}\n"
+            "Shown once, here — deliver it to them yourself."
+        )
+    except Exception as exc:
+        logger.error("telegram approve-by-reply failed (type=%s): %s",
+                     type(exc).__name__, exc, exc_info=True)
+        notify_telegram(f"Approving {norm} failed — check server logs.")
 
 
 # ── Admin — owner only ─────────────────────────────────────────────────────
@@ -1426,8 +1496,7 @@ def api_admin_approve(req_id: int):
         req = store.get_access_request(req_id)
         if req is None:
             return JSONResponse(status_code=404, content={"error": "no such request"})
-        key_id, raw, expires = store.create_guest_key(label=req["email"])
-        store.decide_access_request(req_id, "approved")
+        key_id, raw, expires = _mint_and_approve(req)
         return {"ok": True, "guest_key": raw, "key_id": key_id,
                 "expires_at": expires.isoformat(),
                 "request": store.get_access_request(req_id)}

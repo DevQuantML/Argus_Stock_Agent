@@ -44,6 +44,8 @@ import pathlib
 import sqlite3
 import sys
 import tempfile
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -413,6 +415,110 @@ def main():
     check("no admin listing leaks a key hash",
           "key_hash" in oc.get("/api/admin/guest-keys").text, False)
 
+    # ── Telegram approve-by-reply ───────────────────────────────────────────
+    # The owner can reply to the push with the email instead of opening the
+    # admin view. Two layers: _process_update (pure chat-id filter, no
+    # network) and _handle_telegram_reply (the actual approve-by-email logic,
+    # sharing _mint_and_approve with the admin route so the two cannot drift).
+    section("telegram approve-by-reply — safety and matching logic")
+
+    before_threads = {t.name for t in threading.enumerate()}
+    TestClient(api.app).get("/health")
+    check("a bare TestClient (no 'with') never starts the reply-listener thread — "
+          "this IS the guarantee that importing/testing api.py touches no network",
+          "telegram-reply-listener" in
+          ({t.name for t in threading.enumerate()} - before_threads), False)
+
+    import tools.notify as notify_mod
+    check("start_telegram_reply_listener no-ops (returns None) while unconfigured",
+          notify_mod.start_telegram_reply_listener(lambda text: None), None)
+
+    seen = []
+    notify_mod._process_update(
+        {"message": {"chat": {"id": 111}, "text": "from the owner's chat"}},
+        want_chat_id=111, handler=lambda t: seen.append(t))
+    check("_process_update: matching chat_id reaches the handler",
+          seen, ["from the owner's chat"])
+    seen.clear()
+    notify_mod._process_update(
+        {"message": {"chat": {"id": 999}, "text": "from a stranger who also messaged the bot"}},
+        want_chat_id=111, handler=lambda t: seen.append(t))
+    check("_process_update: a DIFFERENT chat_id is dropped — this is the entire "
+          "authorization boundary on the inbound side", seen, [])
+    seen.clear()
+    notify_mod._process_update({"message": {"chat": {"id": 111}, "text": ""}},
+                                want_chat_id=111, handler=lambda t: seen.append(t))
+    check("_process_update: empty text is dropped", seen, [])
+
+    notify_calls.clear()
+    r = pub.post("/api/access-request", json={"email": "Erin@Example.com", "note": "reply flow"})
+    check("seed request for the reply-flow tests is accepted", r.status_code, 200)
+    check("...and it pushed once (already covered above, reconfirmed as this section's baseline)",
+          len(notify_calls), 1)
+    notify_calls.clear()
+
+    api._handle_telegram_reply("yes erin@example.com approved")
+    check("a reply naming the email approves it in one push",
+          len(notify_calls), 1)
+    check("...naming the email in the confirmation",
+          "erin@example.com" in notify_calls[-1].lower(), True)
+    check("...and handing back a gk_ key", "gk_" in notify_calls[-1], True)
+    erin_req = [x for x in store.list_access_requests() if x["email_norm"] == "erin@example.com"][0]
+    check("...and the request is now approved in the database",
+          erin_req["status"], "approved")
+
+    notify_calls.clear()
+    api._handle_telegram_reply("erin@example.com")
+    check("replying again for an already-approved address mints NO second key "
+          "(email lookup only matches PENDING rows)", len(notify_calls), 1)
+    check("...and says there is no pending request",
+          "no pending" in notify_calls[-1].lower(), True)
+
+    notify_calls.clear()
+    api._handle_telegram_reply("never-asked@example.com")
+    check("replying with an email nobody requested says so and mints nothing",
+          len(notify_calls), 1)
+    check("...and it is the 'no pending request' message, not a key",
+          "gk_" in notify_calls[-1], False)
+
+    notify_calls.clear()
+    api._handle_telegram_reply("just chatting, no address here")
+    check("a reply with no email substring at all triggers NO push whatsoever "
+          "(silence, not a confusing error)", len(notify_calls), 0)
+
+    # Positive control: with real credentials configured, the lifespan
+    # actually starts the poller and it actually calls the transport — proves
+    # the safety checks above are gating a REAL capability, not asserting
+    # the absence of one that was never wired up.
+    section("telegram approve-by-reply — the poller genuinely starts when configured")
+    poll_calls = []
+
+    def fake_get_updates(token, offset, timeout_s):
+        poll_calls.append((token, offset, timeout_s))
+        time.sleep(0.02)
+        return []
+
+    real_get_updates = notify_mod._get_updates
+    notify_mod._get_updates = fake_get_updates
+    os.environ["TELEGRAM_BOT_TOKEN"] = "harness-fake-token"
+    os.environ["TELEGRAM_CHAT_ID"] = "111"
+    try:
+        with TestClient(api.app) as lifespan_client:
+            time.sleep(0.2)
+            during = {t.name for t in threading.enumerate()}
+            check("CONTROL: with credentials set, the poller thread IS running",
+                  "telegram-reply-listener" in during, True)
+            check("CONTROL: and it actually called the (stubbed) transport",
+                  len(poll_calls) > 0, True)
+        time.sleep(0.2)
+        after = {t.name for t in threading.enumerate()}
+        check("the poller thread stops cleanly when the app shuts down",
+              "telegram-reply-listener" in after, False)
+    finally:
+        notify_mod._get_updates = real_get_updates
+        os.environ["TELEGRAM_BOT_TOKEN"] = ""
+        os.environ["TELEGRAM_CHAT_ID"] = ""
+
     # ── Redeeming a minted key ─────────────────────────────────────────────
     section("redeeming a guest key")
     rc = TestClient(api.app)
@@ -453,7 +559,6 @@ def main():
 
     # The race the PRIMARY KEY exists to win.
     section("budget atomicity under concurrency")
-    import threading
     kid2 = store.create_guest_key("race@example.com")[0]
     results, lock = [], threading.Lock()
 

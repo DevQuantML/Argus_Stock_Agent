@@ -332,6 +332,23 @@ js/tour.js            five-step coach-mark orientation (no imports, no network)
   does this, asserts the emptiness *after* import, and additionally counts
   provider invocations — with a positive control proving the counter can fire, so
   "never entered" is evidence rather than a monkeypatch that silently missed.
+- **A blank line in `.env` is not the same as an absent one, and `ARGUS_DB`
+  used to get this wrong.** `.env.example` documents `ARGUS_DB=` (and
+  `TRUST_PROXY=`, `ALPHA_VANTAGE_KEY=`) as "leave blank for the default" — but
+  `load_dotenv(override=False)` only skips a name already present in the
+  process environment; a `KEY=` line with nothing after the `=` still SETS
+  that key, to `""`. `os.getenv("ARGUS_DB", default)` only falls back when the
+  key is *absent*, so a present-but-empty value silently wins over the
+  default, `Path("")` resolves to the cwd, and `sqlite3.connect()` on a
+  directory fails with an opaque "unable to open database file" that gives no
+  hint the cause is an env var. This is exactly what a fresh
+  `cp .env.example .env` produces — it is not a hypothetical. `DB_PATH` is now
+  `Path(os.getenv("ARGUS_DB") or (Path(__file__).parent / "argus.db"))`; `or`
+  treats "unset" and "set to empty" as the same request, matching what the
+  comment already promised. `TRUST_PROXY` never had this bug — `_trusted_hops()`
+  wraps the `int()` conversion in a `try/except ValueError` and fails closed to
+  0, so an empty string degrades safely there by accident of unrelated code,
+  not by the same guarantee.
 - **`POST /api/research/{t}/synthesis` fences its body.** `_synthesis_prompt()`
   interpolates the four posted module strings and `run_synthesis` fires three
   paid calls off them. While the only caller was the operator's own browser
@@ -377,6 +394,31 @@ js/tour.js            five-step coach-mark orientation (no imports, no network)
   side-channel notification must never affect what the public endpoint returns.
   No `parse_mode` is set on the Telegram call, so the caller-supplied email/note
   reach Telegram as literal text with no Markdown/HTML injection surface.
+- **The owner can approve a request by replying to the Telegram push with the
+  email — no webhook, and it works identically on localhost or deployed.**
+  `tools.notify.start_telegram_reply_listener()` long-polls Telegram's
+  `getUpdates` from a daemon thread rather than registering a webhook: a
+  webhook needs a public HTTPS URL Telegram can call back into, and polling
+  needs only outbound requests, which this process can always make. It starts
+  from `api.py`'s FastAPI `lifespan`, not at import time — a bare `import api`
+  or the bare `TestClient(api.app)` this project's whole harness suite uses
+  (no `with` block) never runs `lifespan`, so importing or testing api.py
+  starts no thread and touches no network. Only `with TestClient(app) as c:`
+  or a real `uvicorn.run()` triggers it.
+  **The chat-id check in `_process_update` is the entire authorization
+  boundary** — a message from any chat other than the configured
+  `TELEGRAM_CHAT_ID` is dropped before it ever reaches the handler. The bot is
+  not a public interface; anyone who starts a chat with it and replies gets
+  silently ignored, not an error.
+  `api._handle_telegram_reply()` matches the reply's email against **pending**
+  requests only (`store.list_access_requests("pending")`), which is what stops
+  a stale or duplicate reply from minting a second key for an address already
+  approved or denied — the email simply will not be found there any more.
+  Approval itself goes through `api._mint_and_approve()`, shared with the
+  admin web route's APPROVE button, so the two paths cannot drift into
+  different behaviour. On first start the listener discards whatever backlog
+  `getUpdates` returns before processing anything — a server restart must not
+  replay a reply from days ago and auto-approve something stale.
 - **Every `?v=` in `static/` must agree.** ES modules are keyed by full URL, so
   `api.js?v=15` and `api.js?v=16` are two module instances with two separate
   `auth` objects. This actually shipped: `views.js` sat a version behind, so SIGN

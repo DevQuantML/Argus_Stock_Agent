@@ -30,7 +30,14 @@ from tools.validator import validate_ticker
 
 logger = logging.getLogger(__name__)
 
-DB_PATH = Path(os.getenv("ARGUS_DB", Path(__file__).parent / "argus.db"))
+# `os.getenv("ARGUS_DB", default)` only falls back when the key is ABSENT —
+# a .env line "ARGUS_DB=" (exactly what .env.example ships, and what a fresh
+# `cp .env.example .env` produces) sets it to a PRESENT empty string, which
+# getenv returns as-is. Path("") resolves to the cwd, and sqlite3.connect()
+# on a directory fails with an opaque "unable to open database file" that
+# gives no hint the cause is an env var, not a permissions problem. `or`
+# treats "unset" and "set to empty" as the same request: use the default.
+DB_PATH = Path(os.getenv("ARGUS_DB") or (Path(__file__).parent / "argus.db"))
 
 SESSION_DAYS = 30
 
