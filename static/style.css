@@ -926,8 +926,11 @@ input::placeholder{color:var(--txt-muted);opacity:.7;}
 
 /* ══════════════════════════════════════════════════════════════════════════
    v17 — landing, access tiers, admin, tour, news
-   Every colour here is a token. Nothing is hardcoded, so the accent swap on
-   [data-accent] keeps working.
+   Accent-derived colour goes through tokens, so the [data-accent] swap keeps
+   working. The few literal rgba() values below are alpha variants of FIXED
+   semantic colours (--gold), which is the same convention .tag.t-amber and
+   .qc-nat.nat-wait already use — those are not accent derivatives and do not
+   change with the theme.
    ══════════════════════════════════════════════════════════════════════════ */
 
 /* ── Landing ──────────────────────────────────────────────────────────── */

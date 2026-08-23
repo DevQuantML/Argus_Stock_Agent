@@ -71,7 +71,11 @@ CREATE TABLE IF NOT EXISTS sessions (
     token_hash TEXT PRIMARY KEY,
     created_at TEXT NOT NULL,
     expires_at TEXT NOT NULL,
-    tier       TEXT NOT NULL DEFAULT 'owner',
+    -- CHECKed like access_requests.status is; the same schema should not
+    -- constrain one enum column and leave the security-relevant one open.
+    -- Only lands on fresh databases (ADD COLUMN cannot add a CHECK), so it
+    -- is belt-and-braces behind create_session's ValueError.
+    tier       TEXT NOT NULL DEFAULT 'owner' CHECK (tier IN ('owner','guest')),
     guest_key_id INTEGER
 );
 -- Guest keys: time-boxed credentials the operator issues to other people.
@@ -594,6 +598,18 @@ def revoke_all_guest_access() -> int:
 
 # ── Guest budget ──────────────────────────────────────────────────────────
 
+def _expired(iso: str) -> bool:
+    """True when an ISO timestamp is in the past, or unparseable.
+
+    Fails closed on a bad value: a timestamp we cannot read is not evidence
+    that a credential is still live.
+    """
+    try:
+        return datetime.fromisoformat(iso) < datetime.now(timezone.utc)
+    except (TypeError, ValueError):
+        return True
+
+
 def consume_guest_unit(key_id: int, ticker: str, module: str) -> str:
     """Claim one stage of the guest's dive.
 
@@ -618,38 +634,57 @@ def consume_guest_unit(key_id: int, ticker: str, module: str) -> str:
     with _lock:
         c = _connect()
         c.execute("BEGIN IMMEDIATE")
+        # One exit point, deliberately. The outcome is computed into `result`
+        # and committed once, below.
+        #
+        # This was `try: … return … finally: c.commit()`. The bare finally
+        # committed whatever a FAILED transaction had already written — in
+        # practice the conditional UPDATE binding dive_ticker — leaving a guest
+        # with a key welded to a ticker it consumed no stage on, refused 409 on
+        # every other symbol, and nothing logged.
+        #
+        # The obvious repair (`except: rollback; raise` / `else: commit`) is
+        # WRONG here and silently so: an `else` clause does not run when the
+        # try block exits via `return`, and every branch below returns. The
+        # commit never happened, the transaction stayed open, and the next
+        # BEGIN IMMEDIATE died with "cannot start a transaction within a
+        # transaction" — which is exactly why the original reached for finally.
         try:
             row = c.execute("SELECT * FROM guest_keys WHERE id = ?", (key_id,)).fetchone()
             if row is None:
-                return "missing"
-            if row["revoked_at"]:
-                return "revoked"
-            try:
-                if datetime.fromisoformat(row["expires_at"]) < datetime.now(timezone.utc):
-                    return "expired"
-            except ValueError:
-                return "expired"
-
-            c.execute(
-                "UPDATE guest_keys SET dive_ticker = ? WHERE id = ? AND dive_ticker IS NULL",
-                (t, key_id),
-            )
-            bound = c.execute(
-                "SELECT dive_ticker FROM guest_keys WHERE id = ?", (key_id,)
-            ).fetchone()["dive_ticker"]
-            if bound != t:
-                return "other_ticker"
-
-            try:
+                result = "missing"
+            elif row["revoked_at"]:
+                result = "revoked"
+            elif _expired(row["expires_at"]):
+                result = "expired"
+            else:
                 c.execute(
-                    "INSERT INTO guest_key_uses (key_id, module, used_at) VALUES (?,?,?)",
-                    (key_id, module, _now()),
+                    "UPDATE guest_keys SET dive_ticker = ? WHERE id = ? AND dive_ticker IS NULL",
+                    (t, key_id),
                 )
-            except sqlite3.IntegrityError:
-                return "used"
-            return "ok"
-        finally:
-            c.commit()
+                bound = c.execute(
+                    "SELECT dive_ticker FROM guest_keys WHERE id = ?", (key_id,)
+                ).fetchone()["dive_ticker"]
+                if bound != t:
+                    result = "other_ticker"
+                else:
+                    try:
+                        c.execute(
+                            "INSERT INTO guest_key_uses (key_id, module, used_at) "
+                            "VALUES (?,?,?)",
+                            (key_id, module, _now()),
+                        )
+                        result = "ok"
+                    except sqlite3.IntegrityError:
+                        result = "used"
+        except Exception:
+            c.rollback()
+            logger.error("consume_guest_unit failed (key_id=%s ticker=%s module=%s)",
+                         key_id, t, module, exc_info=True)
+            raise
+
+        c.commit()
+        return result
 
 
 def refund_guest_unit(key_id: int, module: str) -> None:
@@ -673,8 +708,8 @@ _MAX_PENDING = 200
 _MAX_REQUESTS = 1000
 
 
-def create_access_request(email: str, email_norm: str, note: str) -> str:
-    """Record a request. Returns 'ok' or 'closed'.
+def create_access_request(email: str, email_norm: str, note: str) -> tuple[str, bool]:
+    """Record a request. Returns (outcome, is_new); outcome is 'ok' or 'closed'.
 
     The caller must map BOTH outcomes onto responses that do not reveal
     anything about a specific address — a new email, a duplicate, an already
@@ -684,6 +719,12 @@ def create_access_request(email: str, email_norm: str, note: str) -> str:
     A resubmission refreshes the note of a still-pending row and otherwise
     changes nothing. Note that a denied row is therefore inert: see
     reopen_access_request(), which is the operator's way back from a misclick.
+
+    `is_new` is True only when the address had no row at all — never for a
+    note-refresh on a pending row, and never for a no-op hit against an
+    approved/denied one. The caller uses it to gate the owner's Telegram
+    notification: without this, a denied address retried on a timer would
+    page the owner's phone forever for a submission that changes nothing.
     """
     with _lock:
         c = _connect()
@@ -694,11 +735,12 @@ def create_access_request(email: str, email_norm: str, note: str) -> str:
         existing = c.execute(
             "SELECT id FROM access_requests WHERE email_norm = ?", (email_norm,)
         ).fetchone()
+        is_new = existing is None
 
         # Caps apply to genuinely new rows; an existing requester updating their
         # note must not be turned away because the queue is long.
-        if existing is None and (pending >= _MAX_PENDING or total >= _MAX_REQUESTS):
-            return "closed"
+        if is_new and (pending >= _MAX_PENDING or total >= _MAX_REQUESTS):
+            return "closed", False
 
         c.execute(
             """INSERT INTO access_requests (email, email_norm, note, status, created_at)
@@ -708,7 +750,7 @@ def create_access_request(email: str, email_norm: str, note: str) -> str:
             (email[:254], email_norm, (note or "")[:280], _now()),
         )
         c.commit()
-        return "ok"
+        return "ok", is_new
 
 
 def list_access_requests(status: str | None = None) -> list[dict]:

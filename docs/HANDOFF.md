@@ -866,9 +866,10 @@ feed visitor mode.** `verify_access.py` plants a sentinel ticker in
 
 ### 10.8 Verification
 
-All six free harnesses pass: `verify_access` 98, `verify_hardening` 50,
-`verify_proxy_trust` 17, `verify_consistency` 13, `verify_docs` 30,
-`verify_ticker_validation` all.
+All six free harnesses pass. Deliberately not quoting the assertion counts:
+they were wrong within a day of being written, and each harness prints its own
+total, so a number here adds nothing a reader can act on and one more thing that
+can be stale.
 
 Exercised in a browser against the real uvicorn server, since `TestClient` skips
 the middleware where the rate limiting lives: landing → free mode → `quant AAPL`

@@ -11,6 +11,7 @@
 
 export const auth = {
   authenticated: false,
+  stale: false,        // true when the last refresh could not reach the server
   tier: null,          // 'owner' | 'guest' | null — null means no session at all
   guest: null,         // {expires_at, dive_ticker, modules_total, modules_used, exhausted}
 
@@ -47,9 +48,27 @@ export const auth = {
   },
 
   async refresh() {
+    /* Only an ANSWER clears the cached identity.
+
+       GET /api/session is ungated and returns 200 {authenticated:false} when
+       there genuinely is no session — so a throw here means something else:
+       a dropped network, a 5xx, or a 429. Treating those as "no session"
+       downgraded a live keyholder to visitor: at boot the owner was shown the
+       public landing asking them to request access to their own terminal, and
+       mid-run a guest's chip flipped to FREE MODE with four stages still
+       unspent. The cookie is HttpOnly and still there; only our cache was
+       wrong. */
     try {
       auth._apply(await request('/api/session'));
-    } catch { auth._apply(null); }
+      auth.stale = false;
+    } catch (err) {
+      if (err && err.status === 401) {
+        auth._apply(null);        // authoritative: the session is gone
+        auth.stale = false;
+      } else {
+        auth.stale = true;        // keep what we had; the server never answered
+      }
+    }
     return auth.authenticated;
   },
 
@@ -79,8 +98,20 @@ export const auth = {
   },
 
   async signOut() {
-    try { await request('/api/session', { method: 'DELETE' }); } catch { /* already gone */ }
+    /* Returns whether the server actually confirmed it. The cookie is cleared
+       by the DELETE's response, so if that never arrived the session is still
+       live and a reload restores full access — which is the wrong thing to
+       report as "signed out" on a machine someone else can reach, and a guest
+       key exists precisely to be used on someone else's machine. */
+    let confirmed = false;
+    try {
+      await request('/api/session', { method: 'DELETE' });
+      confirmed = true;
+    } catch (err) {
+      confirmed = Boolean(err && err.status === 401);   // already gone counts
+    }
     auth._apply(null);
+    return confirmed;
   },
 };
 
@@ -89,8 +120,8 @@ export class ApiError extends Error {
     super(message);
     this.name   = 'ApiError';
     this.status = status;
-    // network | unauthorized | forbidden | budget | bound | expired
-    // | ratelimit | notfound | server | config | aborted
+    // network | unauthorized | forbidden | budget | bound | stage | expired
+    // | provider | ratelimit | notfound | server | config | aborted
     this.kind   = kind;
     this.code   = code;     // the server's machine-readable reason, when it sent one
     this.detail = detail;   // structured extras, e.g. {bound_ticker}
@@ -136,11 +167,18 @@ function describe(status, body) {
   if (status === 401) {
     // A guest whose key died must NOT be sent to the unlock screen to enter an
     // operator secret they were never given.
-    if (code === 'guest_expired') {
-      return new ApiError(server || 'Your guest key has expired.',
+    if (code === 'guest_expired' || code === 'session_expired') {
+      return new ApiError(server || 'Your session has expired.',
                           { status, kind: 'expired', code });
     }
     return new ApiError('Not authorised — unlock with your key.', { status, kind: 'unauthorized', code });
+  }
+  if (status === 502 && code === 'provider_unavailable') {
+    // Terminal for the run. Every remaining stage calls the same provider, so
+    // carrying on means four more failures and four more toasts. Nothing was
+    // charged for the ones that were refused before billing.
+    return new ApiError(server || 'The research provider is unavailable right now.',
+                        { status, kind: 'provider', code });
   }
   if (status === 429) return new ApiError(server || 'Rate limit reached. Wait a moment.', { status, kind: 'ratelimit', code });
   if (status === 400) return new ApiError(server || 'Ticker not found. Try adding .NS for NSE or .BO for BSE.', { status, kind: 'notfound', code });

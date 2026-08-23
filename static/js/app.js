@@ -17,6 +17,13 @@ import { DISCLAIMER, FRESHNESS_NOTE, guestAllowanceLine } from './copy.js?v=17';
 const $  = ui.$;
 const $$ = ui.$$;
 
+const el = (tag, cls, text) => {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text !== undefined && text !== null) n.textContent = text;
+  return n;
+};
+
 const state = {
   info: null,          // /api/info — portfolio, watchlist, brent levels, geo map
   health: null,
@@ -38,19 +45,23 @@ const state = {
   cancelType: null,    // aborts an in-flight typewriter
   profile: null,       // onboarding answers — drives the tailored defaults
   view: 'research',    // research | portfolio | profile
-  tier: 'visitor',     // visitor | guest | owner — mirrors api.auth, see syncTier()
 };
 
-/* One place where the tier is read off the auth layer. Every gate in this file
-   keys off state.tier rather than a bare auth.has(), because "has a session" no
-   longer answers the question a gate is asking. */
-function syncTier() {
-  state.tier = api.auth.effectiveTier();
-  return state.tier;
-}
+/* The tier is DERIVED, never stored.
 
-const isOwner   = () => state.tier === 'owner';
-const isVisitor = () => state.tier === 'visitor';
+   It used to be a `state.tier` field kept in step with api.auth by a syncTier()
+   call after every refresh — and one call site forgot. Unlocking through the
+   config modal refreshed the auth layer but left the mirror reading 'visitor',
+   so the chip said FREE MODE next to a toast reading "AI research armed", and
+   the real owner's `add`/`rm` were refused as if they were a stranger's until
+   the next reload.
+
+   A getter cannot drift from the thing it reads. Every gate in this file keys
+   off tier() rather than a bare auth.has(), because "has a session" no longer
+   answers the question a gate is asking. */
+const tier      = () => api.auth.effectiveTier();
+const isOwner   = () => tier() === 'owner';
+const isVisitor = () => tier() === 'visitor';
 
 const FOLD_KEY  = 'argus.folded';
 const FOCUS_KEY = 'argus.focus';
@@ -123,7 +134,7 @@ async function bootSequence() {
 
   if (isOwner()) {
     lines.push(ok('SESSION ………… ACTIVE · AI ARMED'));
-  } else if (state.tier === 'guest') {
+  } else if (tier() === 'guest') {
     const g = api.auth.guest;
     const left = api.auth.divesLeft();
     lines.push(g && g.exhausted
@@ -147,11 +158,11 @@ async function bootSequence() {
 
 function paintAll() {
   ui.renderStatus(state.health, state.provider === 'groq' ? 'GROQ' : 'PERPLEXITY');
-  ui.renderKeyState(state.tier, api.auth.guest);
+  ui.renderKeyState(tier(), api.auth.guest);
   // Adding to the watchlist is an owner action; the server refuses it for
   // anyone else, so do not offer the control.
   $('btn-add')?.classList.toggle('hidden', !isOwner());
-  ui.renderBrent(state.brent, state.info?.brent_levels);
+  ui.renderBrent(state.brent, state.levels);
   ui.renderGeo(state.info?.geo_transmission, state.info?.portfolio || [], (t) => runCommand(`research ${t}`));
   buildRows();
   ui.renderTape(state.rows.filter(r => r.last !== null).map(r => ({
@@ -279,6 +290,23 @@ function welcome() {
         <code>help</code> lists every command.</p>
      <p class="dim">Alt-click a watchlist row (or press <code>i</code>) to open the inspector.</p>`;
   o.appendChild(b);
+
+  /* Tier-aware footer. copy.js declared FRESHNESS_NOTE and guestAllowanceLine
+     as belonging here, both modules imported them, and neither rendered them —
+     so a guest learned what their key included only from the chip's tooltip or
+     the cost modal, and nobody was told how fresh the data is. An unused
+     import plus prose asserting it IS used is exactly the drift copy.js was
+     created to prevent. */
+  if (tier() === 'guest') {
+    const g = el('p', 'dim');
+    g.textContent = guestAllowanceLine(api.auth.guest);
+    if (g.textContent) o.appendChild(g);
+  }
+  if (!isOwner()) {
+    const f = el('p', 'ld-disc');
+    f.textContent = FRESHNESS_NOTE;
+    o.appendChild(f);
+  }
 }
 
 function help() {
@@ -296,6 +324,8 @@ function help() {
     ['portfolio', 'Invested, P&L, XIRR, weights and the analyst outlook.'],
     ['profile', 'Edit tailoring, positions, buy dates and watchlist.'],
     ['focus', 'Reading mode — hide the side panels. Esc restores.'],
+    ['tour', 'Replay the 30-second orientation.'],
+    ['request', 'Ask the owner to issue you a guest key.'],
     ['clear', 'Clear the output pane.'],
     ['help', 'This list.'],
   ];
@@ -419,7 +449,7 @@ async function loadFree(sym, { withPipeline = true } = {}) {
     ui.pipeline.done('quant', ms);
     ui.pipeline.done('brent', ms);
   }
-  if (demo.brent) { state.brent = demo.brent; ui.renderBrent(demo.brent, state.info?.brent_levels); }
+  if (demo.brent) { state.brent = demo.brent; ui.renderBrent(demo.brent, state.levels); }
 
   // Identity line
   const s = state.stock;
@@ -550,8 +580,7 @@ function markRemainingLocked(failedKey, why) {
 async function refreshTier() {
   try {
     await api.auth.refresh();
-    syncTier();
-    ui.renderKeyState(state.tier, api.auth.guest);
+    ui.renderKeyState(tier(), api.auth.guest);
   } catch { /* display only — a failure here changes no entitlement */ }
 }
 
@@ -567,7 +596,7 @@ async function research(rawSym, { paid = true } = {}) {
   const started = performance.now();
   // "Can this caller run paid AI?" is no longer "do they hold a session" — a
   // guest holds one and may still have nothing left to spend.
-  const spent  = state.tier === 'guest' && api.auth.divesLeft() <= 0;
+  const spent  = tier() === 'guest' && api.auth.divesLeft() <= 0;
   const hasKey = api.auth.has() && !spent;
 
   openTab(sym);
@@ -599,7 +628,7 @@ async function research(rawSym, { paid = true } = {}) {
     /* A dive that cannot finish before the key dies spends the owner's money
        for a partial result and leaves the guest with nothing to show. Refuse
        to start rather than fail three stages in; the server re-checks anyway. */
-    if (state.tier === 'guest') {
+    if (tier() === 'guest') {
       const hrs = api.auth.hoursLeft();
       if (hrs !== null && hrs < 0.75) {
         ui.setStatus('QUANT ONLY', 'ok');
@@ -613,7 +642,7 @@ async function research(rawSym, { paid = true } = {}) {
     }
 
     const sel = await ui.showCostModal(sym, state.provider, {
-      tier: state.tier,
+      tier: tier(),
       guest: api.auth.guest,
     });
     if (!sel) {
@@ -640,14 +669,6 @@ async function research(rawSym, { paid = true } = {}) {
       const t = performance.now();
       try {
         const data = await api.getResearchModule(sym, key, { signal: controller.signal });
-        // A provider failure comes back 200 with an error body rather than a
-        // status code, so without this the stage gets a green tick and an empty
-        // body — a module that never ran, presented as one that did.
-        if (data.error && !data.output) {
-          ui.pipeline.set(key, 'failed');
-          ui.toast(`${key}: ${data.error}`, 'warn', 7000);
-          continue;
-        }
         texts[key] = data.output || '';
         ui.pipeline.done(key, performance.now() - t);
 
@@ -671,6 +692,17 @@ async function research(rawSym, { paid = true } = {}) {
           ui.pipeline.set(key, 'skipped', 'already run');
           refreshTier();
         }
+        /* The provider itself is down. Every remaining stage would call the
+           same one, so stop — and say so plainly rather than blaming the
+           stage. Anything refused before billing has already been refunded
+           server-side, so a guest's allowance survives this. */
+        else if (err.kind === 'provider') {
+          ui.pipeline.set(key, 'failed');
+          state.run.cancelled = true;
+          ui.toast(err.message, 'error', 9000);
+          markRemainingLocked(key, 'provider down');
+          refreshTier();
+        }
         else if (err.kind === 'budget' || err.kind === 'bound') {
           ui.pipeline.set(key, 'failed');
           state.run.cancelled = true;
@@ -684,8 +716,10 @@ async function research(rawSym, { paid = true } = {}) {
           ui.toast(err.message, 'error', 9000);
           markRemainingLocked(key, 'key expired');
           // Never openConfig() here: that asks for an owner secret a guest was
-          // never given. Send them where a new key actually comes from.
-          openLanding('request');
+          // never given. Send them where a new credential actually comes from —
+          // which differs by who they were. api.auth still holds the pre-401
+          // tier; refreshing first would erase the only clue we have.
+          openLanding(api.auth.isOwner() ? 'unlock' : 'request');
         }
         else if (err.kind === 'forbidden') {
           ui.pipeline.set(key, 'failed');
@@ -697,7 +731,11 @@ async function research(rawSym, { paid = true } = {}) {
           ui.pipeline.set(key, 'failed');
           state.run.cancelled = true;
           ui.toast(err.message, 'error');
-          openConfig();
+          // openConfig() is the OWNER's re-unlock path. For anyone else it
+          // opens a dialog demanding AGENT_SECRET, which a guest or visitor
+          // cannot possibly supply.
+          if (isOwner()) openConfig();
+          else openLanding(tier() === 'guest' ? 'request' : 'unlock');
         } else {
           ui.pipeline.set(key, 'failed');
           ui.toast(`${key}: ${err.message}`, 'warn');
@@ -746,6 +784,12 @@ async function research(rawSym, { paid = true } = {}) {
     ui.setStatus(state.run.cancelled ? 'STOPPED' : 'COMPLETE', state.run.cancelled ? 'err' : 'ok');
     cacheTab(sym);
   } finally {
+    // Also on the happy path. refreshTier() was wired only into the error
+    // branches, so after a COMPLETED dive the cached allowance still read 0/5:
+    // the chip kept saying "1 DIVE", and the next `research` passed the spent
+    // check and showed the full confirmation modal for a dive that then 409'd
+    // on every stage. The client had the data to prevent that.
+    if (tier() === 'guest') refreshTier();
     $('btn-stop').classList.add('hidden');
     const secs = ((performance.now() - started) / 1000).toFixed(1);
     ui.writeLine(`— run complete in ${secs}s —`, 'dim');
@@ -829,7 +873,7 @@ function brentDetail() {
   const box = document.createElement('div');
   box.className = 'r-body';
   box.style.marginTop = '10px';
-  const levels = state.info?.brent_levels || {};
+  const levels = state.levels || {};
   const rows = Object.values(levels).map(v => {
     const [lo, hi] = v.range;
     const on = v.signal === String(b.signal || '').toUpperCase();
@@ -897,7 +941,7 @@ async function runCommand(raw) {
       if (!arg) { ui.toast('Usage: pos <SYM>', 'warn'); return; }
       await inspect(arg); return;
 
-    case 'tour':    tour.startTour(state.tier); return;
+    case 'tour':    tour.startTour(tier()); return;
     case 'request': openLanding('request');     return;
 
     case 'add': {
@@ -1076,9 +1120,9 @@ async function showView(name) {
   }
 
   if (name === 'portfolio') {
-    await views.renderPortfolio(out, { onOutlook: runOutlook, tier: state.tier });
+    await views.renderPortfolio(out, { onOutlook: runOutlook, tier: tier() });
   } else {
-    await views.renderProfile(out, { onChanged: refreshBook, tier: state.tier });
+    await views.renderProfile(out, { onChanged: refreshBook, tier: tier() });
   }
 }
 
@@ -1089,7 +1133,7 @@ async function runOutlook(box) {
      over the owner's whole book, and it overwrites their single cached result —
      neither of which a guest allowance can bound. */
   if (!isOwner()) {
-    ui.toast(state.tier === 'guest'
+    ui.toast(tier() === 'guest'
       ? 'The portfolio outlook is owner-only. Your guest key covers one deep dive '
         + 'on a single ticker instead.'
       : 'Unlock with a key first — this is a paid call.', 'warn', 6000);
@@ -1231,14 +1275,16 @@ function openConfig() {
      sign out, or unlock when the session has lapsed. */
   ui.showConfigModal(api.auth.has(), async (action) => {
     if (action === 'signout') {
-      await api.auth.signOut();
+      const done = await api.auth.signOut();
       ui.renderKeyState('visitor', null);
-      ui.toast('Signed out. AI research is locked.', 'success', 3200);
+      ui.toast(done ? 'Signed out. AI research is locked.'
+                    : 'Could not confirm sign-out — the server did not respond. Close this browser to be safe.',
+               done ? 'success' : 'warn', done ? 3200 : 9000);
       return;
     }
     views.showUnlock(async () => {
       await api.auth.refresh();
-      ui.renderKeyState(state.tier, api.auth.guest);
+      ui.renderKeyState(tier(), api.auth.guest);
       ui.toast('Unlocked — AI research armed.', 'success', 3200);
     });
   }, (key) => {
@@ -1326,7 +1372,6 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // Session first: the boot log reports the tier, so it must know it.
   await api.auth.refresh();
-  syncTier();
 
   const enter = async () => {
     const lines = await bootSequence();
@@ -1367,10 +1412,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     mode,
     onUnlocked: async () => {
       await api.auth.refresh();
-      syncTier();
       await enterOrOnboard();
     },
-    onVisitor: () => { state.tier = 'visitor'; enter(); },
+    onVisitor: () => enter(),   // no session => tier() is already 'visitor'
   });
 
   // Expose the landing so in-terminal calls to action can reach it too.
@@ -1379,7 +1423,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   if (!api.auth.has()) {
     let chose = null;
     try { chose = sessionStorage.getItem('argus.visitor'); } catch { /* fine */ }
-    if (chose) { state.tier = 'visitor'; await enter(); return; }
+    if (chose) { await enter(); return; }
     landing('landing');
     return;
   }
@@ -1416,14 +1460,14 @@ function startTerminal() {
        enterOrOnboard() sets the flag for them, because a 6-step coach-mark
        tour immediately after a 4-step wizard is ten modal steps before the
        reader can type anything. They get the one-line hint in welcome(). */
-    try { tour.maybeOfferTour(state.tier); }
+    try { tour.maybeOfferTour(tier()); }
     catch (err) { console.error('[argus] tour failed:', err); }
 
     setInterval(async () => {
       try {
         const b = await api.getBrent();
         state.brent = b;
-        ui.renderBrent(b, state.info?.brent_levels);
+        ui.renderBrent(b, state.levels);
       } catch { /* the panel keeps the last good value */ }
     }, 5 * 60 * 1000);
   }

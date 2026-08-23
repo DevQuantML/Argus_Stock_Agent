@@ -51,6 +51,7 @@ tools/stock_data.py           yfinance prices + live-book context
 tools/oil_price.py            Brent futures → macro gate signal
 tools/validator.py            validate_ticker, guard_tool_output, sanitize_question
 tools/xirr.py                 money-weighted return for the portfolio analytics route
+tools/notify.py               best-effort Telegram push (access-request alerts)
 static/                       frontend — index.html, style.css, js/*.js (ES modules)
 scripts/verify_*.py           free harnesses — run before any PR
 docs/HANDOFF.md               design decisions, open items, verification log
@@ -96,9 +97,17 @@ Three of them, and every gate keys off the tier rather than "has a session":
 | **guest** | A 24-hour `gk_…` key the owner issued | Visitor features, plus **read-only** sight of the owner's book, plus exactly one 5-stage dive on one ticker. |
 | **owner** | `AGENT_SECRET` | Everything, plus the admin view. |
 
-`state.tier` in `app.js` mirrors `api.auth.effectiveTier()`. The guest allowance
-is rendered as a **count** (`PLTR 2/5`), never a spent/unspent flag — the budget
-is five separately consumable stages, and a guest one stage in still has four.
+`app.js` **derives** the tier — `const tier = () => api.auth.effectiveTier()` —
+and never stores it. It was a `state.tier` field kept in step by a `syncTier()`
+call after every refresh, and one call site forgot: unlocking through the config
+modal left the mirror reading `visitor`, so the real owner's `add`/`rm` were
+refused as a stranger's. A getter cannot drift from what it reads, and
+`verify_consistency.py` fails the build if a `state.tier` field or `syncTier`
+reappears.
+
+The guest allowance is rendered as a **count** (`PLTR 2/5`), never a
+spent/unspent flag — the budget is five separately consumable stages, and a
+guest one stage in still has four.
 
 ## Frontend — ARGUS://TERMINAL
 
@@ -285,7 +294,8 @@ js/tour.js            five-step coach-mark orientation (no imports, no network)
   class existed its holder was indistinguishable from the operator and inherited
   `POST /api/portfolio/outlook` — ~$0.06 a call with no budget concept at all.
   **Never reintroduce a bare-boolean credential check.** `require_owner` guards
-  the five book-mutating routes plus the two unbudgeted paid ones, and answers a
+  three kinds of route — the five book-mutating ones, the two unbudgeted paid
+  ones, and the whole `/api/admin/*` surface (seven routes) — and answers a
   guest with **403, not 401** — a 401 sends the frontend to the unlock screen and
   asks a guest for an owner secret they were never given.
 - **The guest budget is per-module, and the PRIMARY KEY is the lock.** A dive is
@@ -299,8 +309,11 @@ js/tour.js            five-step coach-mark orientation (no imports, no network)
   a plain non-reentrant `threading.Lock` and `_rows`/`_exec` both acquire it, so
   calling either from inside the lock deadlocks on the first guest research call.
   The surrounding file's idiom is the opposite.
-- **Refund only what provably cost nothing.** `_refund_if_free()` returns a stage
-  only when no provider was configured — that raises before any network call.
+- **Refund only what provably cost nothing.** `_refund_if_free()` keys off a
+  structured `cost_incurred: False` set by the layer that made — or did not make
+  — the network call, never off the wording of an error string. Three cases
+  qualify: no provider configured, a 401, and a 429; all are rejected before any
+  work is billed.
   Any other failure keeps the stage: a mid-flight timeout may already have been
   billed, and refunding it would be unlimited retries of a paid operation. A
   refund never unbinds `dive_ticker`, so "one dive, one ticker" stays a rule with
@@ -351,6 +364,19 @@ js/tour.js            five-step coach-mark orientation (no imports, no network)
   nothing and return the same cheerful body forever. That is deliberate
   anti-enumeration — but it means one misclick is a silent permanent block, so
   denied rows stay **visible and reopenable** in the admin view.
+- **The owner's Telegram push fires only on `is_new`, not on every 200.**
+  `POST /api/access-request` returns the identical body for a new address, a
+  pending resubmission, and a no-op hit on an approved/denied row — that's the
+  anti-enumeration guarantee above. Notifying on every one of those would let a
+  denied address on a retry loop page the owner's phone forever over a
+  submission that changes nothing in the database. `store.create_access_request`
+  now returns `(outcome, is_new)`; `api_access_request` only schedules
+  `notify_telegram` when `is_new` is True. The push itself runs via FastAPI
+  `BackgroundTasks` **after** the response is sent, and `tools/notify.py`
+  swallows every failure (unset token, network error, Telegram outage) — a
+  side-channel notification must never affect what the public endpoint returns.
+  No `parse_mode` is set on the Telegram call, so the caller-supplied email/note
+  reach Telegram as literal text with no Markdown/HTML injection surface.
 - **Every `?v=` in `static/` must agree.** ES modules are keyed by full URL, so
   `api.js?v=15` and `api.js?v=16` are two module instances with two separate
   `auth` objects. This actually shipped: `views.js` sat a version behind, so SIGN
@@ -398,8 +424,8 @@ same stubbed provider, so a zero invocation count is evidence rather than a
 monkeypatch that silently failed to bind. A control that has stopped
 controlling is worse than no control.
 
-`verify_quant.py` lives on `fix/slide-in-panel-overlay`, not on this branch.
-Its `currency mismatch` assertion was inverted there as part of this work: it
+`verify_quant.py`'s `currency mismatch` assertion was inverted as part of the FX
+work: it
 used to require `dcf_intrinsic_value is None` whenever the currencies
 disagreed, which was right when declining was the only honest option and is
 wrong now that `tools/fx.py` converts. It now asserts the opposite, and reads

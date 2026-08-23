@@ -1343,7 +1343,7 @@ export function renderNews(host, items) {
    a URL ends up in history, logs and the OS handler chain. */
 
 export function showKeyReveal({ email, key, expiresAt }) {
-  const { box } = modal(`
+  const { box, close } = modal(`
     <div class="mdl-hd"><span>GUEST KEY · SHOWN ONCE</span><button data-close type="button">✕</button></div>
     <div class="mdl-b">
       <p class="hint" id="kr-for" style="margin:0 0 10px"></p>
@@ -1354,7 +1354,7 @@ export function showKeyReveal({ email, key, expiresAt }) {
       </div>
       <p class="hint" id="kr-warn" style="margin-top:12px"></p>
     </div>
-    <div class="mdl-f"><button class="btn" data-close type="button">DONE</button></div>`);
+    <div class="mdl-f"><button id="kr-done" class="btn" type="button">DONE</button></div>`);
 
   // Untrusted: the address came from a public form.
   box.querySelector('#kr-for').textContent =
@@ -1378,15 +1378,42 @@ export function showKeyReveal({ email, key, expiresAt }) {
 
   const copy = box.querySelector('#kr-copy');
   copy.onclick = async () => {
+    /* Verify before claiming. navigator.clipboard is undefined on plain HTTP —
+       which this app explicitly supports — and the execCommand fallback
+       returns FALSE on failure rather than throwing, so the old catch never
+       fired and the button went green regardless.
+
+       This modal is the only moment the key exists in readable form; only its
+       hash is stored. A false "COPIED ✓" means the operator pastes whatever
+       was already on their clipboard, the request is already marked approved
+       and gone from the pending list, and the person who asked never gets a
+       key — with no signal to anyone. */
+    let ok = false;
     try {
-      await navigator.clipboard.writeText(key);
-    } catch {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(key);
+        ok = true;
+      }
+    } catch { ok = false; }
+
+    if (!ok) {
       input.select();
-      try { document.execCommand('copy'); } catch { /* leave it selected to copy by hand */ }
+      try { ok = document.execCommand('copy'); } catch { ok = false; }
     }
-    copy.textContent = 'COPIED ✓';
-    setTimeout(() => { copy.textContent = 'COPY KEY'; }, 1500);
+
+    copy.textContent = ok ? 'COPIED ✓' : 'COPY FAILED — PRESS CTRL+C';
+    copy.classList.toggle('btn-danger', !ok);
+    if (!ok) input.select();     // leave it selected so Ctrl+C works
+    setTimeout(() => {
+      copy.textContent = 'COPY KEY';
+      copy.classList.remove('btn-danger');
+    }, ok ? 1500 : 6000);
   };
+
+  // modal() wires only the FIRST [data-close], and this is the only dialog in
+  // the file with two. DONE is the button an operator actually clicks after
+  // copying the key, so an inert one reads as "the key was not issued".
+  box.querySelector('#kr-done').onclick = () => close();
 
   input.focus();
   input.select();

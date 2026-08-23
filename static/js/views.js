@@ -756,9 +756,11 @@ export async function renderProfile(host, { onChanged, tier = 'owner' } = {}) {
   out.type = 'button';
   out.style.marginTop = '10px';
   out.onclick = async () => {
-    await api.auth.signOut();
+    const done = await api.auth.signOut();
     ui.renderKeyState('visitor', null);
-    ui.toast('Signed out. Paid research is locked until you unlock again.', 'info', 4000);
+    ui.toast(done ? 'Signed out. Paid research is locked until you unlock again.'
+                  : 'Could not confirm sign-out — the server did not respond. Close this browser to be safe.',
+             done ? 'info' : 'warn', done ? 4000 : 9000);
     onChanged && onChanged();
   };
   host.appendChild(out);

@@ -40,6 +40,7 @@ Run:  python scripts/verify_access.py
 Exit: 0 all passed, 1 any failed
 """
 import os
+import pathlib
 import sqlite3
 import sys
 import tempfile
@@ -59,6 +60,13 @@ os.environ["GROQ_API_KEY"] = ""
 os.environ["ARGUS_DB"] = str(Path(_tmp) / "access.db")
 os.environ["TRUST_PROXY"] = "0"
 os.environ["AGENT_SECRET"] = "harness-only-secret"
+# Same footgun as the provider keys above: a real .env on this machine may
+# hold live Telegram credentials, and load_dotenv(override=False) would refill
+# a POPPED name but skips one already present (even empty). Blanking these is
+# what stops this "spends nothing, touches nothing external" harness from
+# actually paging the operator's phone every time an access-request test runs.
+os.environ["TELEGRAM_BOT_TOKEN"] = ""
+os.environ["TELEGRAM_CHAT_ID"] = ""
 
 PASS, FAIL = [], []
 
@@ -130,6 +138,10 @@ def main():
           bool(api.os.getenv("PERPLEXITY_API_KEY")), False)
     check("GROQ_API_KEY is falsy after importing api",
           bool(api.os.getenv("GROQ_API_KEY")), False)
+    check("TELEGRAM_BOT_TOKEN is falsy after importing api",
+          bool(api.os.getenv("TELEGRAM_BOT_TOKEN")), False)
+    check("TELEGRAM_CHAT_ID is falsy after importing api",
+          bool(api.os.getenv("TELEGRAM_CHAT_ID")), False)
 
     # ── Cost safety layer 3 — count provider invocations ───────────────────
     calls = []
@@ -144,6 +156,12 @@ def main():
     api.run_synthesis = stub("synthesis")
     api.run_perplexity_research = stub("legacy")
     api.run_portfolio_outlook = stub("outlook")
+
+    # notify_telegram runs via BackgroundTasks, which TestClient executes
+    # synchronously before .post() returns — so this stub's call count is
+    # readable immediately after each request, no polling needed.
+    notify_calls = []
+    api.notify_telegram = lambda text: notify_calls.append(text)
 
     store.bootstrap()
     client = TestClient(api.app)
@@ -271,9 +289,13 @@ def main():
     r = pub.post("/api/access-request", json={"email": "Alice@Example.com", "note": "hello"})
     check("a valid request is accepted", r.status_code, 200)
     first_body = r.text
+    check("a genuinely new request pings the owner's Telegram", len(notify_calls), 1)
+    check("...and the push names the address",
+          "alice@example.com" in notify_calls[-1].lower(), True)
 
     r = pub.post("/api/access-request", json={"email": "not-an-email"})
     check("a malformed address is refused 400", r.status_code, 400)
+    check("...and a rejected address never triggers a push", len(notify_calls), 1)
 
     # Anti-enumeration: the same-address resubmission must be indistinguishable.
     r = pub.post("/api/access-request", json={"email": "alice@example.com", "note": "again"})
@@ -283,26 +305,79 @@ def main():
           len([x for x in store.list_access_requests() if x["email_norm"] == "alice@example.com"]), 1)
     check("case differences normalise to one row",
           store.list_access_requests()[0]["email_norm"], "alice@example.com")
+    check("...and a pending resubmission does NOT push again (is_new gates it)",
+          len(notify_calls), 1)
 
     check("/api/access-request has its own tight budget",
           api._budget_for("/api/access-request"), ("signup", 5, 3600))
 
+    notify_calls.clear()
     api._rate_limit_store.clear()
     codes = [pub.post("/api/access-request", json={"email": f"u{i}@example.com"}).status_code
              for i in range(7)]
     check("the 6th request from one IP inside the window is throttled", 429 in codes, True)
+    check("exactly the accepted new addresses pushed, none of the throttled ones",
+          len(notify_calls), codes.count(200))
     api._rate_limit_store.clear()
 
     # Denial must be reversible, or a misclick is a permanent silent block.
     section("a denied request can be reopened")
     req = store.list_access_requests()[-1]
     store.decide_access_request(req["id"], "denied")
+    notify_calls.clear()
     pub.post("/api/access-request", json={"email": req["email_norm"], "note": "please"})
     check("a denied row is NOT resurrected by resubmitting",
           store.get_access_request(req["id"])["status"], "denied")
+    check("...and resubmitting a denied address does not push either (is_new gates it too)",
+          len(notify_calls), 0)
     check("the operator can reopen it", store.reopen_access_request(req["id"]), True)
     check("...and it is pending again",
           store.get_access_request(req["id"])["status"], "pending")
+
+    # ── tools/notify.py — unconfigured means genuinely inert, not just quiet ──
+    # api.notify_telegram is stubbed above, so everything up to this point
+    # exercised the ROUTING (is_new gating), never the real function. This
+    # exercises the real one, with an informant swapped in for urlopen: if the
+    # empty-token no-op guard were ever removed, this positive control proves
+    # the informant would have caught it rather than passing by accident.
+    section("tools.notify.notify_telegram — unconfigured is a true no-op")
+    import tools.notify as notify_mod
+
+    opened = []
+    real_urlopen = notify_mod.urllib.request.urlopen
+    notify_mod.urllib.request.urlopen = lambda *a, **k: opened.append(1)
+    try:
+        notify_mod.notify_telegram("should not attempt any network call")
+        check("no exception with both TELEGRAM_* unset", True, True)
+        check("...and urlopen was never reached (real no-op, not a swallowed error)",
+              len(opened), 0)
+
+        os.environ["TELEGRAM_BOT_TOKEN"] = "harness-fake-token"
+        os.environ["TELEGRAM_CHAT_ID"] = "harness-fake-chat"
+        notify_mod.notify_telegram("CONTROL: configured, should reach urlopen")
+        check("CONTROL: with both set, urlopen IS reached (the guard is live, not a stub)",
+              len(opened), 1)
+    finally:
+        notify_mod.urllib.request.urlopen = real_urlopen
+        os.environ["TELEGRAM_BOT_TOKEN"] = ""
+        os.environ["TELEGRAM_CHAT_ID"] = ""
+
+    # A raising urlopen (bad token, Telegram outage, no network) must not
+    # propagate — this fires from inside a public, unauthenticated route.
+    def _boom(*a, **k):
+        raise OSError("simulated Telegram outage")
+    os.environ["TELEGRAM_BOT_TOKEN"] = "harness-fake-token"
+    os.environ["TELEGRAM_CHAT_ID"] = "harness-fake-chat"
+    notify_mod.urllib.request.urlopen = _boom
+    try:
+        notify_mod.notify_telegram("should swallow the OSError")
+        check("a network failure is swallowed, not raised", True, True)
+    except Exception:
+        check("a network failure is swallowed, not raised", False, True)
+    finally:
+        notify_mod.urllib.request.urlopen = real_urlopen
+        os.environ["TELEGRAM_BOT_TOKEN"] = ""
+        os.environ["TELEGRAM_CHAT_ID"] = ""
 
     # ── Admin gating ───────────────────────────────────────────────────────
     section("admin routes are owner-only")
@@ -532,9 +607,12 @@ def main():
 
     def no_provider(*a, **k):
         calls.append("module")
-        return {"error": "No AI provider configured — set PERPLEXITY_API_KEY "
-                         "or GROQ_API_KEY in .env",
-                "key": "PERPLEXITY_API_KEY or GROQ_API_KEY", "ticker": "PLTR"}
+        # Must mirror run_research_module's real no-provider return, or this
+        # asserts against a shape production does not produce. It previously
+        # omitted cost_incurred, which is exactly the key the refund keys off —
+        # so the harness went on passing while the refund was dead code.
+        return {"error": "the research provider is not configured",
+                "reason": "no_provider", "cost_incurred": False, "ticker": "PLTR"}
 
     saved = api.run_research_module
     api.run_research_module = no_provider
@@ -558,6 +636,218 @@ def main():
                         {"error": "upstream timeout after 30s", "ticker": "PLTR"})
     check("a timeout does not hand the stage back",
           store.guest_usage(keep_id)["modules_used"], 1)
+
+    # ── An unrecognised tier must DENY, not proceed ────────────────────────
+    # _guest_gate used to short-circuit on `not ctx.is_guest`, which reads the
+    # same for owner and guest but differs for anything else — a third tier
+    # would have sailed past the budget onto a paid route, unmetered.
+    # require_owner already tested positively, so the two dependencies
+    # disagreed and the permissive one guarded the money.
+    section("an unrecognised session tier fails closed")
+    calls.clear()
+    bogus = api.AuthCtx("poltergeist")
+    gate = api._guest_gate(bogus, "PLTR", "report")
+    check("an unknown tier is refused by the guest gate", gate is not None, True)
+    check("...with a 403", getattr(gate, "status_code", None), 403)
+    check("...and the provider was never entered", calls, [])
+
+    # The two tiers that DO exist must still behave as before.
+    check("an owner still passes the gate untouched",
+          api._guest_gate(api.AuthCtx("owner"), "PLTR", "report"), None)
+
+    # The schema now constrains the column the same way access_requests.status is.
+    section("the sessions.tier column is constrained")
+    with store._lock:
+        c = store._connect()
+        sql = c.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='sessions'"
+        ).fetchone()[0]
+    check("fresh databases CHECK the tier column",
+          "CHECK (tier IN ('owner','guest'))" in sql, True)
+    try:
+        store.create_session("poltergeist")
+        rejected = False
+    except ValueError:
+        rejected = True
+    check("create_session still rejects an unknown tier outright", rejected, True)
+
+    # ── A dead provider must not be served as a successful report ──────────
+    # _call() returned "" for EVERY failure — 401, 429, timeout, empty — and
+    # run_research_module dressed that empty string up as the `output` field of
+    # a success-shaped dict. The route answered 200, the caller ticked the stage
+    # green, and a guest was charged all five stages for five paragraphs telling
+    # them to edit a .env file on someone else's server.
+    section("a provider failure is reported, not dressed up as output")
+    from tools import perplexity_research as pr
+
+    # _call's contract: on failure it reports WHY, and whether money moved.
+    class _Boom:
+        def __init__(self, msg):
+            self.msg = msg
+
+        @property
+        def chat(self):
+            raise RuntimeError(self.msg)
+
+    for msg, reason, cost in [
+        ("Error code: 401 - invalid_api_key", "auth", False),
+        ("Error code: 429 - rate limit",      "ratelimit", False),
+        ("Request timeout after 30s",         "timeout", True),
+        ("connection reset by peer",          "error", True),
+    ]:
+        st = {}
+        out = pr._call("p", client=_Boom(msg), status=st)
+        check(f"_call reports reason={reason} for {msg[:22]!r}", st.get("reason"), reason)
+        check(f"...and cost_incurred={cost}", st.get("cost_incurred"), cost)
+        check("...and still returns a string for the callers that want one", out, "")
+
+    # The route turns that into a 502 with a code, not a 200 with prose.
+    prov_key = store.create_guest_key("provider@example.com")[1]
+    rcv = TestClient(api.app)
+    rcv.post("/api/session", json={"key": prov_key})
+    prov_id = store.guest_key_for(prov_key)["id"]
+
+    saved = api.run_research_module
+    api.run_research_module = lambda *a, **k: {
+        "error": "the research provider is unavailable right now",
+        "reason": "auth", "cost_incurred": False, "ticker": "PLTR", "module": "report",
+    }
+    try:
+        r = rcv.get("/api/research/PLTR/report")
+    finally:
+        api.run_research_module = saved
+
+    check("a provider failure is NOT served as 200", r.status_code, 502)
+    check("...it carries a code the staged loop can stop on",
+          r.json().get("code"), "provider_unavailable")
+    check("...and never names the owner's env var to a guest",
+          "env" in r.json().get("error", "").lower(), False)
+    check("...and the stage was refunded, since nothing was billed",
+          store.guest_usage(prov_id)["modules_used"], 0)
+
+    section("a possibly-billed failure keeps the stage")
+    t_id = store.create_guest_key("timeout@example.com")[0]
+    store.consume_guest_unit(t_id, "PLTR", "report")
+    api._refund_if_free(api.AuthCtx("guest", t_id), "report",
+                        {"error": "provider unavailable", "reason": "timeout",
+                         "cost_incurred": True, "ticker": "PLTR"})
+    check("a timeout does not hand the stage back",
+          store.guest_usage(t_id)["modules_used"], 1)
+    api._refund_if_free(api.AuthCtx("guest", t_id), "report",
+                        {"error": "provider unavailable", "reason": "auth",
+                         "cost_incurred": False, "ticker": "PLTR"})
+    check("an auth rejection does hand it back",
+          store.guest_usage(t_id)["modules_used"], 0)
+
+    # ── A failed claim must not leave the key welded to a ticker ───────────
+    # consume_guest_unit ended in `finally: c.commit()`, which committed the
+    # partial transaction — including the UPDATE binding dive_ticker — whenever
+    # a statement raised. The guest was left with a key pinned to a ticker it
+    # had consumed no stage on, refused 409 on every other symbol, with nothing
+    # logged anywhere.
+    section("a failed claim rolls back rather than welding the ticker")
+    weld_id = store.create_guest_key("weld@example.com")[0]
+    with store._lock:
+        c = store._connect()
+        c.execute("ALTER TABLE guest_key_uses RENAME TO _uses_hidden")
+        c.commit()
+    try:
+        store.consume_guest_unit(weld_id, "PLTR", "report")
+        raised = False
+    except Exception:                                     # noqa: BLE001
+        raised = True
+    finally:
+        with store._lock:
+            c = store._connect()
+            c.execute("ALTER TABLE _uses_hidden RENAME TO guest_key_uses")
+            c.commit()
+
+    check("the failure propagates rather than being swallowed", raised, True)
+    check("...and dive_ticker was NOT committed",
+          store.guest_usage(weld_id)["dive_ticker"], None)
+    check("...so the key can still be spent on any ticker",
+          store.consume_guest_unit(weld_id, "MSFT", "report"), "ok")
+
+    # ── The notifier must never be able to hurt the endpoint it fires from ──
+    # notify_telegram runs from a PUBLIC, unauthenticated handler. Whatever
+    # Telegram does — bad token, DNS failure, outage, timeout — must not change
+    # what the caller gets back, must not raise, and must not be silent to the
+    # operator.
+    section("a Telegram outage cannot affect the public endpoint")
+    import urllib.error
+
+    from tools import notify as notify_mod
+
+    real_urlopen = notify_mod.urllib.request.urlopen
+
+    def boom(*a, **k):
+        raise urllib.error.URLError("telegram is down")
+
+    notify_mod.urllib.request.urlopen = boom
+    prev_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    prev_chat = os.environ.get("TELEGRAM_CHAT_ID", "")
+    os.environ["TELEGRAM_BOT_TOKEN"] = "test-token"
+    os.environ["TELEGRAM_CHAT_ID"] = "12345"
+    try:
+        raised = False
+        try:
+            notify_mod.notify_telegram("hello")
+        except Exception:                                 # noqa: BLE001
+            raised = True
+        check("a failing push is swallowed, never raised", raised, False)
+
+        # And the endpoint itself, with the real (failing) notifier wired in.
+        real_notify = api.notify_telegram
+        api.notify_telegram = notify_mod.notify_telegram
+        try:
+            r = pub.post("/api/access-request",
+                         json={"email": "outage@example.com", "note": "hi"})
+        finally:
+            api.notify_telegram = real_notify
+        check("...and the public endpoint still answers 200", r.status_code, 200)
+        check("...with the same body as any other accepted request",
+              r.json(), {"ok": True, "status": "received"})
+        check("...and the request was still recorded",
+              any(x["email_norm"] == "outage@example.com"
+                  for x in store.list_access_requests()), True)
+    finally:
+        notify_mod.urllib.request.urlopen = real_urlopen
+        os.environ["TELEGRAM_BOT_TOKEN"] = prev_token
+        os.environ["TELEGRAM_CHAT_ID"] = prev_chat
+
+    # A failed push must be VISIBLE. logger.debug is discarded under uvicorn
+    # (nothing calls basicConfig), so a wrong token would look exactly like
+    # "nobody has asked for access yet" — forever.
+    src = (ROOT / "tools" / "notify.py").read_text(encoding="utf-8")
+    check("a failed push is logged at warning, not debug",
+          "logger.warning(" in src, True)
+    check("...and no debug-level failure log remains",
+          "logger.debug(" in src, False)
+
+    # No new dependency: the project ships none for this.
+    check("notify.py imports nothing outside the stdlib",
+          all(m not in src for m in ("import requests", "import httpx", "from requests")),
+          True)
+    # Strip docstrings and comments before searching. The docstring EXPLAINS
+    # that no parse_mode is set, so a raw substring scan matches the prose and
+    # reports the opposite of the truth. This false-positive class has now bitten
+    # this project four times; the rule is to search code, never the file.
+    import ast as _ast
+
+    def _code_only(path):
+        tree = _ast.parse(pathlib.Path(path).read_text(encoding="utf-8"))
+        for node in _ast.walk(tree):
+            if (isinstance(node, _ast.Expr)
+                    and isinstance(node.value, _ast.Constant)
+                    and isinstance(node.value.value, str)):
+                node.value.value = ""          # blank docstrings
+        return _ast.unparse(tree)              # comments are already gone
+
+    notify_code = _code_only(ROOT / "tools" / "notify.py")
+    check("...and sets no parse_mode, so the note cannot inject markup",
+          "parse_mode" in notify_code, False)
+    check("CONTROL: the code scan still sees the real request body",
+          "chat_id" in notify_code, True)
 
     # ── Final cost assertion ───────────────────────────────────────────────
     section("cost — no unintended provider call remains outstanding")
