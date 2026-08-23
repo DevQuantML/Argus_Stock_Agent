@@ -279,7 +279,16 @@ def add_watch(ticker: str, note: str = "", sector: str = "") -> str:
     _exec(
         """INSERT INTO watchlist (ticker, note, tranches, brent_gated, exchange, sector, added_at)
            VALUES (?,?,'[]',0,'',?,?)
-           ON CONFLICT(ticker) DO UPDATE SET note=excluded.note""",
+           ON CONFLICT(ticker) DO UPDATE SET
+               note=excluded.note,
+               -- Only overwrite sector when a non-blank one was supplied.
+               -- add_watch(t, note) with no sector is the common re-add path
+               -- (the command line's `add PLTR "thesis"`), and excluded.sector
+               -- is '' there — assigning it unconditionally would silently wipe
+               -- a sector already set, and a blank sector matches no geo event
+               -- at all, so the ticker would quietly drop out of the panel.
+               sector=CASE WHEN excluded.sector != '' THEN excluded.sector
+                           ELSE watchlist.sector END""",
         (t, (note or "")[:500], (sector or "")[:80], _now()),
     )
     return t
