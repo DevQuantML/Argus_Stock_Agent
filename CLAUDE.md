@@ -39,7 +39,8 @@ not.
 
 ```
 api.py                        FastAPI app — routes, auth, rate limit, CSP
-config.py                     MY_PORTFOLIO, WATCHLIST, BRENT_LEVELS, GEO_TRANSMISSION
+config.py                     MY_PORTFOLIO, WATCHLIST, BRENT_LEVELS, GEO_TRANSMISSION,
+                               GEO_EVENT_LIBRARY
 main.py                       CLI: python main.py PLTR | scan | brent
 store.py                      SQLite — positions, watchlist, sessions, profile
 tools/perplexity_research.py  the ONLY AI path — prompts, modules, synthesis

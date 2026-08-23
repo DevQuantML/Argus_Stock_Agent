@@ -363,6 +363,9 @@ Current local data (pre-computed — use these exact numbers, do not recalculate
 
 Search the web for recent information about {ticker}:
 - Q2/Q3 2026 earnings results, revenue guidance, margin commentary
+- Next scheduled earnings date (or fiscal quarter if a date isn't set yet),
+  consensus EPS/revenue estimates, and the likely stock price impact —
+  specific upside and downside scenarios — around that print
 - Major contract wins, product launches, or executive changes
 - Analyst rating changes or price target revisions (last 60 days)
 - Competitive threats or sector tailwinds
@@ -392,7 +395,9 @@ Write the full institutional report in this exact format:
 **BUY TRANCHE / ADD / HOLD / WAIT / EXIT** at $[price level] — one specific reason
 
 ## NEXT CATALYST
-[One specific upcoming event or data point that will most update this thesis]"""
+[One specific upcoming event or data point that will most update this thesis.
+If the next earnings print is the relevant catalyst, name the date/quarter and
+state the estimated upside/downside — do not just say "watch earnings."]"""
 
 
 # ── Debate prompts ────────────────────────────────────────────────────────
