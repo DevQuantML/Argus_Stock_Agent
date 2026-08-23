@@ -47,7 +47,11 @@ export function compact(v) {
 }
 
 const tone = (v) => (num(v) === null ? '' : num(v) >= 0 ? 'pos' : 'neg');
-const el = (tag, cls, text) => {
+
+/* Exported: app.js and views.js both build DOM this way, and three byte-identical
+   copies of the same four lines is three places for the textContent rule to be
+   quietly relaxed in one of them. */
+export const el = (tag, cls, text) => {
   const n = document.createElement(tag);
   if (cls) n.className = cls;
   if (text !== undefined && text !== null) n.textContent = text;
@@ -144,9 +148,6 @@ export function renderStatus(health, providerLabel) {
 export function renderKeyState(tier, guest) {
   const n = $('key-state');
   if (!n) return;
-
-  // Back-compat: older call sites passed a boolean.
-  if (typeof tier === 'boolean') tier = tier ? 'owner' : 'visitor';
 
   if (tier === 'owner') {
     n.textContent = 'AI ARMED';

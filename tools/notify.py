@@ -22,13 +22,13 @@ def notify_telegram(text: str) -> None:
 
     No-ops silently if TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID are unset — the
     feature is optional per .env.example. Any failure (network, bad token,
-    Telegram outage) is swallowed and logged at debug level: this fires from
-    inside a public, unauthenticated request handler, and a notification
-    side-channel must never affect the response the caller gets. No
-    parse_mode is set, so the request's email/note reach Telegram as literal
-    text — there is no Markdown/HTML injection surface to worry about.
+    Telegram outage) is swallowed: this fires from inside a public,
+    unauthenticated request handler, and a notification side-channel must never
+    affect the response the caller gets. No parse_mode is set, so the request's
+    email/note reach Telegram as literal text — there is no Markdown/HTML
+    injection surface to worry about.
 
-    Failures are logged at WARNING rather than debug: this project sets no
+    Swallowed, but logged at WARNING rather than debug: this project sets no
     logging config, so debug output is discarded and a permanently broken token
     would be invisible forever.
     """

@@ -11,12 +11,7 @@ import * as prefs from './theme.js?v=17';
 import { DISCLAIMER, PRIVACY_NOTE, FRESHNESS_NOTE, guestAllowanceLine } from './copy.js?v=17';
 
 const $ = ui.$;
-const el = (tag, cls, text) => {
-  const n = document.createElement(tag);
-  if (cls) n.className = cls;
-  if (text !== undefined && text !== null) n.textContent = text;
-  return n;
-};
+const el = ui.el;
 
 /* ── Landing ─────────────────────────────────────────────────────────────
    The front door. It used to be a bare password box for a secret that only the
@@ -815,6 +810,21 @@ async function renderAdmin(host) {
   await paintKeys(keyBox);
 }
 
+/* Approve and reveal, shared by the pending row's ✓ and the approved row's +KEY.
+   Both mint a key, and the raw key exists in that ONE response and nowhere else
+   — two hand-copied reveal calls is one of them quietly losing the reveal and
+   minting a key nobody can ever read. Only the repaint differs: re-approving an
+   already-approved row does not change its status, so that list stays put. */
+async function approveAndReveal(r, box, { repaintRequests }) {
+  try {
+    const res = await api.adminApprove(r.id);
+    ui.showKeyReveal({ email: r.email, key: res.guest_key,
+                       expiresAt: (res.expires_at || '').slice(0, 16).replace('T', ' ') });
+    if (repaintRequests) await paintRequests(box);
+    await paintKeys($('adm-keys'));
+  } catch (err) { ui.toast(err.message, 'error'); }
+}
+
 async function paintRequests(box) {
   box.innerHTML = '';
   let rows = [];
@@ -838,16 +848,8 @@ async function paintRequests(box) {
     if (r.status === 'pending') {
       const ok = el('button', 'btn-g', '✓');
       ok.type = 'button'; ok.title = `Approve ${r.email} and mint a key`;
-      ok.onclick = async () => {
-        try {
-          const res = await api.adminApprove(r.id);
-          // The only moment this key exists in readable form.
-          ui.showKeyReveal({ email: r.email, key: res.guest_key,
-                             expiresAt: (res.expires_at || '').slice(0, 16).replace('T', ' ') });
-          await paintRequests(box);
-          await paintKeys($('adm-keys'));
-        } catch (err) { ui.toast(err.message, 'error'); }
-      };
+      // The reveal inside is the only moment this key exists in readable form.
+      ok.onclick = () => approveAndReveal(r, box, { repaintRequests: true });
       const no = el('button', 'btn-danger', '✕');
       no.type = 'button'; no.title = `Deny ${r.email}`;
       no.onclick = async () => {
@@ -873,14 +875,7 @@ async function paintRequests(box) {
     } else {
       const again = el('button', 'btn-g', '+KEY');
       again.type = 'button'; again.title = `Issue ${r.email} a fresh key`;
-      again.onclick = async () => {
-        try {
-          const res = await api.adminApprove(r.id);
-          ui.showKeyReveal({ email: r.email, key: res.guest_key,
-                             expiresAt: (res.expires_at || '').slice(0, 16).replace('T', ' ') });
-          await paintKeys($('adm-keys'));
-        } catch (err) { ui.toast(err.message, 'error'); }
-      };
+      again.onclick = () => approveAndReveal(r, box, { repaintRequests: false });
       acts.appendChild(again);
     }
     row.appendChild(acts);

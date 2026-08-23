@@ -442,11 +442,6 @@ def session_info(token: str) -> dict | None:
             "expires_at": r["expires_at"]}
 
 
-def session_valid(token: str) -> bool:
-    """Kept so existing callers that only need a yes/no keep working."""
-    return session_info(token) is not None
-
-
 def destroy_session(token: str) -> None:
     if token:
         _exec("DELETE FROM sessions WHERE token_hash = ?", (_hash_token(token),))
@@ -469,6 +464,20 @@ def purge_expired_sessions() -> None:
 # opposite, which is exactly why this is spelled out.
 
 GUEST_HOURS = 24
+
+
+def _expired(iso: str) -> bool:
+    """True when an ISO timestamp is in the past, or unparseable.
+
+    Fails closed on a bad value: a timestamp we cannot read is not evidence
+    that a credential is still live. Every expiry test on a guest key goes
+    through here so the fail-closed rule cannot differ between them.
+    """
+    try:
+        return datetime.fromisoformat(iso) < datetime.now(timezone.utc)
+    except (TypeError, ValueError):
+        return True
+
 
 # The five paid stages of one dive: four module GETs plus the synthesis POST.
 GUEST_MODULES = ("report", "context", "policy", "patterns", "synthesis")
@@ -514,12 +523,8 @@ def guest_key_for(raw_key: str) -> dict | None:
     r["dead"] = None
     if r["revoked_at"]:
         r["dead"] = "revoked"
-    else:
-        try:
-            if datetime.fromisoformat(r["expires_at"]) < datetime.now(timezone.utc):
-                r["dead"] = "expired"
-        except ValueError:
-            r["dead"] = "expired"
+    elif _expired(r["expires_at"]):
+        r["dead"] = "expired"
     return r
 
 
@@ -550,13 +555,9 @@ def guest_usage(key_id: int) -> dict:
 def list_guest_keys() -> list[dict]:
     """Admin listing. Never returns key_hash — that is the credential material."""
     out = []
-    now = datetime.now(timezone.utc)
     for r in _rows("SELECT * FROM guest_keys ORDER BY created_at DESC"):
         usage = guest_usage(r["id"])
-        try:
-            expired = datetime.fromisoformat(r["expires_at"]) < now
-        except ValueError:
-            expired = True
+        expired = _expired(r["expires_at"])
         out.append({
             "id": r["id"], "key_prefix": r["key_prefix"], "label": r["label"],
             "created_at": r["created_at"], "expires_at": r["expires_at"],
@@ -597,18 +598,6 @@ def revoke_all_guest_access() -> int:
 
 
 # ── Guest budget ──────────────────────────────────────────────────────────
-
-def _expired(iso: str) -> bool:
-    """True when an ISO timestamp is in the past, or unparseable.
-
-    Fails closed on a bad value: a timestamp we cannot read is not evidence
-    that a credential is still live.
-    """
-    try:
-        return datetime.fromisoformat(iso) < datetime.now(timezone.utc)
-    except (TypeError, ValueError):
-        return True
-
 
 def consume_guest_unit(key_id: int, ticker: str, module: str) -> str:
     """Claim one stage of the guest's dive.

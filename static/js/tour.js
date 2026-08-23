@@ -65,21 +65,29 @@ function buildSteps(tier) {
             + 'you ask about — free, unlimited, and with the reasoning shown rather '
             + 'than a bare score.' };
 
-  const last = tier === 'guest'
-    ? { target: '#key-state', fallback: '#btn-cfg', title: 'YOUR GUEST KEY',
-        body: 'Your key includes one full five-stage AI deep dive on a single ticker, '
-            + 'and expires 24 hours after it was issued. Everything else here — quant, '
-            + 'charts, history, news — is free and unlimited until then.' }
-    : tier === 'owner'
-      ? { target: '#key-state', fallback: '#btn-cfg', title: 'COST CONTROL',
-          body: 'Free tools cost nothing, ever. Paid AI research is gated by this chip '
-              + 'and always shows a dollar estimate for your confirmation first.' }
-      : { target: '#key-state', fallback: '#btn-cfg', title: 'FREE MODE',
-          body: 'You are browsing without a key: all the free tools, none of the paid '
-              + 'AI research. Type `request` if you would like the owner to issue you '
-              + 'a guest key.' };
+  // All three point at the same chip, so the selectors are written once.
+  const last = { target: '#key-state', fallback: '#btn-cfg', ...lastStepCopy(tier) };
 
   return [...common, middle, last];
+}
+
+function lastStepCopy(tier) {
+  switch (tier) {
+    case 'guest':
+      return { title: 'YOUR GUEST KEY',
+               body: 'Your key includes one full five-stage AI deep dive on a single ticker, '
+                   + 'and expires 24 hours after it was issued. Everything else here — quant, '
+                   + 'charts, history, news — is free and unlimited until then.' };
+    case 'owner':
+      return { title: 'COST CONTROL',
+               body: 'Free tools cost nothing, ever. Paid AI research is gated by this chip '
+                   + 'and always shows a dollar estimate for your confirmation first.' };
+    default:
+      return { title: 'FREE MODE',
+               body: 'You are browsing without a key: all the free tools, none of the paid '
+                   + 'AI research. Type `request` if you would like the owner to issue you '
+                   + 'a guest key.' };
+  }
 }
 
 /* A step whose target is missing or laid out to zero — the side panels collapse

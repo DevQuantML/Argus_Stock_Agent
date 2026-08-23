@@ -17,12 +17,7 @@ import { DISCLAIMER, FRESHNESS_NOTE, guestAllowanceLine } from './copy.js?v=17';
 const $  = ui.$;
 const $$ = ui.$$;
 
-const el = (tag, cls, text) => {
-  const n = document.createElement(tag);
-  if (cls) n.className = cls;
-  if (text !== undefined && text !== null) n.textContent = text;
-  return n;
-};
+const el = ui.el;
 
 const state = {
   info: null,          // /api/info — portfolio, watchlist, brent levels, geo map
@@ -679,12 +674,14 @@ async function research(rawSym, { paid = true } = {}) {
         await typeBlock(o, data.output || '');
         cacheTab(sym);
       } catch (err) {
+        /* Most kinds below are TERMINAL for the whole run, not per-stage
+           hiccups, and each sets state.run.cancelled. Without that the loop
+           treats a denial like a flaky upstream and carries on to the next
+           module — four more paid requests that cannot possibly succeed, four
+           more red toasts, and the rate bucket burned. The two exceptions are
+           'stage' and the generic fallback, which are genuinely per-stage. */
         if (err.kind === 'aborted') { ui.pipeline.set(key, 'cancelled'); state.run.cancelled = true; }
 
-        /* A denial is terminal for the whole run, not a per-stage hiccup.
-           Without this the loop treats it like a flaky upstream and carries on
-           to the next module — four more paid requests that cannot possibly
-           succeed, four more red toasts, and the rate bucket burned. */
         /* One stage of the dive was already claimed by an earlier run. The
            rest are still theirs, so skip this one and carry on — halting here
            is what stranded the remaining stages. */

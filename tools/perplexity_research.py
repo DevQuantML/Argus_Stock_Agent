@@ -31,10 +31,9 @@ from tools.oil_price import get_brent_signal
 from tools.quant import get_quant_metrics
 from tools.stock_data import get_price_and_fundamentals
 from tools.validator import (
-    guard_tool_output,
     _MAX_QUESTION_LEN,
+    guard_tool_output,
     sanitize_prompt_text,
-    sanitize_question,
     validate_ticker,
 )
 

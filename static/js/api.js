@@ -138,7 +138,7 @@ function describe(status, body) {
   // FastAPI nests HTTPException payloads under `detail`, while our own
   // JSONResponse bodies are flat. Look in both, or half the codes go missing.
   const code   = (body && body.code) || (d && d.code) || '';
-  const extra  = (body && body.detail && !d?.error ? body.detail : null) || null;
+  const extra  = body && body.detail && !d?.error ? body.detail : null;
 
   // Status alone is not enough to act on. The staged research loop treats a
   // generic failure as a per-module warning and CARRIES ON to the next stage —
