@@ -1,0 +1,27 @@
+name: verify
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      # Every harness here is free — no PERPLEXITY_API_KEY/GROQ_API_KEY calls.
+      # The quant pair reads live yfinance data; the rest run TestClient
+      # against a scratch ARGUS_DB with provider keys blanked.
+      - run: python scripts/verify_quant.py
+      - run: python scripts/verify_metric_status.py
+      - run: python scripts/verify_ticker_validation.py
+      - run: python scripts/verify_proxy_trust.py
+      - run: python scripts/verify_hardening.py
+      - run: python scripts/verify_consistency.py
+      - run: python scripts/verify_docs.py
+      - run: python scripts/verify_access.py
