@@ -376,11 +376,45 @@ def main():
         r_portfolio = auth_client.get("/api/portfolio")
         check("authenticated /api/portfolio still carries the real thesis",
               secret_thesis in r_portfolio.text, True)
+        auth_client.delete("/api/session")  # do not leak a live session into section 7
     finally:
         if prev_secret is None:
             os.environ.pop("AGENT_SECRET", None)
         else:
             os.environ["AGENT_SECRET"] = prev_secret
+
+    # ── 7. Owner-session revocation kills OTHER sessions, keeps the caller's own
+    # revoke-all only ever targeted guest sessions — there was no way to cut off
+    # a specific compromised owner session. Two separate owner logins simulate
+    # two devices sharing AGENT_SECRET; one calls revoke-owner and only the
+    # OTHER session must die.
+    api._rate_limit_store.clear()
+    api._auth_fail_store.clear()
+    prev_secret = os.environ.get("AGENT_SECRET")
+    os.environ["AGENT_SECRET"] = "harness-only-secret"
+    try:
+        client_a = TestClient(api.app)
+        client_b = TestClient(api.app)
+        check("owner session A established",
+              client_a.post("/api/session", json={"key": "harness-only-secret"}).status_code, 200)
+        check("owner session B established",
+              client_b.post("/api/session", json={"key": "harness-only-secret"}).status_code, 200)
+
+        r_revoke = client_a.post("/api/admin/sessions/revoke-owner")
+        check("revoke-owner succeeds", r_revoke.status_code, 200)
+        check("revoke-owner reports exactly one other session killed",
+              r_revoke.json().get("revoked"), 1)
+        check("the caller's own session survives calling revoke-owner",
+              client_a.get("/api/portfolio").status_code, 200)
+        check("the other owner session is dead after revoke-owner",
+              client_b.get("/api/portfolio").status_code, 401)
+    finally:
+        if prev_secret is None:
+            os.environ.pop("AGENT_SECRET", None)
+        else:
+            os.environ["AGENT_SECRET"] = prev_secret
+        api._rate_limit_store.clear()
+        api._auth_fail_store.clear()
 
 
 main()

@@ -675,6 +675,25 @@ def revoke_all_guest_access() -> int:
         return cur.rowcount
 
 
+def revoke_other_owner_sessions(current_token: str) -> int:
+    """Kill every owner session except the caller's own.
+
+    revoke_all_guest_access() only ever touched tier='guest' rows by design —
+    there was no path to cut off a specific compromised owner session (a
+    stolen cookie, a shared machine) short of direct DB surgery. This is that
+    path. Scoped to "other" deliberately: the admin calling it must not lock
+    themselves out mid-use, so their own current session survives.
+    """
+    with _lock:
+        c = _connect()
+        cur = c.execute(
+            "DELETE FROM sessions WHERE tier = 'owner' AND token_hash != ?",
+            (_hash_token(current_token),),
+        )
+        c.commit()
+        return cur.rowcount
+
+
 # ── Guest budget ──────────────────────────────────────────────────────────
 
 def consume_guest_unit(key_id: int, ticker: str, module: str) -> str:

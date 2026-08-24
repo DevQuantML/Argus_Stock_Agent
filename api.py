@@ -1677,6 +1677,27 @@ def api_admin_revoke_all():
         return JSONResponse(status_code=500, content={"error": "internal server error"})
 
 
+@app.post("/api/admin/sessions/revoke-owner", dependencies=[Depends(require_owner)])
+def api_admin_revoke_owner(request: Request):
+    """Kill switch for every OTHER owner session — e.g. a stolen cookie.
+
+    revoke-all above only ever touched guest sessions. There was no way to
+    cut off a specific compromised owner session (device theft, a shared
+    machine, a leaked cookie jar) short of editing the database directly —
+    sessions last up to SESSION_DAYS with no other revocation path. The
+    caller's own current session is deliberately excluded so calling this
+    can never lock the operator out of the account they are using it from.
+    """
+    try:
+        token = request.cookies.get(SESSION_COOKIE)
+        if not token:
+            return JSONResponse(status_code=401, content={"error": "no active session"})
+        return {"ok": True, "revoked": store.revoke_other_owner_sessions(token)}
+    except Exception as exc:
+        logger.debug("api_admin_revoke_owner: error (type=%s): %s", type(exc).__name__, exc)
+        return JSONResponse(status_code=500, content={"error": "internal server error"})
+
+
 # ── Profile ────────────────────────────────────────────────────────────────
 
 class ProfileBody(BaseModel):
