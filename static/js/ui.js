@@ -9,9 +9,9 @@
      2. Any string that originated from an LLM or from yfinance goes through
         textContent or renderMarkdown — never innerHTML with raw input. */
 
-import { renderMarkdown, escapeHtml } from './md.js?v=17';
-import { sparkline } from './chart.js?v=17';
-import * as prefs from './theme.js?v=17';
+import { renderMarkdown, escapeHtml } from './md.js?v=18';
+import { sparkline } from './chart.js?v=18';
+import * as prefs from './theme.js?v=18';
 
 export const $  = (id)  => document.getElementById(id);
 export const $$ = (sel) => Array.from(document.querySelectorAll(sel));

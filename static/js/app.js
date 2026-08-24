@@ -5,14 +5,14 @@
    Version query on each import so a redeploy can never pair a fresh app.js
    with a stale cached sub-module. Bump together with the ?v= in index.html. */
 
-import * as api from './api.js?v=17';
-import { drawChart, makeResponsive } from './chart.js?v=17';
-import { renderMarkdown } from './md.js?v=17';
-import * as prefs from './theme.js?v=17';
-import * as ui from './ui.js?v=17';
-import * as views from './views.js?v=17';
-import * as tour from './tour.js?v=17';
-import { DISCLAIMER, FRESHNESS_NOTE, guestAllowanceLine } from './copy.js?v=17';
+import * as api from './api.js?v=18';
+import { drawChart, makeResponsive } from './chart.js?v=18';
+import { renderMarkdown, escapeHtml } from './md.js?v=18';
+import * as prefs from './theme.js?v=18';
+import * as ui from './ui.js?v=18';
+import * as views from './views.js?v=18';
+import * as tour from './tour.js?v=18';
+import { DISCLAIMER, FRESHNESS_NOTE, guestAllowanceLine } from './copy.js?v=18';
 
 const $  = ui.$;
 const $$ = ui.$$;
@@ -409,7 +409,7 @@ async function loadChart(sym, period) {
     return true;
   } catch (err) {
     state.history = null;
-    if (host) host.innerHTML = `<div class="chart-empty">${err.message}</div>`;
+    if (host) host.innerHTML = `<div class="chart-empty">${escapeHtml(err.message)}</div>`;
     return false;
   }
 }
@@ -862,7 +862,7 @@ async function scan() {
         `<span class="mt ${r.chg >= 0 ? 'pos' : 'neg'}">${ui.pct(r.chg)}</span>`;
     } catch (err) {
       line.className = 'pl fail';
-      line.innerHTML = `<span class="ic">✕</span><span class="nm">${r.sym}</span><span class="mt">${err.message}</span>`;
+      line.innerHTML = `<span class="ic">✕</span><span class="nm">${r.sym}</span><span class="mt">${escapeHtml(err.message)}</span>`;
     }
   }
 

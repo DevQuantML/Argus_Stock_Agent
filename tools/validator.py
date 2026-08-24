@@ -1,10 +1,19 @@
 """
 tools/validator.py — Input validation and injection guard.
 
-Three functions applied at every external boundary:
-  validate_ticker()    — before any API call in stock_data / oil_price
-  sanitize_question()  — before user question enters agent message history
-  guard_tool_output()  — before every tool result enters agent message history
+Functions applied at every external boundary:
+  validate_ticker()      — before any API call in stock_data / oil_price
+  sanitize_prompt_text() — before any stored text (question, thesis, sector,
+                           the posted synthesis fields) enters a prompt
+  guard_tool_output()    — before every tool result enters agent message
+                           history
+
+sanitize_question() below is NOT currently called anywhere in production —
+the question path was migrated to sanitize_prompt_text() (a superset: same
+fence/HTML/injection-phrase defenses, plus the <<<UNTRUSTED:...>>> wrapper).
+It's kept for now as it may still be useful standalone; if you're looking
+for what actually guards the question boundary today, that's
+sanitize_prompt_text(), not this.
 """
 
 import re
@@ -104,18 +113,12 @@ def sanitize_question(s: str) -> str:
     Strip HTML tags, neutralise forged fence delimiters, redact known
     injection phrases, and truncate to MAX_QUESTION_LEN characters.
 
-    Call this on every user-supplied question before it enters the
-    agent's message history. A question reaches the model in the same
-    prompt as fenced thesis/sector text (_research_prompt's question
-    branch interpolates `context`, which includes position_block's fenced
-    blocks, right below it) — so it needs the same two defences
-    sanitize_prompt_text() already applies to that fenced text: a forged
-    fence token in the question must not be able to prematurely close or
-    impersonate one of those blocks, and a known injection phrase must not
-    survive verbatim. It does not get the full <<<UNTRUSTED:...>>> wrapper
-    sanitize_prompt_text() adds, since a question is the operator's own
-    live instruction to the assistant they are already directly
-    commanding, not stored data replayed into a future prompt.
+    NOT currently called anywhere in production — see the module docstring.
+    The question path in api.py/perplexity_research.py runs through
+    sanitize_prompt_text() instead, which applies the same fence/HTML/
+    injection-phrase defenses this function does, plus the full
+    <<<UNTRUSTED:...>>> wrapper. This function is kept as a lighter-weight
+    standalone alternative (no wrapper), not as the active guard.
 
     Returns:
         Cleaned string (never raises).

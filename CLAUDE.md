@@ -335,7 +335,7 @@ js/tour.js            five-step coach-mark orientation (no imports, no network)
   "never entered" is evidence rather than a monkeypatch that silently missed.
 - **A blank line in `.env` is not the same as an absent one, and `ARGUS_DB`
   used to get this wrong.** `.env.example` documents `ARGUS_DB=` (and
-  `TRUST_PROXY=`, `ALPHA_VANTAGE_KEY=`) as "leave blank for the default" — but
+  `TRUST_PROXY=`) as "leave blank for the default" — but
   `load_dotenv(override=False)` only skips a name already present in the
   process environment; a `KEY=` line with nothing after the `=` still SETS
   that key, to `""`. `os.getenv("ARGUS_DB", default)` only falls back when the

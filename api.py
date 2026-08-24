@@ -46,7 +46,7 @@ try:
 except ImportError:
     pass  # dotenv optional — fall back to real env vars
 
-from fastapi import BackgroundTasks, Depends, FastAPI, Header, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 
@@ -67,7 +67,7 @@ from tools.stock_data import (
     get_price_and_fundamentals,
     get_price_history,
 )
-from tools.validator import sanitize_prompt_text, validate_ticker
+from tools.validator import _MAX_QUESTION_LEN, sanitize_prompt_text, validate_ticker
 from tools.xirr import xirr
 
 _STATIC_DIR = Path(__file__).parent / "static"
@@ -188,6 +188,12 @@ async def add_security_headers(request: Request, call_next):
     # in place the correct value is off.
     response.headers["X-XSS-Protection"] = "0"
     response.headers["Referrer-Policy"] = "no-referrer"
+    # Cloud platforms (Railway/Fly/Render) typically inject HSTS at the edge,
+    # but the app sets it too so a direct HTTPS hit is covered either way.
+    # Never set over plain HTTP — that would pin a host that cannot yet serve
+    # HTTPS at all, e.g. local dev.
+    if _is_https(request):
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
 
     is_page = path == "/" or path.startswith("/static/")
     response.headers["Content-Security-Policy"] = _PAGE_CSP if is_page else _API_CSP
@@ -1071,7 +1077,7 @@ def api_history(ticker: str, period: str = "1y"):
 # ── Auth-gated JSON API ────────────────────────────────────────────────────
 
 @app.get("/api/research/{ticker}", dependencies=[Depends(require_owner)])
-def api_research(ticker: str, question: str = None):
+def api_research(ticker: str, question: str = Query(default=None, max_length=_MAX_QUESTION_LEN)):
     """
     Full Perplexity sonar-pro research. Requires X-Agent-Key header.
     Returns structured JSON with report, bull case, bear case, and all metrics.
@@ -1248,7 +1254,7 @@ def _refund_if_free(ctx: AuthCtx | None, module: str, result: dict | None) -> No
 
 
 @app.get("/api/research/{ticker}/report")
-def api_research_report(ticker: str, question: str = None,
+def api_research_report(ticker: str, question: str = Query(default=None, max_length=_MAX_QUESTION_LEN),
                         ctx: AuthCtx = Depends(require_auth)):
     """Main institutional research brief — situation, quant read, catalysts, verdict."""
     return _module_response(ticker, "report", question, ctx)
