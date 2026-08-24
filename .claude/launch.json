@@ -4,7 +4,7 @@
     {
       "name": "argus",
       "runtimeExecutable": "python",
-      "runtimeArgs": ["-m", "uvicorn", "api:app", "--host", "127.0.0.1", "--port", "8000", "--workers", "1"],
+      "runtimeArgs": ["-m", "uvicorn", "api:app", "--host", "127.0.0.1", "--port", "8000", "--workers", "1", "--no-proxy-headers"],
       "port": 8000
     }
   ]
