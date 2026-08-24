@@ -975,6 +975,13 @@ def run_demo(ticker: str) -> dict:
     # the UI and the price the LLM reasons about are the same snapshot.
     stock, quant, brent, _context = _get_local_bundle(ticker)
 
+    # /api/demo is public and unauthenticated — get_price_and_fundamentals()
+    # is shared with the authenticated portfolio/research paths and injects
+    # real position/watchlist context whenever the ticker matches a live
+    # holding. Strip it here so the public demo never carries the operator's
+    # book, regardless of which ticker a caller asks for.
+    stock = {k: v for k, v in stock.items() if k not in ("my_position", "watchlist")}
+
     return {
         "ticker":    ticker,
         "mode":      "demo",

@@ -22,6 +22,7 @@ Run:  python scripts/verify_hardening.py
 """
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -30,6 +31,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # TRUST_PROXY left set in the environment cannot change which bucket a request
 # lands in and make the limiter results meaningless.
 os.environ["TRUST_PROXY"] = "0"
+
+# Section 6 seeds a real position to prove /api/demo never echoes it back.
+# ARGUS_DB must point at a scratch file before `store` is ever imported (its
+# DB_PATH is resolved at import time) so this never touches the operator's
+# real argus.db.
+_tmp_db = tempfile.mkdtemp(prefix="argus-hardening-")
+os.environ["ARGUS_DB"] = str(Path(_tmp_db) / "hardening.db")
 
 PASS, FAIL = [], []
 
@@ -323,6 +331,56 @@ def main():
             if "uvicorn api:app" in s and "--no-proxy-headers" not in s:
                 bad.append(s)
         check(f"{name}: every uvicorn command disables proxy headers", bad, [])
+
+    # ── 6. /api/demo must never carry the operator's real book ────────────
+    # get_price_and_fundamentals() is shared between the public, unauthenticated
+    # demo path and the authenticated portfolio/research paths, and it injects
+    # real position/watchlist context whenever the ticker matches a live
+    # holding. run_demo() must strip that before /api/demo/{ticker} returns —
+    # this seeds a real position and watchlist entry and proves an anonymous
+    # caller who guesses the ticker gets neither.
+    import store
+    store._conn = None  # reconnect against the scratch ARGUS_DB set at import time
+
+    secret_thesis = "SECRET-THESIS-never-leak-8f2c1a"
+    secret_watch_note = "SECRET-WATCH-never-leak-9d4b7e"
+    store.upsert_position("AAPL", {
+        "shares": 10, "avg_cost": 100.0, "stop_loss": 90.0, "trim_at": 150.0,
+        "tranches": [], "thesis": secret_thesis, "sector": "Technology",
+    })
+    store.add_watch("MSFT", note=secret_watch_note)
+
+    r_demo_pos = client.get("/api/demo/AAPL")
+    check("demo mode for a held ticker still returns 200", r_demo_pos.status_code, 200)
+    demo_stock = r_demo_pos.json().get("stock", {})
+    check("demo response carries no my_position key", "my_position" in demo_stock, False)
+    check("demo response body never contains the real thesis text",
+          secret_thesis in r_demo_pos.text, False)
+
+    r_demo_watch = client.get("/api/demo/MSFT")
+    check("demo mode for a watched ticker still returns 200", r_demo_watch.status_code, 200)
+    demo_watch_stock = r_demo_watch.json().get("stock", {})
+    check("demo response carries no watchlist key", "watchlist" in demo_watch_stock, False)
+    check("demo response body never contains the real watch note",
+          secret_watch_note in r_demo_watch.text, False)
+
+    # The authenticated path must be unaffected by the fix — an owner session
+    # for the same ticker should still see the real position, proving this is
+    # a filter on the public path, not a regression in the shared helper.
+    prev_secret = os.environ.get("AGENT_SECRET")
+    os.environ["AGENT_SECRET"] = "harness-only-secret"
+    try:
+        auth_client = TestClient(api.app)
+        r_login = auth_client.post("/api/session", json={"key": "harness-only-secret"})
+        check("owner login for the comparison check succeeds", r_login.status_code, 200)
+        r_portfolio = auth_client.get("/api/portfolio")
+        check("authenticated /api/portfolio still carries the real thesis",
+              secret_thesis in r_portfolio.text, True)
+    finally:
+        if prev_secret is None:
+            os.environ.pop("AGENT_SECRET", None)
+        else:
+            os.environ["AGENT_SECRET"] = prev_secret
 
 
 main()
