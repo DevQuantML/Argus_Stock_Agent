@@ -1,19 +1,22 @@
 # ARGUS://TERMINAL — Developer Handoff
 
-Last updated: 2026-08-21
+Last updated: 2026-08-23
 
-> **Most recent change (2026-08-21): the terminal has three kinds of visitor.**
+> **Most recent change (2026-08-23): geo-transmission grew sector search and
+> earnings prompting.** `GEO_TRANSMISSION` (§1, §10.6) now drives a sector
+> search command and prompts the research pipeline with the ticker's next
+> earnings date, threaded through as a question the AI modules answer
+> directly rather than a generic macro pass. If you are holding a mental
+> model where geo-transmission only feeds the public/private data boundary
+> at `/api/meta`, it is out of date — that boundary is unchanged, this is
+> additive.
+>
+> **Previous change (2026-08-21): the terminal has three kinds of visitor.**
 > A session is no longer a yes/no — it carries a *tier*. `owner` is
 > `AGENT_SECRET` and can do everything; `guest` is a 24-hour key worth exactly
 > one research dive and is read-only on the book; `visitor` has no session at
 > all and gets the free tools. If you are holding a mental model where "holds a
 > session" means "may spend money", it is out of date — see §10.
->
-> **Previous change (2026-08-08): the auth boundary moved.** Every route that
-> reads or writes the book now requires a session. If you are holding a mental
-> model where `/api/positions` and `/api/portfolio` are open, it is out of date —
-> see §2 and §4. Sections are dated because "this session" in an undated handoff
-> is what caused the last two rounds of confusion.
 
 ---
 
