@@ -41,6 +41,10 @@ Thumbs.db
 # broad `git add` would otherwise commit a second copy of the tree.
 .claude/
 
+# graphify knowledge-graph output — regenerate on demand with /graphify,
+# never commit it (machine-derived, ~30K lines, redundant with source).
+graphify-out/
+
 # Local database — profile, positions, watchlist, sessions.
 # Globbed rather than listed: a dev/scratch database (argus-dev.db, and the
 # -wal/-shm SQLite writes beside it) is still a database full of real holdings
