@@ -9,9 +9,9 @@
      2. Any string that originated from an LLM or from yfinance goes through
         textContent or renderMarkdown — never innerHTML with raw input. */
 
-import { renderMarkdown, escapeHtml } from './md.js?v=18';
-import { sparkline } from './chart.js?v=18';
-import * as prefs from './theme.js?v=18';
+import { renderMarkdown, escapeHtml } from './md.js?v=34';
+import { sparkline } from './chart.js?v=34';
+import * as prefs from './theme.js?v=34';
 
 export const $  = (id)  => document.getElementById(id);
 export const $$ = (sel) => Array.from(document.querySelectorAll(sel));
@@ -1209,16 +1209,32 @@ export function showCostModal(sym, provider, { tier = 'owner', guest = null } = 
       ? MODULES.reduce((o, m) => (o[m.key] = true, o), { synthesis: true })
       : loadSelection();
 
+    // Per-module cost display is provider-aware — it used to show the same
+    // ~$0.04 regardless of provider, so a genuinely free Groq run displayed
+    // a cost estimate that was simply wrong. Perplexity keeps its real
+    // per-module figures; Groq is always $0.00 (no fixed price to hide
+    // behind a number); Gemini gets no hardcoded figure at all — its actual
+    // cost depends on the caller's own remaining monthly quota, which this
+    // app has no way to know, so a specific dollar amount would just be a
+    // guess dressed as a fact.
+    const costLabel = (m) => {
+      if (provider === 'groq') return '$0.00';
+      if (provider === 'gemini') return 'often free';
+      return `~$${m.cost.toFixed(2)}`;
+    };
+
     const rows = MODULES.map(m => `
       <label class="cf${sel[m.key] ? ' on' : ''}" data-k="${m.key}">
         <input type="checkbox" ${sel[m.key] ? 'checked' : ''} ${isGuest ? 'disabled' : ''}
                aria-label="${escapeHtml(m.name)}">
         <span><span class="n">${escapeHtml(m.name)}</span><span class="d">${escapeHtml(m.desc)}</span></span>
-        ${isGuest ? '' : `<span class="c">~$${m.cost.toFixed(2)}</span>`}
+        ${isGuest ? '' : `<span class="c">${costLabel(m)}</span>`}
       </label>`).join('');
 
     const note = provider === 'groq'
       ? 'Running on GROQ — fast and free, but with no live web search the politician-trade and news modules fall back to model knowledge.'
+      : provider === 'gemini'
+      ? "Running on GEMINI with live Google Search grounding — usually free within your own ~5,000 searches/month quota, then billed on your account beyond that (ai.google.dev/pricing). Answers cite the pages they used, though coverage is typically thinner than Perplexity's."
       : 'Running on PERPLEXITY sonar-pro with live web search. Costs are estimates and vary with response length.';
 
     // The dollar column is the owner's concern. Showing "$0.21" to a guest who
@@ -1233,8 +1249,15 @@ export function showCostModal(sym, provider, { tier = 'owner', guest = null } = 
         unlimited either way.</span>
       </div>` : '';
 
+    // Only Perplexity has a real running total to compute live as checkboxes
+    // change (#cf-total below). Groq's is a fixed $0.00 with nothing to
+    // recalculate; Gemini has no fixed figure at all, per costLabel() above.
     const totalRow = isGuest
       ? `<div class="cf-tot"><span class="l">YOUR ALLOWANCE</span><span class="v">1 of 1 deep dive</span></div>`
+      : provider === 'groq'
+      ? `<div class="cf-tot"><span class="l">ESTIMATED TOTAL</span><span class="v">$0.00 · FREE</span></div>`
+      : provider === 'gemini'
+      ? `<div class="cf-tot"><span class="l">ESTIMATED TOTAL</span><span class="v">OFTEN FREE (SEE BELOW)</span></div>`
       : `<div class="cf-tot"><span class="l">ESTIMATED TOTAL</span><span class="v" id="cf-total">$0.00</span></div>`;
 
     const { box, close } = modal(`
@@ -1243,7 +1266,9 @@ export function showCostModal(sym, provider, { tier = 'owner', guest = null } = 
         ${guestStrip}
         <p class="hint" style="margin:0 0 12px">${isGuest
           ? 'Your included dive runs every stage. Quant, chart and P&amp;L are already loaded and always free.'
-          : 'Each module is a separate paid call. Uncheck anything you do not need — quant, chart and P&amp;L are already loaded and always free.'}</p>
+          : provider === 'groq'
+          ? 'Every module here is free on Groq. Uncheck anything you do not need — quant, chart and P&amp;L are already loaded and always free either way.'
+          : 'Each module is a separate call on your own key. Uncheck anything you do not need — quant, chart and P&amp;L are already loaded and always free.'}</p>
         ${rows}
         ${totalRow}
         <p class="hint" style="margin-top:12px">${escapeHtml(note)}</p>
@@ -1256,10 +1281,18 @@ export function showCostModal(sym, provider, { tier = 'owner', guest = null } = 
     const totalEl = box.querySelector('#cf-total');
     const runBtn  = box.querySelector('[data-run]');
     const recalc = () => {
-      if (!totalEl) return;                 // guest: no dollar column to update
-      const t = MODULES.filter(m => sel[m.key]).reduce((s, m) => s + m.cost, 0);
-      totalEl.textContent = `$${t.toFixed(2)}`;
-      runBtn.disabled = t === 0;
+      if (totalEl) {                        // Perplexity only — see totalRow above
+        const t = MODULES.filter(m => sel[m.key]).reduce((s, m) => s + m.cost, 0);
+        totalEl.textContent = `$${t.toFixed(2)}`;
+      }
+      // Whether RUN should be enabled is about SELECTION, not dollar total —
+      // those used to be the same thing when only Perplexity (always a
+      // nonzero per-module cost) reached this modal, so $0 meant "nothing
+      // checked." Now that Groq/Gemini can show a real $0.00/"often free"
+      // while modules genuinely ARE selected, keying off the total would
+      // wrongly disable RUN on a fully-checked, free run. True for guests
+      // too — their selection is always all-true, so this never disables it.
+      runBtn.disabled = !MODULES.some(m => sel[m.key]);
     };
     recalc();
 
@@ -1459,7 +1492,8 @@ export function showDataModal(health, info) {
       <p class="hint" style="border-top:1px solid var(--border);margin-top:12px;padding-top:10px">
         Overall: <b>${escapeHtml(String(health?.status || 'unknown').toUpperCase())}</b> ·
         one AI provider is sufficient — both are listed so you can see which will serve a run.
-        Provider keys live in <code>.env</code> on the server and are never sent to this browser.
+        Provider keys live in <code>.env</code> on the server. The owner can set or change
+        them from <b>◈ CONFIG</b> — once saved, a key is never sent back to any browser.
       </p>
       <p class="hint">Tracking <b>${(info?.portfolio || []).length}</b> holdings ·
         <b>${Object.keys(info?.watchlist || {}).length}</b> watchlist ·
@@ -1467,7 +1501,39 @@ export function showDataModal(health, info) {
     </div>`);
 }
 
-export function showConfigModal(authenticated, onAction, onPref) {
+/* isOwner gates the AI Research field entirely — a guest session is
+   `authenticated` too, but POST /api/settings/provider-key is require_owner
+   and would 403 them. Hiding the field is the frontend half of that same
+   boundary; the backend check is what actually enforces it. */
+export function showConfigModal(authenticated, isOwner, checks, onAction, onPref, onSetProviderKey) {
+  const c = checks || {};
+
+  const pkRow = (provider, label, configured) => `
+    <div class="pk-row" data-pk="${provider}" style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+      <span style="width:76px;font-size:10px;color:var(--txt-muted);letter-spacing:.05em">${label}</span>
+      <span data-pk-status style="width:96px;font-size:9px;color:var(--${configured ? 'green' : 'gold'})">
+        ${configured ? '● CONFIGURED' : '○ NOT SET'}</span>
+      <input type="password" class="inp" data-pk-input autocomplete="off" spellcheck="false"
+             placeholder="paste key — blank clears it" style="flex:1;padding:6px 8px"/>
+      <button class="btn-g" data-pk-save type="button" style="padding:6px 12px;white-space:nowrap">SAVE</button>
+    </div>`;
+
+  // Write-only, like AGENT_SECRET's own field: there is no "view the current
+  // key" anywhere in this product, and a masked fragment isn't shown here
+  // either — /health's own disclosure floor is presence only, never a
+  // fragment, and this field holds itself to the same line.
+  const aiResearchField = isOwner ? `
+      <div class="fld">
+        <div class="fld-l">AI Research</div>
+        ${pkRow('perplexity', 'PERPLEXITY', c.perplexity_key)}
+        ${pkRow('groq', 'GROQ', c.groq_key)}
+        <p class="hint" id="cfg-pk-msg" style="line-height:1.8">
+          Perplexity is used first when both are set. Saved straight to
+          <code>.env</code> on the server and live immediately — no restart,
+          and the key is never shown here again once saved.
+        </p>
+      </div>` : '';
+
   const { box, close } = modal(`
     <div class="mdl-hd"><span>ARGUS://CONFIG</span><button data-close type="button">✕</button></div>
     <div class="mdl-b">
@@ -1481,6 +1547,7 @@ export function showConfigModal(authenticated, onAction, onPref) {
         <button class="${authenticated ? 'btn-danger' : 'btn'}" data-session type="button"
                 style="padding:8px 16px">${authenticated ? 'SIGN OUT' : 'UNLOCK ▸'}</button>
       </div>
+      ${aiResearchField}
       <div class="fld">
         <div class="fld-l">Accent</div>
         <div class="swatch" id="cfg-accent">
@@ -1521,6 +1588,34 @@ export function showConfigModal(authenticated, onAction, onPref) {
   wire('#cfg-tempo', 'tempo');
   wire('#cfg-crt', 'crt');
 
+  if (isOwner) {
+    const msg = box.querySelector('#cfg-pk-msg');
+    box.querySelectorAll('[data-pk-save]').forEach((btn) => {
+      btn.onclick = async () => {
+        const row = btn.closest('[data-pk]');
+        const provider = row.dataset.pk;
+        const input = row.querySelector('[data-pk-input]');
+        const status = row.querySelector('[data-pk-status]');
+        const key = input.value.trim();
+        btn.disabled = true;
+        const res = await onSetProviderKey(provider, key);
+        btn.disabled = false;
+        if (res && res.ok) {
+          input.value = '';
+          status.style.color = res.configured ? 'var(--green)' : 'var(--gold)';
+          status.textContent = res.configured ? '● CONFIGURED' : '○ NOT SET';
+          if (msg) {
+            msg.textContent = `${provider} ${res.configured ? 'connected.' : 'disconnected.'}`;
+            msg.style.color = 'var(--green)';
+          }
+        } else if (msg) {
+          msg.textContent = (res && res.message) || 'Could not save — try again.';
+          msg.style.color = 'var(--red)';
+        }
+      };
+    });
+  }
+
   box.querySelector('[data-cancel]').onclick = close;
   box.querySelector('[data-session]').onclick = () => {
     close();
@@ -1547,6 +1642,51 @@ export function confirmSpend(title, detail, cost) {
     box.querySelector('[data-close]').onclick  = () => done(false);
     box.querySelector('[data-run]').onclick    = () => done(true);
     box.querySelector('[data-run]').focus();
+  });
+}
+
+/* Model Court needs BOTH keys at once, from an already-unlocked caller
+   (owner or guest) — a separate, smaller form from the full BYOK landing
+   pane, since this is reached from inside the terminal, not the pre-auth
+   gate. Neither key is stored anywhere by this function; the caller
+   receives them once and they go out of scope the moment the request that
+   uses them returns — same in-memory-only discipline as state.selfKey. */
+export function showModelCourtKeys(sym) {
+  return new Promise((resolve) => {
+    const { box, close } = modal(`
+      <div class="mdl-hd"><span>ARGUS://MODEL COURT · ${escapeHtml(sym)}</span><button data-close type="button">✕</button></div>
+      <div class="mdl-b">
+        <p class="hint" style="margin:0 0 12px;line-height:1.8">Runs Perplexity and Gemini in
+          parallel on your own keys, then compares what each one caught. Neither key is
+          stored — paste them each time you run this.</p>
+        <div class="fld">
+          <div class="fld-l">Perplexity key</div>
+          <input id="mc-pplx" class="inp" type="password" autocomplete="off" spellcheck="false"/>
+        </div>
+        <div class="fld">
+          <div class="fld-l">Gemini key</div>
+          <input id="mc-gemini" class="inp" type="password" autocomplete="off" spellcheck="false"/>
+        </div>
+        <div id="mc-err" class="gate-err"></div>
+      </div>
+      <div class="mdl-f">
+        <button class="btn-g" data-cancel type="button" style="padding:7px 14px">CANCEL</button>
+        <button class="btn" data-run type="button">RUN MODEL COURT ▸</button>
+      </div>`);
+    const done = (v) => { close(); resolve(v); };
+    box.querySelector('[data-cancel]').onclick = () => done(null);
+    box.querySelector('[data-close]').onclick  = () => done(null);
+    box.querySelector('[data-run]').onclick = () => {
+      const perplexityKey = box.querySelector('#mc-pplx').value.trim();
+      const geminiKey = box.querySelector('#mc-gemini').value.trim();
+      const err = box.querySelector('#mc-err');
+      if (!perplexityKey || !geminiKey) {
+        err.textContent = 'Both keys are required — Model Court compares two providers.';
+        return;
+      }
+      done({ perplexityKey, geminiKey });
+    };
+    box.querySelector('#mc-pplx').focus();
   });
 }
 

@@ -5,14 +5,14 @@
    Version query on each import so a redeploy can never pair a fresh app.js
    with a stale cached sub-module. Bump together with the ?v= in index.html. */
 
-import * as api from './api.js?v=18';
-import { drawChart, makeResponsive } from './chart.js?v=18';
-import { renderMarkdown, escapeHtml } from './md.js?v=18';
-import * as prefs from './theme.js?v=18';
-import * as ui from './ui.js?v=18';
-import * as views from './views.js?v=18';
-import * as tour from './tour.js?v=18';
-import { DISCLAIMER, FRESHNESS_NOTE, guestAllowanceLine } from './copy.js?v=18';
+import * as api from './api.js?v=34';
+import { drawChart, makeResponsive } from './chart.js?v=34';
+import { renderMarkdown, escapeHtml } from './md.js?v=34';
+import * as prefs from './theme.js?v=34';
+import * as ui from './ui.js?v=34';
+import * as views from './views.js?v=34';
+import * as tour from './tour.js?v=34';
+import { DISCLAIMER, FRESHNESS_NOTE, guestAllowanceLine } from './copy.js?v=34';
 
 const $  = ui.$;
 const $$ = ui.$$;
@@ -40,6 +40,14 @@ const state = {
   cancelType: null,    // aborts an in-flight typewriter
   profile: null,       // onboarding answers — drives the tailored defaults
   view: 'research',    // research | portfolio | profile
+
+  // A visitor's OWN Groq/Perplexity key, from the landing gate's BRING YOUR
+  // OWN KEY pane. Deliberately a plain module-scope field, never
+  // localStorage/sessionStorage — AGENT_SECRET was moved OFF exactly that
+  // kind of storage once its XSS-readability was recognised as a real risk,
+  // and a visitor's own paid key gets at least the same caution. Lost on
+  // refresh, on purpose: {provider, key} | null.
+  selfKey: null,
 };
 
 /* The tier is DERIVED, never stored.
@@ -130,9 +138,18 @@ async function bootSequence() {
       : bad(`INFO_ENDPOINT ……… ${infoResult.error?.message || 'failed'}`));
   }
 
-  if (health?.checks?.perplexity_key)      lines.push(ok('PERPLEXITY_API …… CONFIGURED · LIVE WEB'));
-  else if (health?.checks?.groq_key)       lines.push(warn('GROQ_API ………… FALLBACK · NO WEB SEARCH'));
-  else                                     lines.push(warn('AI_PROVIDER ……… NOT CONFIGURED'));
+  // The two degraded/absent states get an actionable sub-line, not just a
+  // status word — a fresh clone with no key should tell the reader what to
+  // do next, not just that something is missing.
+  if (health?.checks?.perplexity_key) {
+    lines.push(ok('PERPLEXITY_API …… CONFIGURED · LIVE WEB'));
+  } else if (health?.checks?.groq_key) {
+    lines.push(warn('GROQ_API ………… FALLBACK · NO WEB SEARCH'));
+    lines.push(dim('  add a PERPLEXITY_API_KEY for live web search · docs/SETUP.md'));
+  } else {
+    lines.push(warn('AI_PROVIDER ……… NOT CONFIGURED'));
+    lines.push(dim('  run  python main.py setup  to connect a free engine · docs/SETUP.md'));
+  }
 
   if (isOwner()) {
     lines.push(ok('SESSION ………… ACTIVE · AI ARMED'));
@@ -597,9 +614,12 @@ async function research(rawSym, { paid = true, question } = {}) {
   $('btn-exec').disabled = true;
   const started = performance.now();
   // "Can this caller run paid AI?" is no longer "do they hold a session" — a
-  // guest holds one and may still have nothing left to spend.
-  const spent  = tier() === 'guest' && api.auth.divesLeft() <= 0;
-  const hasKey = api.auth.has() && !spent;
+  // guest holds one and may still have nothing left to spend. A self-key
+  // visitor holds no session at all and is still a yes: state.selfKey is a
+  // THIRD, independent way to reach this, orthogonal to tier().
+  const spent      = tier() === 'guest' && api.auth.divesLeft() <= 0;
+  const hasSelfKey = !!state.selfKey;
+  const hasKey     = (api.auth.has() && !spent) || hasSelfKey;
 
   openTab(sym);
   ui.clearOut();
@@ -629,6 +649,17 @@ async function research(rawSym, { paid = true, question } = {}) {
       ui.setStatus('QUANT ONLY', 'ok');
       if (spent) for (const [k] of AI_MODULES) ui.pipeline.set(k, 'locked', 'allowance used');
       o.appendChild(aiLockedNote(spent));
+      cacheTab(sym);
+      return;
+    }
+
+    /* A self-key visitor is a completely separate path from here on — one
+       one-shot call (report + bull/bear), not the 4-module + synthesis
+       pipeline the owner/guest path below runs. No session, no allowance,
+       no ticker-binding to check — those all belong to the guest-budget
+       system this caller was never part of. */
+    if (hasSelfKey) {
+      await runSelfKeyResearch(sym, question, o);
       cacheTab(sym);
       return;
     }
@@ -813,6 +844,218 @@ async function research(rawSym, { paid = true, question } = {}) {
   }
 }
 
+/* A visitor's own key, the SAME 4-module + synthesis staged pipeline
+   research() runs for owner/guest below — à-la-carte module selection via
+   ui.showCostModal's owner-style branch, one call per module against
+   /api/byok/{ticker}/{module} instead of the session-gated routes.
+
+   Deliberately its own loop rather than a branch inside the main one:
+   several of that loop's error kinds (budget/bound/stage/expired) are
+   guest-allowance concepts with no meaning for a caller who has no
+   allowance at all — reusing it risks one of those firing for the wrong
+   reason instead of just not existing here. state.run/$('btn-stop') are
+   still wired the same way so Stop and the outer finally in research()
+   (state.busy, the exec button, the "run complete" line) work identically
+   for both paths without needing to know which one ran. */
+async function runSelfKeyResearch(sym, question, o) {
+  const { provider, key } = state.selfKey;
+  const providerLabel = provider.toUpperCase();
+
+  // tier: 'owner' selects showCostModal's à-la-carte UX (per-module
+  // checkboxes, live running total) — it is a UI-mode selector on that
+  // function, not a claim about who this caller is. `provider` here is
+  // THIS visitor's chosen provider, deliberately not state.provider (the
+  // OPERATOR's configured one) — the modal's Groq/Perplexity note must
+  // describe the key actually paying for the run.
+  const sel = await ui.showCostModal(sym, provider, { tier: 'owner' });
+  if (!sel) {
+    for (const [k] of AI_MODULES) ui.pipeline.set(k, 'skipped');
+    ui.pipeline.set('synthesis', 'skipped');
+    ui.setStatus('QUANT ONLY', 'ok');
+    ui.toast('AI stages skipped — quant, chart and P&L are loaded.', 'info');
+    return;
+  }
+  for (const [k] of AI_MODULES) if (!sel[k]) ui.pipeline.set(k, 'skipped');
+  if (!sel.synthesis) ui.pipeline.set('synthesis', 'skipped');
+
+  const controller = new AbortController();
+  state.run = { controller, cancelled: false };
+  $('btn-stop').classList.remove('hidden');
+
+  const texts = {};
+  for (const [modKey, label] of AI_MODULES) {
+    if (!sel[modKey]) continue;
+    if (state.run.cancelled) { ui.pipeline.set(modKey, 'skipped'); continue; }
+
+    ui.pipeline.set(modKey, 'running');
+    const t = performance.now();
+    try {
+      const data = await api.getByokResearchModule(sym, provider, key, modKey, {
+        question: modKey === 'report' ? question : undefined,
+        signal: controller.signal,
+      });
+      texts[modKey] = data.output || '';
+      ui.pipeline.done(modKey, performance.now() - t);
+
+      const head = document.createElement('div');
+      head.className = 'r-head';
+      head.textContent = `${label}  ·  YOUR ${providerLabel} KEY`;
+      o.appendChild(head);
+      await typeBlock(o, data.output || '');
+    } catch (err) {
+      if (err.kind === 'aborted') {
+        ui.pipeline.set(modKey, 'cancelled');
+        state.run.cancelled = true;
+      } else if (err.status === 403) {
+        // ALLOW_BYOK_VISITORS got turned off mid-run, or never was on —
+        // every remaining stage would hit the identical refusal.
+        ui.pipeline.set(modKey, 'failed');
+        state.run.cancelled = true;
+        ui.toast('This ARGUS instance has not turned on self-funded research.', 'warn', 8000);
+        markRemainingLocked(modKey, 'not enabled');
+      } else if (err.status === 400) {
+        // A malformed key (soft_validate catches it before any provider
+        // call) fails identically on every remaining stage — stop rather
+        // than burn four more round trips proving it again.
+        ui.pipeline.set(modKey, 'failed');
+        state.run.cancelled = true;
+        ui.toast(err.message || 'That key was rejected — check you copied it correctly.', 'error', 8000);
+        markRemainingLocked(modKey, 'key rejected');
+      } else if (err.kind === 'provider') {
+        // A 502 provider_unavailable — the key passed soft_validate's format
+        // check and something went wrong only once it reached the provider.
+        // Deliberately NOT worded as "your key was rejected" any more: that
+        // is only one of the things this branch catches, and asserting it
+        // sent a real user through two good keys chasing what was actually a
+        // wrong model id in _GEMINI_MAIN. The server already names the real
+        // cause (_PROVIDER_REASON_TEXT, which says outright when the fault is
+        // this server's rather than the caller's) — show that and nothing on
+        // top of it, per the same rule the quant cards follow: the layer that
+        // knows which branch it took is the only layer allowed to say.
+        ui.pipeline.set(modKey, 'failed');
+        state.run.cancelled = true;
+        ui.toast(err.message || 'The provider call failed.', 'error', 8000);
+        markRemainingLocked(modKey, 'stopped');
+      } else {
+        ui.pipeline.set(modKey, 'failed');
+        ui.toast(`${modKey}: ${err.message}`, 'warn');
+      }
+    }
+  }
+
+  const any = Object.values(texts).some(Boolean);
+  if (sel.synthesis && !state.run.cancelled && any) {
+    ui.pipeline.set('synthesis', 'running');
+    const t = performance.now();
+    try {
+      const res = await api.postByokSynthesis(sym, provider, key, {
+        report: texts.report || '', context: texts.context || '',
+        policy: texts.policy || '', patterns: texts.patterns || '',
+      }, { signal: controller.signal });
+
+      ui.renderVerdict(o, res.synthesis);
+      if (res.bull_case || res.bear_case) {
+        o.appendChild(Object.assign(document.createElement('div'),
+          { className: 'r-head', textContent: 'BULL vs BEAR' }));
+        const grid = document.createElement('div');
+        grid.style.cssText = 'display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:8px';
+        for (const [txt, cls, lbl] of [[res.bull_case, 'green', '▲ BULL'], [res.bear_case, 'red', '▼ BEAR']]) {
+          const c = document.createElement('div');
+          c.style.cssText = `border:1px solid var(--border);border-left:2px solid var(--${cls});padding:9px;background:var(--bg-panel)`;
+          c.innerHTML = `<div style="font-size:8px;letter-spacing:.1em;color:var(--${cls});margin-bottom:6px">${lbl}</div>`;
+          const b = document.createElement('div');
+          b.className = 'r-body';
+          b.innerHTML = renderMarkdown(txt || '');
+          c.appendChild(b);
+          grid.appendChild(c);
+        }
+        o.appendChild(grid);
+        if (window.matchMedia('(max-width:820px)').matches) grid.style.gridTemplateColumns = '1fr';
+      }
+      ui.pipeline.done('synthesis', performance.now() - t);
+    } catch (err) {
+      ui.pipeline.set('synthesis', err.kind === 'aborted' ? 'cancelled' : 'failed');
+      if (err.kind !== 'aborted') ui.toast(`synthesis: ${err.message}`, 'warn');
+    }
+  } else if (sel.synthesis) {
+    ui.pipeline.set('synthesis', 'skipped');
+  }
+
+  ui.setStatus(state.run.cancelled ? 'STOPPED' : 'COMPLETE', state.run.cancelled ? 'err' : 'ok');
+}
+
+/* Model Court — Perplexity and Gemini, run in parallel on the caller's own
+   two keys, compared. Gated to a real session (owner or guest) before the
+   key-entry modal even opens — decided explicitly in chat as the interim
+   access boundary; a real paid-membership gate was requested for later,
+   not built here. Neither key this modal collects is ever stored: they
+   live only as local variables for the one request that uses them. */
+async function runModelCourt(sym) {
+  if (state.busy) { ui.toast('A run is already in flight.', 'warn'); return; }
+  if (!isOwner() && tier() !== 'guest') {
+    ui.toast('Model Court needs an unlocked session — the owner\'s key, or a guest key. '
+           + 'Type `request` to ask the owner for access.', 'warn', 7000);
+    return;
+  }
+
+  const keys = await ui.showModelCourtKeys(sym);
+  if (!keys) return;
+
+  state.busy = true;
+  state.ticker = sym;
+  $('btn-exec').disabled = true;
+  const started = performance.now();
+
+  openTab(sym);
+  ui.clearOut();
+  ui.writeTitle(`ARGUS://${sym} · MODEL COURT`);
+  const o = ui.out();
+
+  try {
+    const ok = await loadFree(sym, { withPipeline: false });
+    if (!ok) { cacheTab(sym); return; }
+
+    ui.writeLine('Running Perplexity + Gemini in parallel…', 'dim');
+    const res = await api.runModelCourt(sym, keys.perplexityKey, keys.geminiKey);
+
+    // Same shape for all three sections: a heading, then either the real
+    // output or a plain failure/unavailable line — never both, never neither.
+    const section = (label) => {
+      o.appendChild(Object.assign(document.createElement('div'),
+        { className: 'r-head', textContent: label }));
+    };
+    const failLine = (text, dim) => {
+      const p = document.createElement('p');
+      p.className = dim ? 'r-body dim' : 'r-body';
+      p.textContent = text;
+      o.appendChild(p);
+    };
+
+    section('PERPLEXITY');
+    if (res.perplexity?.error) failLine(`Failed: ${res.perplexity.error}`);
+    else await typeBlock(o, res.perplexity?.report || '');
+
+    section('GEMINI');
+    if (res.gemini?.error) failLine(`Failed: ${res.gemini.error}`);
+    else await typeBlock(o, res.gemini?.report || '');
+
+    section('COMPARISON');
+    if (res.comparison) await typeBlock(o, res.comparison);
+    else failLine(res.comparison_note || 'Comparison unavailable.', true);
+
+    ui.setStatus(res.comparison ? 'COMPLETE' : 'PARTIAL', res.comparison ? 'ok' : 'err');
+  } catch (err) {
+    ui.setStatus('FAILED', 'err');
+    ui.toast(err.message || 'Model Court failed.', 'error', 8000);
+  } finally {
+    const secs = ((performance.now() - started) / 1000).toFixed(1);
+    ui.writeLine(`— run complete in ${secs}s —`, 'dim');
+    cacheTab(sym);
+    state.busy = false;
+    $('btn-exec').disabled = false;
+  }
+}
+
 /* Typewriter that can be interrupted by Stop. */
 function typeBlock(container, markdown) {
   /* Belt-and-braces: the reveal is decoration on a paid pipeline, so it
@@ -924,7 +1167,7 @@ async function inspect(sym) {
 /* ── Command parser ──────────────────────────────────────────────────── */
 
 const CMDS = ['research', 'quant', 'chart', 'scan', 'brent', 'pos', 'add', 'rm',
-              'portfolio', 'profile', 'focus', 'clear', 'tour', 'request', 'help'];
+              'portfolio', 'profile', 'focus', 'clear', 'tour', 'request', 'help', 'court'];
 
 /* Refuse a book edit before it reaches the network. The server enforces this
    with a 403 regardless; catching it here means the reader gets a sentence
@@ -1033,6 +1276,10 @@ async function runCommand(raw) {
       if (!arg) { ui.toast('Usage: research <SYM>', 'warn'); return; }
       await research(arg, { question: captureQuestion(rest.slice(1)) }); return;
 
+    case 'court':
+      if (!arg) { ui.toast('Usage: court <SYM>', 'warn'); return; }
+      await runModelCourt(arg); return;
+
     default: {
       // Bare ticker is the most common input — treat it as research.
       const guess = head.toUpperCase().replace(/[^A-Z0-9.=-]/g, '');
@@ -1054,7 +1301,8 @@ function wireHints() {
   let idx = -1;
 
   const HINTS = [
-    ['research', 'full staged brief'], ['quant', 'free metrics only'],
+    ['research', 'full staged brief'], ['court', 'Perplexity vs Gemini, compared'],
+    ['quant', 'free metrics only'],
     ['chart', 'price + reference lines'], ['scan', 'sweep all holdings'],
     ['brent', 'framework detail'], ['pos', 'open inspector'],
     ['portfolio', 'P&L, XIRR, outlook'], ['profile', 'edit positions & tailoring'],
@@ -1307,10 +1555,15 @@ function applyTailoring(profile) {
 /* ── Config ──────────────────────────────────────────────────────────── */
 
 function openConfig() {
-  /* The key itself is never held in the browser any more — it lives in an
-     HttpOnly session cookie — so this offers the two actions that remain:
-     sign out, or unlock when the session has lapsed. */
-  ui.showConfigModal(api.auth.has(), async (action) => {
+  /* AGENT_SECRET itself is never held in the browser any more — it lives in
+     an HttpOnly session cookie — so the Session field offers only the two
+     actions that remain: sign out, or unlock when the session has lapsed.
+     A Groq/Perplexity key is a different kind of secret (a provider
+     credential the server calls out with, not something this app compares
+     against) and the AI Research field below is owner-only — isOwner gates
+     whether it even renders, matching POST /api/settings/provider-key's own
+     require_owner on the server. */
+  ui.showConfigModal(api.auth.has(), api.auth.isOwner(), state.health?.checks, async (action) => {
     if (action === 'signout') {
       const done = await api.auth.signOut();
       ui.renderKeyState('visitor', null);
@@ -1326,6 +1579,20 @@ function openConfig() {
     });
   }, (key) => {
     if (key === 'accent') paintChart();
+  }, async (provider, key) => {
+    try {
+      const res = await api.setProviderKey(provider, key);
+      // Keep the cached boot-time health snapshot in sync so a second open
+      // of this same modal (or the DATA modal) reflects the change without
+      // needing a full page reload.
+      if (res && res.ok && state.health) {
+        state.health.checks = { ...state.health.checks,
+          [provider === 'perplexity' ? 'perplexity_key' : 'groq_key']: res.configured };
+      }
+      return res;
+    } catch (err) {
+      return { ok: false, message: (err && err.message) || 'Could not reach the server.' };
+    }
   });
 }
 
@@ -1452,6 +1719,15 @@ document.addEventListener('DOMContentLoaded', async () => {
       await enterOrOnboard();
     },
     onVisitor: () => enter(),   // no session => tier() is already 'visitor'
+    onSelfKey: (provider, key) => {
+      // Still no session — tier() stays 'visitor' exactly as onVisitor
+      // above. selfKey only ever unlocks AI research specifically; it never
+      // touches the owner's book or admin surface.
+      state.selfKey = { provider, key };
+      const label = provider.charAt(0).toUpperCase() + provider.slice(1);
+      ui.toast(`Using your own ${label} key for research.`, 'success', 3200);
+      enter();
+    },
   });
 
   // Expose the landing so in-terminal calls to action can reach it too.

@@ -4,11 +4,11 @@
    portfolio overview, profile. Kept out of ui.js so that file stays about the
    terminal chrome. */
 
-import * as api from './api.js?v=18';
-import { renderMarkdown, escapeHtml } from './md.js?v=18';
-import * as ui from './ui.js?v=18';
-import * as prefs from './theme.js?v=18';
-import { DISCLAIMER, PRIVACY_NOTE, FRESHNESS_NOTE, guestAllowanceLine } from './copy.js?v=18';
+import * as api from './api.js?v=34';
+import { renderMarkdown, escapeHtml } from './md.js?v=34';
+import * as ui from './ui.js?v=34';
+import * as prefs from './theme.js?v=34';
+import { DISCLAIMER, PRIVACY_NOTE, FRESHNESS_NOTE, guestAllowanceLine } from './copy.js?v=34';
 
 const $ = ui.$;
 const el = ui.el;
@@ -34,7 +34,166 @@ const ART = ` █████╗ ██████╗  ██████╗ �
 
 const LAST_TIER_KEY = 'argus.lastTier';
 
-export function showLanding({ mode = 'landing', onUnlocked, onVisitor } = {}) {
+/* ── BYOK provider walkthrough ──────────────────────────────────────────
+   A guided coach-mark over the three provider buttons, one at a time —
+   same interaction pattern as tour.js's #tour (spotlight, tooltip, dots,
+   Next/Back/Esc), reimplemented rather than imported: tour.js's own
+   startTour() deliberately refuses to run while the landing gate is open
+   (its docstring: never launch on top of a decision the reader is mid-way
+   through), and this walkthrough IS a screen inside that gate — the two
+   are mutually exclusive by construction, so there is nothing to share
+   beyond the visual language, which lives in matching CSS classes instead
+   (#byok-tour mirrors #tour at a higher z-index; see style.css). */
+const BYOK_TOUR_STEPS = [
+  { target: null,
+    title: 'PICK A PROVIDER',
+    body: 'Three ways to fund research here — free and instant, free with a '
+        + 'quota, or paid with the best quality. Step through each, or press '
+        + 'Esc to go straight back to pasting a key.' },
+  { target: '[data-v="groq"]',
+    title: 'GROQ — FREE, FASTEST',
+    body: "No live web search — answers come from the model's training data, "
+        + 'which can be months stale. Best for trying the app at zero cost, '
+        + 'not a real decision. Get one (~1 min): console.groq.com/keys → '
+        + 'sign up → Create API Key (starts gsk_).' },
+  { target: '[data-v="gemini"]',
+    title: 'GEMINI — FREE QUOTA, LIVE SEARCH',
+    body: 'Live web search via Google, free within ~5,000 searches/month, '
+        + 'then paid. Answers cite the pages they used, though coverage is '
+        + 'usually thinner than Perplexity\'s. The best free option if '
+        + 'freshness matters. Get one: aistudio.google.com/apikey → sign in '
+        + 'with Google → Create API Key (starts AIza).' },
+  { target: '[data-v="perplexity"]',
+    title: 'PERPLEXITY — RECOMMENDED',
+    body: 'Paid, ~$0.04–0.21 per run — live web search with full citations. '
+        + 'Best when result quality matters most. Get one: '
+        + 'perplexity.ai/settings/api → sign up, add a payment method '
+        + '→ generate a key (starts pplx-).' },
+];
+
+function startByokTour(seg) {
+  if (document.getElementById('byok-tour')) return; // already open — ignore a double-click
+
+  const RM = window.matchMedia('(prefers-reduced-motion:reduce)').matches;
+  let step = 0;
+
+  const root = document.createElement('div');
+  root.id = 'byok-tour';
+  if (RM) root.classList.add('rm');
+
+  const spot = document.createElement('div');
+  spot.id = 'byok-tour-spot';
+
+  const tip = document.createElement('div');
+  tip.id = 'byok-tour-tip';
+  tip.setAttribute('role', 'dialog');
+  tip.setAttribute('aria-modal', 'true');
+  tip.setAttribute('aria-labelledby', 'byok-tour-title');
+
+  const dots = document.createElement('div');
+  dots.className = 'ob-steps';
+
+  const title = document.createElement('div');
+  title.className = 'gate-hd';
+  title.id = 'byok-tour-title';
+
+  const body = document.createElement('p');
+  body.id = 'byok-tour-body';
+
+  const nav = document.createElement('div');
+  nav.className = 'tour-nav';
+  const skip = document.createElement('button');
+  skip.className = 'btn-g'; skip.type = 'button';
+  skip.textContent = 'SKIP (ESC)';
+  const next = document.createElement('button');
+  next.className = 'btn'; next.type = 'button';
+  nav.append(skip, next);
+
+  tip.append(dots, title, body, nav);
+  root.append(spot, tip);
+  document.body.appendChild(root);
+
+  const resolveTarget = (sel) => (sel && seg) ? seg.querySelector(sel) : null;
+
+  const position = (node) => {
+    if (!node) {
+      spot.style.cssText = `top:${innerHeight / 2}px;left:${innerWidth / 2}px;width:0;height:0`;
+      tip.style.top = `${Math.max(12, innerHeight / 2 - tip.offsetHeight / 2)}px`;
+      tip.style.left = `${Math.max(10, innerWidth / 2 - tip.offsetWidth / 2)}px`;
+      return;
+    }
+    const r = node.getBoundingClientRect();
+    spot.style.cssText = `top:${r.top - 4}px;left:${r.left - 4}px;`
+                       + `width:${r.width + 8}px;height:${r.height + 8}px`;
+    const h = tip.offsetHeight || 160;
+    const w = tip.offsetWidth || 300;
+    const below = r.bottom + 14;
+    const top = (below + h > innerHeight - 10) ? Math.max(10, r.top - h - 14) : below;
+    tip.style.top = `${top}px`;
+    tip.style.left = `${Math.min(Math.max(10, r.left), innerWidth - w - 10)}px`;
+  };
+
+  const paint = () => {
+    const s = BYOK_TOUR_STEPS[step];
+    const node = resolveTarget(s.target);
+    dots.innerHTML = '';
+    BYOK_TOUR_STEPS.forEach((_, i) => {
+      const d = document.createElement('span');
+      d.className = `ob-dot${i === step ? ' on' : ''}${i < step ? ' done' : ''}`;
+      dots.appendChild(d);
+    });
+    title.textContent = s.title;
+    body.textContent = s.body;
+    next.textContent = step === BYOK_TOUR_STEPS.length - 1 ? 'DONE ▸' : 'NEXT ▸';
+    // The trigger button sits below the provider row in the (internally
+    // scrolling) gate box, so the very first spotlighted button can start
+    // off-screen — scrollIntoView on .gate as the nearest scrollable
+    // ancestor, then position() runs again via the scroll listener below.
+    if (node) node.scrollIntoView({ block: 'center', behavior: RM ? 'auto' : 'smooth' });
+    position(node);
+    next.focus();
+  };
+
+  const advance = () => {
+    if (step >= BYOK_TOUR_STEPS.length - 1) end(); else { step += 1; paint(); }
+  };
+
+  function end() {
+    document.removeEventListener('keydown', onKey, true);
+    window.removeEventListener('resize', onMove);
+    document.removeEventListener('scroll', onMove, true);
+    root.remove();
+    $('byok-tour-btn')?.focus();
+  }
+
+  function onKey(e) {
+    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); end(); }
+    else if (e.key === 'Enter' || e.key === 'ArrowRight') {
+      e.preventDefault(); e.stopPropagation(); advance();
+    } else if (e.key === 'ArrowLeft') {
+      e.preventDefault(); e.stopPropagation();
+      step = Math.max(0, step - 1); paint();
+    } else if (e.key === 'Tab') {
+      // Two-element focus trap, same as #tour's.
+      e.preventDefault();
+      (document.activeElement === next ? skip : next).focus();
+    }
+  }
+  const onMove = () => position(resolveTarget(BYOK_TOUR_STEPS[step].target));
+
+  skip.onclick = end;
+  next.onclick = advance;
+  document.addEventListener('keydown', onKey, true);
+  window.addEventListener('resize', onMove);
+  // Capture phase: .gate.on scrolls internally (overflow-y:auto), so a
+  // bubbling listener on window would never see it — same reasoning
+  // tour.js's own onMove uses for #out and the side panels.
+  document.addEventListener('scroll', onMove, true);
+
+  paint();
+}
+
+export function showLanding({ mode = 'landing', onUnlocked, onVisitor, onSelfKey } = {}) {
   const host = $('gate');
   let cur = mode;
 
@@ -53,7 +212,10 @@ export function showLanding({ mode = 'landing', onUnlocked, onVisitor } = {}) {
     host.innerHTML =
       `<div class="gate-box ld">
          <pre class="boot-art" aria-hidden="true">${ART}</pre>
-         ${cur === 'landing' ? paneLanding() : cur === 'request' ? paneRequest() : paneUnlock()}
+         ${cur === 'landing' ? paneLanding()
+           : cur === 'request' ? paneRequest()
+           : cur === 'byok'    ? paneByok()
+           : paneUnlock()}
        </div>`;
     wire();
   };
@@ -68,9 +230,56 @@ export function showLanding({ mode = 'landing', onUnlocked, onVisitor } = {}) {
     <div class="ld-actions">
       <button id="ld-free" class="btn" type="button">CONTINUE WITHOUT A KEY ▸</button>
       <button id="ld-request" class="btn-g" type="button">REQUEST ACCESS</button>
+      <button id="ld-byok" class="btn-g" type="button">BRING YOUR OWN KEY</button>
       <button id="ld-unlock" class="btn-g" type="button">I HAVE A KEY</button>
     </div>
     <p class="ld-disc" id="ld-disc"></p>`;
+
+  /* A visitor's own Groq, Gemini, or Perplexity key — never the owner's
+     book, never a session, never stored anywhere on this end. May be off on
+     this particular instance (ALLOW_BYOK_VISITORS) — the server says so
+     plainly if so, rather than this pane pretending it always works. */
+  const paneByok = () => `
+    <div class="gate-hd">ARGUS://OWN KEY</div>
+    <div class="fld">
+      <div class="fld-l">Provider</div>
+      <div class="seg" id="byok-provider">
+        <button type="button" data-v="groq">GROQ</button>
+        <button type="button" data-v="gemini">GEMINI</button>
+        <button type="button" data-v="perplexity">PERPLEXITY</button>
+      </div>
+    </div>
+    <div class="fld">
+      <div class="fld-l">Key</div>
+      <input id="byok-key" class="inp" type="password" autocomplete="off"
+             spellcheck="false" placeholder="paste your Groq, Gemini or Perplexity key"/>
+      <div id="byok-err" class="gate-err"></div>
+    </div>
+    <button id="byok-go" class="btn" type="button" style="width:100%;padding:10px">CONTINUE ▸</button>
+
+    <div class="fld byok-compare" style="margin-top:16px">
+      <p class="hint" style="line-height:1.8">
+        Not sure which to use? <b>Perplexity</b> is recommended for depth of
+        sourcing. <b>Gemini</b> also searches the live web and is free within
+        a monthly quota. <b>Groq</b> is instant and free but has no web
+        search, so it can be stale.
+      </p>
+      <button id="byok-tour-btn" class="btn-g" type="button"
+              style="width:100%;padding:9px;margin-top:8px">
+        ▸ COMPARE ALL THREE · 30 SEC
+      </button>
+      <p class="hint" style="margin-top:8px">
+        Prefer reading? Full walkthrough: <code>docs/SETUP.md</code>.
+      </p>
+    </div>
+
+    <p class="hint" style="margin-top:14px;line-height:1.8">
+      Used only for research you run this session — held in this tab's memory,
+      never written to disk or browser storage, and gone the moment you
+      refresh or close the tab. This does not unlock the owner's book or any
+      admin action, only AI research funded by your own key. Not every ARGUS
+      instance has this turned on — you'll be told plainly if this one hasn't.</p>
+    <button id="ld-back" class="btn-g ld-back" type="button">◂ OTHER OPTIONS</button>`;
 
   const paneUnlock = () => `
     <div class="gate-hd">ARGUS://UNLOCK</div>
@@ -88,6 +297,13 @@ export function showLanding({ mode = 'landing', onUnlocked, onVisitor } = {}) {
       provider key. It is exchanged for a session cookie your browser stores but
       page scripts cannot read. Free quant, charts and the Brent gate work without
       any key; the owner's book and paid AI research do not.</p>
+    <p class="hint" style="margin-top:10px;line-height:1.8">
+      Running your own copy of ARGUS for the first time? Your
+      <b>AGENT_SECRET</b> was generated automatically and printed to the
+      server's console when it started — unlock with that here, then add a
+      Groq or Perplexity key from <b>◈ CONFIG</b>, entirely in the browser.
+      No terminal needed after this step. See <code>docs/SETUP.md</code> for
+      the full walkthrough, including the CLI alternative.</p>
     <button id="ld-back" class="btn-g ld-back" type="button">◂ OTHER OPTIONS</button>`;
 
   const paneRequest = () => `
@@ -116,6 +332,7 @@ export function showLanding({ mode = 'landing', onUnlocked, onVisitor } = {}) {
 
     $('ld-request')?.addEventListener('click', () => go('request'));
     $('ld-unlock')?.addEventListener('click',  () => go('unlock'));
+    $('ld-byok')?.addEventListener('click',    () => go('byok'));
     $('ld-back')?.addEventListener('click',    () => go('landing'));
 
     $('ld-free')?.addEventListener('click', () => {
@@ -129,6 +346,41 @@ export function showLanding({ mode = 'landing', onUnlocked, onVisitor } = {}) {
 
     wireUnlock();
     wireRequest();
+    wireByok();
+  }
+
+  function wireByok() {
+    const seg = $('byok-provider');
+    if (!seg) return;
+    let provider = 'groq';
+    const paint = () => seg.querySelectorAll('button')
+      .forEach(b => b.classList.toggle('on', b.dataset.v === provider));
+    seg.querySelectorAll('button').forEach(b => {
+      b.onclick = () => { provider = b.dataset.v; paint(); };
+    });
+    paint();
+
+    const tourBtn = $('byok-tour-btn');
+    if (tourBtn) tourBtn.onclick = () => startByokTour(seg);
+
+    const input = $('byok-key');
+    const err = $('byok-err');
+
+    // Client-side sanity check only, to save a round trip on an obvious
+    // mistake — the server re-validates on every single call regardless
+    // (soft_validate, same function the CLI wizard and CONFIG modal use),
+    // since this key is never stored here for the server to have already
+    // checked once and remembered.
+    const submit = () => {
+      const v = input.value.trim();
+      if (!v) { err.textContent = 'Paste a key first.'; input.focus(); return; }
+      if (v.length < 20) { err.textContent = 'That looks too short to be a real key.'; return; }
+      host.className = 'gate';
+      host.innerHTML = '';
+      onSelfKey && onSelfKey(provider, v);
+    };
+    $('byok-go').onclick = submit;
+    input.addEventListener('keydown', e => { if (e.key === 'Enter') submit(); });
   }
 
   function wireUnlock() {

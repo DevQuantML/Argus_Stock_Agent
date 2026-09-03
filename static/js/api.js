@@ -186,11 +186,14 @@ function describe(status, body) {
   return new ApiError(server || `Request failed (${status}).`, { status, kind: 'server', code });
 }
 
-async function request(path, { method = 'GET', body = null, signal = null } = {}) {
-  const headers = {};
+async function request(path, { method = 'GET', body = null, signal = null, headers: extra = null } = {}) {
+  const headers = { ...(extra || {}) };
 
   // credentials:'same-origin' sends the HttpOnly session cookie. There is no
-  // key to attach by hand any more — that is the point of the change.
+  // key to attach by hand any more — that is the point of the change. `extra`
+  // is the one deliberate exception: the BYOK route below attaches a
+  // visitor's OWN key per-request, the same way X-Agent-Key already works,
+  // never as a stored credential this function manages on the caller's behalf.
   const opts = { method, headers, signal, credentials: 'same-origin' };
   if (body !== null) {
     headers['Content-Type'] = 'application/json';
@@ -233,7 +236,7 @@ function throwIfErrorField(data) {
   const missingKey = /API_KEY|not configured|No AI provider/i.test(data.error);
   throw new ApiError(
     missingKey
-      ? 'AI research unavailable — add PERPLEXITY_API_KEY or GROQ_API_KEY to your server .env file.'
+      ? 'AI research unavailable — the owner needs to connect a key via ◈ CONFIG.'
       : data.error,
     { status: 200, kind: missingKey ? 'config' : 'server' },
   );
@@ -245,6 +248,69 @@ export async function getResearch(ticker, question) {
   return throwIfErrorField(
     await request(`/api/research/${encodeURIComponent(ticker)}${q}`, {}),
   );
+}
+
+/* Anonymous, self-funded research — a visitor's OWN key, sent per-request as
+   a header exactly like X-Agent-Key already works, never stored by this
+   module. No session, no cookie needed for this one. May 403 if the
+   instance hasn't enabled ALLOW_BYOK_VISITORS — surfaces as a normal
+   ApiError via throwIfErrorField/describe, same as any other failure. */
+export async function getByokResearch(ticker, provider, key, { question, signal } = {}) {
+  const q = question ? `?question=${encodeURIComponent(question)}` : '';
+  return throwIfErrorField(
+    await request(`/api/byok/${encodeURIComponent(ticker)}${q}`, {
+      signal,
+      headers: { 'X-Provider': provider, 'X-Provider-Key': key },
+    }),
+  );
+}
+
+/* Staged BYOK pipeline — mirrors getResearchModule/postSynthesis exactly,
+   headers instead of a session cookie. One call per module so each renders
+   as it lands and the run can be stopped part-way, same as the owner/guest
+   loop this pairs with in app.js. */
+export async function getByokResearchModule(ticker, provider, key, module, { question, signal } = {}) {
+  const q = module === 'report' && question ? `?question=${encodeURIComponent(question)}` : '';
+  return throwIfErrorField(
+    await request(`/api/byok/${encodeURIComponent(ticker)}/${module}${q}`, {
+      signal,
+      headers: { 'X-Provider': provider, 'X-Provider-Key': key },
+    }),
+  );
+}
+
+export async function postByokSynthesis(ticker, provider, key, payload, { signal } = {}) {
+  return throwIfErrorField(
+    await request(`/api/byok/${encodeURIComponent(ticker)}/synthesis`, {
+      method: 'POST', body: payload, signal,
+      headers: { 'X-Provider': provider, 'X-Provider-Key': key },
+    }),
+  );
+}
+
+/* Model Court — session-gated (owner or guest; the server enforces this
+   with require_session, not this header set), two of the visitor's own
+   keys travel per-request exactly like BYOK's headers do. No body — the
+   route takes nothing but the two keys and an optional question.
+
+   Deliberately NOT wrapped in throwIfErrorField. That helper exists for
+   routes where a 200-with-{error} means the whole call was worthless (no
+   provider configured — nothing else in the body is usable). Model Court's
+   own "both providers failed" shape is a 200 that DOES carry a top-level
+   `error`, but the response is still exactly what the caller needs:
+   `perplexity`/`gemini` sub-objects naming which provider failed and why.
+   Throwing here would discard that detail behind one generic toast — the
+   opposite of run_model_court()'s whole point, which is to degrade
+   gracefully and say what happened rather than showing nothing. A genuine
+   request-level failure (bad key format, no session, disabled instance,
+   internal error) is still a non-2xx status and still throws — that check
+   lives in request() above, unconditionally, before this line is reached. */
+export async function runModelCourt(ticker, perplexityKey, geminiKey, { question, signal } = {}) {
+  const q = question ? `?question=${encodeURIComponent(question)}` : '';
+  return request(`/api/model-court/${encodeURIComponent(ticker)}${q}`, {
+    method: 'POST', signal,
+    headers: { 'X-Perplexity-Key': perplexityKey, 'X-Gemini-Key': geminiKey },
+  });
 }
 
 /* Staged pipeline: one module per call so each renders as it lands and the
@@ -280,6 +346,12 @@ export const delWatch     = (t)     => request(`/api/watchlist/${encodeURICompon
 
 export const getAnalytics = ()      => request('/api/portfolio/analytics');
 export const getOutlook   = ()      => request('/api/portfolio/outlook');
+
+/* Owner-only. An empty key clears that provider rather than erroring — the
+   server treats it as a deliberate "disconnect" action. The raw key never
+   comes back in the response; only {ok, provider, configured}. */
+export const setProviderKey = (provider, key) =>
+  request('/api/settings/provider-key', { method: 'POST', body: { provider, key: key || '' } });
 
 /* ── Public: no session needed ───────────────────────────────────────────── */
 

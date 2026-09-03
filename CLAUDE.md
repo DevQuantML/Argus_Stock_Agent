@@ -41,10 +41,12 @@ not.
 api.py                        FastAPI app — routes, tiered auth, rate limit, CSP
 config.py                     MY_PORTFOLIO, WATCHLIST, BRENT_LEVELS, GEO_TRANSMISSION,
                                GEO_EVENT_LIBRARY
-main.py                       CLI: python main.py PLTR | scan | brent
+main.py                       CLI: python main.py setup | PLTR | scan | brent
 store.py                      SQLite — positions, watchlist, sessions, profile,
                               guest keys + dive budget, access requests
 tools/perplexity_research.py  the ONLY AI path — prompts, modules, synthesis
+tools/gemini_native.py        Gemini's native endpoint wearing the OpenAI client's shape
+                               (grounding is impossible via the compat endpoint)
 tools/quant.py                DCF, ROIC, FCF yield, PEG, Sharpe, Beta (pure Python)
 tools/fundamentals.py         annual statements with provenance (imported by quant.py)
 tools/fx.py                   currency conversion for foreign-listed names (ADRs)
@@ -53,30 +55,75 @@ tools/oil_price.py            Brent futures → macro gate signal
 tools/validator.py            validate_ticker, guard_tool_output, sanitize_question
 tools/xirr.py                 money-weighted return for the portfolio analytics route
 tools/notify.py               best-effort Telegram push (access-request alerts)
+tools/setup_wizard.py         guided .env key setup — python main.py setup
 static/                       frontend — index.html, style.css, js/*.js (ES modules)
 scripts/verify_*.py           free harnesses — run before any PR
 docs/HANDOFF.md               design decisions, open items, verification log
+docs/SETUP.md                 bring-your-own-key walkthrough — Groq (free) / Perplexity (paid)
 ```
 
 ### Provider policy
 
-**Perplexity is the only research engine, Groq is the declared fallback.**
+**Perplexity is the primary research engine, Groq is the declared fallback.**
 `_get_provider()` in `tools/perplexity_research.py` picks between them:
 Perplexity when `PERPLEXITY_API_KEY` is set, else Groq. Anthropic and
 OpenRouter were removed deliberately — do not reintroduce an SDK to solve a
 problem that a prompt change can solve.
 
-Groq has **no live web search**. Any prompt that depends on real-world
-freshness must declare that degradation in its own output when
-`provider == "groq"` — see `_policy_prompt()` for the pattern.
+**Gemini is a third provider, reachable only via BYOK** (`_get_provider(override=("gemini", key))`
+— see the `/api/byok/*` gotcha below). It fits the same "no new SDK" discipline
+above rather than breaking it: Gemini's OpenAI-compatible endpoint
+(`generativelanguage.googleapis.com/v1beta/openai/`) speaks the exact same
+`openai` package this file already depends on for Perplexity and Groq — no
+new dependency. It is *not* offered by the CLI wizard, CONFIG modal, or
+`.env` — `tools/setup_wizard.py`'s `PERSISTENT_PROVIDERS` deliberately
+excludes it, because Google's own docs flag that compat layer as still
+beta. Promoting it to full parity is a later, separate decision.
+
+**Groq has no live web search; Perplexity and Gemini both do.** Any prompt
+that depends on real-world freshness must declare that degradation in its own
+output when `provider in _NO_LIVE_SEARCH` — see `_policy_prompt()`. That tuple
+(`("groq",)`) is the single gate; it replaced a `provider == "groq"` check
+repeated per prompt. **If Gemini is ever moved back to the compat endpoint it
+must be added to that tuple**, or the prompts will claim a freshness the run
+cannot deliver.
+
+**Gemini does NOT use the OpenAI-compatible endpoint — it is the one provider
+here on a native client** (`tools/gemini_native.py`), and that is load-bearing,
+not incidental: Grounding with Google Search is unavailable through
+compatibility mode entirely. Google validates request *shape* before the
+credential, so every documented form was probed against the live API with a
+deliberately fake key (free, never billed) and all were refused — `{"google":
+{"tools": [{"google_search": {}}]}}` → `Unknown name "google"`; `{"tools":
+[{"google_search": {}}]}` (the form Google's own compat page shows, for image
+generation) → `Unknown name "google_search"`; `{"tools": [{"type":
+"google_search"}]}` → `Invalid tool type`; and `{"google":
+{"thinking_config": …}}`, which that same page documents as working, →
+`Unknown name "google"` too. A Google moderator confirms it outright:
+*"Grounding with Google search is not available when using OpenAI
+compatibility mode."* **Their compat docs are stale on this layer — probe,
+don't read.**
+
+`GeminiNativeClient` duck-types only the slice of `openai.OpenAI` that
+`_call()` touches — `.chat.completions.create(…)` →
+`.choices[0].message.content` — so `_get_provider()` swaps it in and **no call
+site changes**. Alternatives to that adapter were worse: branching `_call()`
+on provider name puts a vendor `if` in the one function every research call
+funnels through, and `google-genai` would be a new dependency for what is a
+plain JSON POST. It uses stdlib `urllib` only, matching `tools/notify.py`.
+Two details it must keep: it re-raises failures as
+`RuntimeError("Error code: {status} - {body}")` so `_call()`'s classifier
+sorts Gemini errors into the same buckets as every other provider with no
+special-casing, and it exposes `.api_key` because `_call()` redacts exactly
+that attribute out of provider messages before logging them.
 
 ### Three different keys — do not conflate them
 
 | Key | Lives in | Purpose |
 |---|---|---|
-| `AGENT_SECRET` | `.env` **and** the browser Settings drawer | A password you choose. Gates `/api/research/*` so nobody else spends your credits. |
-| `PERPLEXITY_API_KEY` | `.env` only | Provider credential. Never sent to the browser. |
-| `GROQ_API_KEY` | `.env` only | Fallback provider credential. Never sent to the browser. |
+| `AGENT_SECRET` | `.env` **and** the browser Settings drawer | A password you choose — or the server generates one for you on first run and prints it once to the console. Gates `/api/research/*` so nobody else spends your credits. |
+| `PERPLEXITY_API_KEY` | `.env`, settable from the browser's **◈ CONFIG** (owner-only, write-only) | Provider credential. `POST /api/settings/provider-key` lets an already-unlocked owner set or clear it live, no restart — the value is never sent back to any browser once saved, matching `AGENT_SECRET`'s own write-only pattern. |
+| `GROQ_API_KEY` | Same as above | Fallback provider credential. Same route, same write-only guarantee. |
 | a **guest key** (`gk_…`) | issued by the owner, stored **hashed** in `guest_keys` | A 24-hour credential handed to one other person. Redeemed at `POST /api/session` like `AGENT_SECRET`, but yields a `tier='guest'` session: read-only on the book, and worth exactly **one** 5-stage research dive on **one** ticker. The raw key exists only in the approve response — the database holds SHA-256 and a 6-char display prefix. |
 
 ## Cost
@@ -164,6 +211,214 @@ js/tour.js            five-step coach-mark orientation (no imports, no network)
 
 ## Gotchas
 
+- **A fresh clone with no `.env` self-bootstraps `AGENT_SECRET` at server
+  startup, before `store.bootstrap()` runs.** `api.py` checks
+  `os.getenv("AGENT_SECRET")` right after `load_dotenv()`; if unset, it calls
+  `tools.setup_wizard.ensure_agent_secret()` (which reuses `ensure_env_file()`
+  under the hood — same neutralization, same `chmod 0o600`), sets
+  `os.environ["AGENT_SECRET"]` explicitly on the running process, and
+  `logger.critical()`s it once, clearly formatted, with the instruction to
+  paste it into "I HAVE A KEY". This is what lets a cloner skip the CLI
+  wizard entirely — every AI provider key after that is added from the
+  browser's **◈ CONFIG** (`POST /api/settings/provider-key`, `require_owner`),
+  live immediately via `os.environ[key_name] = ...` since `_get_provider()`
+  reads at call time. Every verification harness sets a real `AGENT_SECRET`
+  in `os.environ` **before** `import api`, so this branch never fires during
+  tests — only on a genuinely fresh clone. **Never** apply the generated
+  value via `load_dotenv(override=True)`: that reloads every OTHER key in the
+  file over whatever the process already has, clobbering a harness's (or a
+  container's) deliberately-set values for something unrelated.
+- **`/api/byok/*` is the one route family in this file with no auth
+  dependency AND no operator credential behind it — a visitor's own
+  Groq/Perplexity key, sent as `X-Provider`/`X-Provider-Key` headers, funds
+  research for that call only.** Off by default (`ALLOW_BYOK_VISITORS`
+  unset → 403 before the headers are even read, via the shared `_byok_auth()`
+  gate every route in the family calls); the operator opts in per-instance.
+  The key is never written to `os.environ`, never persisted to `.env`, never
+  logged — it exists only as the `override` argument threaded through
+  `run_perplexity_research()` / `run_research_module()` / `run_synthesis()`
+  → `_get_provider(override=...)`, and goes out of scope when the request
+  returns. **Two shapes, both real, not one deprecating the other**:
+  `GET /api/byok/{ticker}` is the one-shot function (report + bull/bear, one
+  round trip — kept for the same curl-friendly reason the legacy
+  `/api/research/{ticker}` stays alongside its own staged sibling); `GET
+  /api/byok/{ticker}/{report,context,policy,patterns}` +
+  `POST /api/byok/{ticker}/synthesis` mirror the owner/guest staged pipeline
+  exactly, letting the frontend offer a self-funded visitor the same
+  à-la-carte module selection (`ui.showCostModal`'s owner branch, reused
+  as-is — `tier: 'owner'` there only selects that UI mode, it is not a claim
+  about who the caller is). The staged routes live **after** `SynthesisBody`
+  in `api.py`, not near `/api/demo` where they'd read more naturally —
+  Python evaluates parameter type annotations at def-time, not lazily, so a
+  route referencing that class has to physically follow its definition.
+  `_PATH_BUDGETS`'s `"byok"` bucket is `(20, 300)`, sized for the staged
+  pattern's real usage (5 requests per full run), not the one-shot route
+  alone. Frontend: `state.selfKey` in `app.js` is a plain module-scope
+  variable, never `localStorage`/`sessionStorage` — `AGENT_SECRET` was moved
+  off exactly that kind of storage once its XSS-readability was recognised
+  as a real risk, and a visitor's own paid key gets at least the same
+  caution; lost on refresh, by design. `runSelfKeyResearch()` is its own
+  loop in `app.js`, not a branch inside `research()`'s owner/guest one — that
+  loop's `budget`/`bound`/`stage`/`expired` error kinds are guest-allowance
+  concepts with no meaning for a caller who has no allowance at all.
+  `scripts/verify_byok_visitor.py` proves a malformed key never reaches
+  `run_perplexity_research`, `run_research_module`, or `run_synthesis` (three
+  separate counting stubs, not one shared assumption) and that no successful
+  call's response — one-shot or any of the five staged ones — ever contains
+  the raw key.
+- **`PROVIDER_KEY_NAMES` and `PERSISTENT_PROVIDERS` (`tools/setup_wizard.py`)
+  are two different scopes, not one list and a subset comment.**
+  `PROVIDER_KEY_NAMES` is the full map (`perplexity`, `groq`, `gemini`) —
+  `_byok_auth()` checks membership here, so all three are reachable via
+  `/api/byok/*`. `PERSISTENT_PROVIDERS = ("perplexity", "groq")` is the
+  narrower one — the CLI wizard's prompt and `POST /api/settings/provider-key`
+  both check *this* one, and that second check is what actually keeps a
+  Gemini key out of `.env`/CONFIG, not just the fact that the wizard's own
+  UI never shows it. **Using `PROVIDER_KEY_NAMES` in a future check that
+  should have used `PERSISTENT_PROVIDERS` silently reopens exactly the
+  BYOK-only boundary Phase 4 was built to hold.** `_get_provider()` itself
+  changed shape for this: it now returns a 5-tuple
+  (`client, main_model, debate_model, provider_name, extra_body`) — every
+  call site unpacks all five, even the ones (like `run_portfolio_outlook`,
+  owner-only, no override) that only ever get `extra_body=None` back.
+- **`_call()`'s failure matcher must never test a bare `"invalid"`, and the
+  one branch that says "the key was rejected" is the one that most needs to
+  log the provider's own message.** Both rules were learned the expensive
+  way. Gemini shipped with `_GEMINI_MAIN = "gemini-3-flash"` — not a real
+  model id (Google publishes `gemini-3.7-flash`, `-3.6-`, `-3.5-`, and a
+  `gemini-3-flash-preview`, but no bare `gemini-3-flash`) — *and* with an
+  `extra_body` the endpoint rejects. Either alone breaks every Gemini call.
+  What made it cost two of a user's real API keys instead of five minutes:
+  Google's OpenAI-compat layer reports request-shape faults in OpenAI's
+  taxonomy (`invalid_request_error`, `INVALID_ARGUMENT`), the matcher tested
+  `"invalid" in err`, so **every** shape fault landed in the auth branch —
+  the single branch that also declined to log the real message. The user was
+  told "the key was rejected" for a typo in a constant, twice, with the
+  evidence discarded. Now: `auth` matches only real credential signals,
+  `not_found` and `bad_request` are their own reasons whose
+  `_PROVIDER_REASON_TEXT` entries say **"not your key — report this"**
+  outright, and every branch logs the provider message with the client's own
+  `api_key` redacted out of it first. Two matcher subtleties, both found live
+  and both pinned in `verify_access.py`: 429 is checked **before** auth
+  because Google's `RESOURCE_EXHAUSTED` carries permission-flavoured wording,
+  and auth matches `("api key" in err and "valid" in err)` rather than a
+  literal phrase because Google sends *both* `API key not valid. Please pass
+  a valid API key.` **and** a bare `Please pass a valid API key` — the latter
+  at HTTP 400 with `INVALID_ARGUMENT` and no `401` anywhere, so a
+  fixed-phrase match filed a genuinely bad key under "report this to the
+  operator". `verify_access.py` pins the whole boundary in both directions:
+  a shape fault must never read as auth, and a real key rejection must still
+  read as auth despite carrying `INVALID_ARGUMENT` too.
+- **Model Court (`POST /api/model-court/{ticker}`) is session-gated, not
+  anonymous — the one BYOK route family that isn't.** Every other `/api/byok/*`
+  route works with no session at all; this one requires `require_session`
+  (owner **or** guest — deliberately not `require_owner`, since a guest's
+  existing entitlements don't need to extend here for the gate to be
+  "authenticated caller"). The reason is the two-key surface, not the cost:
+  the caller supplies **both** `X-Perplexity-Key` and `X-Gemini-Key` fresh on
+  every call, same never-persisted guarantee as every other BYOK path, and
+  neither key touches the guest dive budget or `os.environ`. **This is an
+  interim gate, stated as one in code and here** — a real paid-membership/
+  access-code system was explicitly requested for later and is written down
+  in the plan's Deferred section, not built. Don't read "requires a session"
+  as "requires payment"; today it only means "not a total stranger."
+  `run_model_court()` (`tools/perplexity_research.py`) runs
+  `run_perplexity_research(ticker, question, override=(...))` for both
+  providers **in parallel** via `ThreadPoolExecutor(max_workers=2)` — same
+  pattern `api_portfolio()` already uses for concurrent yfinance calls, not
+  new infrastructure. **Degradation is graceful by design, not
+  all-or-nothing**: if one provider fails, the working side's result still
+  comes back with the failure named, and the comparison stage is explicitly
+  skipped with a `comparison_note` saying why — never silently dropped, never
+  promoted to a hard error. The comparison call itself only runs when *both*
+  succeed, reuses the caller's own Perplexity key/client (already supplied,
+  already the higher-fidelity provider), and both reports are fenced through
+  `sanitize_prompt_text()` before reaching that prompt — a live web search
+  result is exactly as untrusted as the posted synthesis body Phase 3 already
+  fences, just arriving from a different upstream. The rate-limit bucket is
+  the existing `heavy` one (10/60, `/api/portfolio`'s) — reused deliberately,
+  not a new bucket, because this is session-gated like the routes already in
+  that bucket, not anonymous like `/api/byok/*`'s own `byok` bucket.
+  **`scripts/verify_byok_visitor.py`'s section 7 stubs
+  `tools.perplexity_research.run_perplexity_research` and `._call` directly
+  on the module object** — patching `api.run_perplexity_research`, which is
+  enough for the one-shot BYOK route, would not be seen by `run_model_court`,
+  since it calls those names as its own module's globals, not through
+  whatever `api.py` imported.
+- **`run_perplexity_research()`'s return dict does NOT carry a top-level
+  `error` key for the single most common real-world failure — a bad or
+  expired provider key.** It only gains one for a *structural* failure
+  (bad ticker, no provider configured). A runtime failure inside `_call()`
+  (auth/ratelimit/timeout) instead produces a normal-shaped, "successful"
+  dict where `report` holds a friendly string
+  ("Research generation failed — check your ... key and try again.") — fine
+  for this function's original two callers (the legacy one-shot route, the
+  BYOK one-shot route), which just display `report` as-is and never needed
+  to tell the two failure kinds apart programmatically. **This shipped as a
+  real, live bug in Model Court**, found only by live-testing with a
+  deliberately bad key rather than trusting unit-test stubs (the original
+  stubs modelled failure as `{"error": ...}`, a shape the real function
+  never actually produces for this case — passing tests that gave false
+  confidence). The bug's effect: `run_model_court`'s `pplx_ok`/`gemini_ok`
+  read `True` on a bad key, so the "one side failed, skip comparison"
+  degradation never fired, AND a third paid comparison call fired anyway,
+  comparing two "generation failed" strings to each other — real money spent
+  on a call that could never produce anything useful. **The fix**:
+  `run_perplexity_research()` gained an optional `status: dict | None`
+  parameter, mirroring `_call()`'s own `status` pattern exactly — populated
+  with `{"failed": True, "reason": ...}` on any of the three failure paths,
+  `reason` passed through from `_call()`'s own vocabulary
+  (`auth`/`ratelimit`/`timeout`/`no_provider`/`empty`/`error`) rather than
+  re-described. Every existing caller passes nothing and is 100% unaffected
+  — the return shape for `report`/the top-level dict is byte-for-byte
+  unchanged for them. `run_model_court` is the first and only caller that
+  passes `status`, folding a failure into the result dict's `error` key
+  itself (translated through `_PROVIDER_REASON_TEXT` into a short human
+  phrase — "the key was rejected", not the bare word "auth" — since unlike
+  `run_research_module`/`run_synthesis`, which deliberately generalise every
+  reason because a guest must never be told to fix the *owner's* `.env`,
+  Model Court's failure is about the *caller's own* key, so naming it is the
+  actionable, correct thing to do here specifically) so downstream code
+  never needs to know a second `status` argument exists.
+  **A second, related bug this fix immediately surfaced**: `api.js`'s
+  `runModelCourt()` wrapped its response in `throwIfErrorField()` — a helper
+  built for routes where a 200-with-`error` means the whole call was
+  worthless (no provider configured, nothing else in the body usable). Once
+  the first fix made the "both providers failed" response correctly carry a
+  top-level `error`, this helper started throwing on it, discarding the
+  useful `perplexity`/`gemini` sub-objects and replacing three intended
+  failure sections with one contentless "FAILED" toast — the opposite of
+  `run_model_court`'s whole point. `runModelCourt()` no longer wraps in
+  `throwIfErrorField`; a genuine request-level failure (bad key format, no
+  session, disabled instance, 500) is still a non-2xx status and still
+  throws, from the unconditional check in `request()` itself — that check
+  runs before `throwIfErrorField` would ever be reached, so removing the
+  wrapper loses no real error handling. **Together these are why Model Court
+  needed a live pass with an intentionally bad key, not just harness
+  coverage with idealized stubs** — both bugs were invisible to the original
+  109-assertion suite because its own failure-simulating stub returned the
+  same wrong shape the code was wrongly designed around; fixing the stub to
+  match the *real* function's contract is what let the harness catch the
+  regression on the next run.
+- **The self-key staged BYOK pipeline (`/api/byok/{ticker}/{report,context,
+  policy,patterns,synthesis}`) had the identical generic-message bug as
+  Model Court's, in `_byok_module_response()` and `api_byok_synthesis()` —
+  found the same way, from a live report** (a real Gemini key producing
+  nothing more useful than "the research provider is unavailable right
+  now" on every stage, with no way to tell a bad key from a rate limit from
+  anything else). Both functions took `run_research_module()`/
+  `run_synthesis()`'s own `result["error"]` — the deliberately generic text
+  meant to protect the *operator's* `.env` from a guest — and forwarded it
+  verbatim in the 502 response, silently dropping the `result["reason"]`
+  field that was sitting right there in the same dict. Same fix, same
+  reused vocabulary: both now translate through `_PROVIDER_REASON_TEXT`
+  (renamed from `_MODEL_COURT_REASON_TEXT` once it had two callers) before
+  building the response — since this is the caller's own key, not the
+  owner's, specificity is safe here for the same reason it's safe in Model
+  Court. `scripts/verify_byok_visitor.py` section 6 gained two new checks
+  (a failing module stub, a failing synthesis stub, both keyed on `reason`)
+  — the existing section only ever stubbed the *success* shape for these
+  two functions, so this exact regression had zero test coverage before.
 - **An unknown ticker returns HTTP 200 with all-null fields.** yfinance does
   not error on a bogus symbol, so a null `price` is the only reliable
   "no such ticker" signal.
@@ -452,12 +707,15 @@ scripts/verify_proxy_trust.py     TRUST_PROXY hop-count boundary
 scripts/verify_consistency.py     one quantity, one value — P&L rounding and ?v=
 scripts/verify_ticker_validation.py  every ticker write goes through the validator
 scripts/verify_docs.py            this file has not drifted from the tree
+scripts/verify_onboarding.py      the setup wizard's .env writer, and what /health leaks
+scripts/verify_byok_visitor.py    anonymous self-funded research: opt-in, key-scoped, never persisted;
+                                   also Model Court: session gate, dual-key, graceful degradation
 ```
 
 One line to run the free set:
 
 ```
-python scripts/verify_access.py && python scripts/verify_hardening.py && python scripts/verify_proxy_trust.py && python scripts/verify_consistency.py && python scripts/verify_docs.py && python scripts/verify_ticker_validation.py
+python scripts/verify_access.py && python scripts/verify_hardening.py && python scripts/verify_proxy_trust.py && python scripts/verify_consistency.py && python scripts/verify_docs.py && python scripts/verify_ticker_validation.py && python scripts/verify_onboarding.py && python scripts/verify_byok_visitor.py
 ```
 
 `verify_access.py` is the one to extend when touching auth. Its cost safety is

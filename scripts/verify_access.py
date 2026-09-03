@@ -800,12 +800,107 @@ def main():
         ("Error code: 429 - rate limit",      "ratelimit", False),
         ("Request timeout after 30s",         "timeout", True),
         ("connection reset by peer",          "error", True),
+        # Billing exhaustion is NOT a rate limit, though both are 429
+        # RESOURCE_EXHAUSTED. Seen live from Gemini as "Your prepayment
+        # credits are depleted." Reporting it as a rate limit tells the
+        # reader to wait and retry against an account that will never serve
+        # them until it is topped up. Nothing was billed, so a guest's stage
+        # is refunded either way (cost_incurred False).
+        ("Error code: 429 - {'error': {'message': 'Your prepayment credits are "
+         "depleted.', 'status': 'RESOURCE_EXHAUSTED'}}", "quota", False),
+        ("Error code: 429 - You exceeded your current quota", "quota", False),
     ]:
         st = {}
         out = pr._call("p", client=_Boom(msg), status=st)
         check(f"_call reports reason={reason} for {msg[:22]!r}", st.get("reason"), reason)
         check(f"...and cost_incurred={cost}", st.get("cost_incurred"), cost)
         check("...and still returns a string for the callers that want one", out, "")
+
+    # ── The misclassification that blamed a user's key for our own typo ────
+    # _GEMINI_MAIN shipped as "gemini-3-flash", which is not a real model id.
+    # Google's OpenAI-compat layer wraps request-shape faults in OpenAI's
+    # taxonomy — `invalid_request_error`, `INVALID_ARGUMENT` — and _call's old
+    # matcher tested a bare `"invalid" in err`, so EVERY such fault landed in
+    # the auth branch and surfaced as "the key was rejected". Two good keys
+    # were rotated chasing it. These cases pin the boundary: a fault in OUR
+    # request must never be reported as the caller's credential.
+    for msg, reason, label in [
+        ("Error code: 404 - {'error': {'message': 'models/gemini-3-flash is not found "
+         "for API version v1beta', 'status': 'NOT_FOUND'}}", "not_found", "a wrong model id"),
+        ("Error code: 400 - {'error': {'message': 'Invalid JSON payload received.', "
+         "'type': 'invalid_request_error'}}", "bad_request", "a malformed request body"),
+        ("Error code: 400 - {'error': {'status': 'INVALID_ARGUMENT', 'message': "
+         "'Request contains an invalid argument.'}}", "bad_request", "a bare INVALID_ARGUMENT"),
+    ]:
+        st = {}
+        pr._call("p", client=_Boom(msg), status=st)
+        check(f"{label} reports reason={reason}, NOT auth", st.get("reason"), reason)
+        check("...and is never billed", st.get("cost_incurred"), False)
+        # Substring-matched against the BLAMING phrasings specifically, not a
+        # bare "your key" — the correct text says "not your key", which of
+        # course contains "your key". That naive check is what this line was
+        # first written as, and it failed on correct copy.
+        _txt = pr._PROVIDER_REASON_TEXT[reason].lower()
+        check(f"...and {label} never tells the caller to check their key",
+              any(p in _txt for p in ("check your key", "the key was rejected",
+                                      "your key was rejected")), False)
+        check(f"...and {label} says outright it is this server's fault",
+              "not your key" in pr._PROVIDER_REASON_TEXT[reason].lower(), True)
+
+    # The genuine credential rejection Google actually sends — which ALSO
+    # carries INVALID_ARGUMENT — must still read as auth. Tightening the
+    # matcher above must not have thrown out the real case with the false one.
+    for _msg, _label in [
+        ("Error code: 400 - {'error': {'message': 'API key not valid. Please pass a "
+         "valid API key.', 'status': 'INVALID_ARGUMENT'}}", "'API key not valid'"),
+        # Google's OTHER wording for the same thing — HTTP 400, INVALID_ARGUMENT,
+        # no 401 and no "not valid" anywhere. Caught live: the first pass at the
+        # tightened matcher missed it and filed a genuinely bad key under
+        # bad_request, i.e. told the caller to report OUR bug for THEIR typo.
+        ("Error code: 400 - {'error': {'message': 'Please pass a valid API key', "
+         "'status': 'INVALID_ARGUMENT'}}", "bare 'Please pass a valid API key'"),
+    ]:
+        st = {}
+        pr._call("p", client=_Boom(_msg), status=st)
+        check(f"a real {_label} is STILL auth, despite INVALID_ARGUMENT",
+              st.get("reason"), "auth")
+
+    # "wait and retry" vs "retrying cannot help" must not read alike.
+    check("quota exhaustion tells the reader retrying will NOT help",
+          "will not help" in pr._PROVIDER_REASON_TEXT["quota"].lower(), True)
+    check("...while a real rate limit DOES tell them to retry",
+          "retry" in pr._PROVIDER_REASON_TEXT["ratelimit"].lower(), True)
+    check("...and quota is never mistaken for the caller's key being bad",
+          "key" in pr._PROVIDER_REASON_TEXT["quota"].lower(), False)
+
+    # The model id itself. A harness cannot ask Google what exists, but it can
+    # refuse to let the exact retired string come back.
+    check("_GEMINI_MAIN is not the bogus 'gemini-3-flash'",
+          pr._GEMINI_MAIN, "gemini-3.7-flash")
+    check("_GEMINI_FAST likewise", pr._GEMINI_FAST, "gemini-3.7-flash")
+
+    # The key must never reach a log line, including the new message logging.
+    class _BoomKeyed(_Boom):
+        api_key = "gsk_" + "s" * 40
+
+    import logging as _logging
+    _cap = []
+
+    class _Cap(_logging.Handler):
+        def emit(self, rec):
+            _cap.append(rec.getMessage())
+
+    _h = _Cap()
+    pr.logger.addHandler(_h)
+    try:
+        pr._call("p", client=_BoomKeyed("Error code: 401 - key gsk_" + "s" * 40 + " rejected"),
+                 status={})
+    finally:
+        pr.logger.removeHandler(_h)
+    check("CONTROL: the new failure logging does emit the provider message",
+          any("rejected" in m for m in _cap), True)
+    check("...but the caller's key is redacted out of it",
+          any("gsk_" + "s" * 40 in m for m in _cap), False)
 
     # The route turns that into a 502 with a code, not a 200 with prose.
     prov_key = store.create_guest_key("provider@example.com")[1]

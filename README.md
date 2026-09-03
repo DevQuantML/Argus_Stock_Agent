@@ -243,14 +243,21 @@ source .venv/bin/activate        # Bash / macOS / Linux
 # Windows PowerShell: .venv\Scripts\Activate.ps1
 
 pip install -r requirements.txt
-cp .env.example .env             # then edit .env — see below
 ```
 
-Run the web terminal:
+Run the web terminal — no `.env` needed yet, the first run creates one for you:
 
 ```bash
 uvicorn api:app --host 0.0.0.0 --port 8000 --workers 1 --no-proxy-headers
 ```
+
+The console prints a freshly generated `AGENT_SECRET` the first time you run
+this with no `.env` present. Copy it, open `http://localhost:8000`, click
+**I HAVE A KEY**, and paste it in — you're now unlocked as the owner. From
+there, open **◈ CONFIG** to connect a free Groq key or a paid Perplexity key
+entirely from the browser — no file editing required at any point. See
+[docs/SETUP.md](docs/SETUP.md) for the full walkthrough, including
+`python main.py setup` (a CLI alternative) and the manual `.env` path.
 
 > **Neither flag is optional, and both fail silently.**
 >

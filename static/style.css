@@ -754,7 +754,7 @@ input::placeholder{color:var(--txt-muted);opacity:.7;}
 .gate{display:none;}
 .gate.on{
   display:flex;position:fixed;inset:0;z-index:120;
-  align-items:center;justify-content:center;padding:20px;overflow-y:auto;
+  justify-content:center;padding:20px;overflow-y:auto;
   background:var(--bg);
   background-image:
     repeating-linear-gradient(0deg,transparent 0,transparent 39px,rgba(13,20,32,.5) 39px,rgba(13,20,32,.5) 40px),
@@ -764,6 +764,17 @@ input::placeholder{color:var(--txt-muted);opacity:.7;}
   width:460px;max-width:100%;background:var(--bg-panel);
   border:1px solid var(--border-hi);padding:26px;
   box-shadow:0 20px 70px rgba(0,0,0,.8);
+  /* margin:auto 0, not .gate.on's align-items:center, on purpose: a
+     flex container that centers an overflowing child on the cross axis
+     clips the start of that child outside the scrollable range — a well-
+     known trap (the child renders symmetrically past both edges, but
+     overflow:auto only ever lets you scroll toward the END). Auto margins
+     center a SHORT box exactly the same way, but collapse to 0 and scroll
+     normally once the box is taller than the viewport — which BYOK's pane
+     now regularly is. Surfaced by the provider walkthrough: its first
+     spotlighted button was permanently unreachable by scrollIntoView on
+     a scrolled-down gate, not a bug in the walkthrough itself. */
+  margin:auto 0;
 }
 .gate-box.ob{width:600px;}
 .gate-hd{font-size:11px;color:var(--accent);letter-spacing:.14em;margin:0 0 18px;}
@@ -1001,6 +1012,25 @@ textarea.inp{resize:vertical;min-height:58px;line-height:1.6;font-family:var(--m
 #tour-body{font-size:9.5px;line-height:1.8;color:var(--txt);margin:0;}
 .tour-nav{display:flex;justify-content:space-between;gap:8px;margin-top:13px;}
 .tour-nav .btn,.tour-nav .btn-g{padding:7px 14px;font-size:8.5px;}
+
+/* ── BYOK provider walkthrough ───────────────────────────────────────────
+   Same coach-mark mechanic as #tour above (spotlight + tooltip + dots), but
+   scoped to the pre-auth landing gate rather than the terminal, so it needs
+   its own z-index: .gate.on is 120, well above #tour's 55, so the real tour
+   would render invisibly BEHIND the gate if reused here. 130 clears it. */
+#byok-tour{position:fixed;inset:0;z-index:130;}
+#byok-tour-spot{
+  position:fixed;pointer-events:none;
+  box-shadow:0 0 0 200vmax rgba(3,5,10,.78);
+  outline:1px solid var(--accent);outline-offset:3px;
+  transition:top .25s ease,left .25s ease,width .25s ease,height .25s ease;}
+#byok-tour.rm #byok-tour-spot{transition:none;}
+#byok-tour-tip{
+  position:fixed;width:min(300px,calc(100vw - 20px));
+  background:var(--bg-panel);border:1px solid var(--border-hi);
+  box-shadow:0 20px 60px rgba(0,0,0,.8);padding:14px;}
+#byok-tour-tip .gate-hd{margin-bottom:8px;}
+#byok-tour-body{font-size:9.5px;line-height:1.8;color:var(--txt);margin:0;}
 
 /* ── Earnings chip + news ─────────────────────────────────────────────── */
 .chip-earn{
