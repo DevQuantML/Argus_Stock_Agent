@@ -5,14 +5,14 @@
    Version query on each import so a redeploy can never pair a fresh app.js
    with a stale cached sub-module. Bump together with the ?v= in index.html. */
 
-import * as api from './api.js?v=37';
-import { drawChart, makeResponsive } from './chart.js?v=37';
-import { renderMarkdown, escapeHtml } from './md.js?v=37';
-import * as prefs from './theme.js?v=37';
-import * as ui from './ui.js?v=37';
-import * as views from './views.js?v=37';
-import * as tour from './tour.js?v=37';
-import { DISCLAIMER, FRESHNESS_NOTE, guestAllowanceLine } from './copy.js?v=37';
+import * as api from './api.js?v=38';
+import { drawChart, makeResponsive } from './chart.js?v=38';
+import { renderMarkdown, escapeHtml } from './md.js?v=38';
+import * as prefs from './theme.js?v=38';
+import * as ui from './ui.js?v=38';
+import * as views from './views.js?v=38';
+import * as tour from './tour.js?v=38';
+import { DISCLAIMER, FRESHNESS_NOTE, guestAllowanceLine } from './copy.js?v=38';
 
 const $  = ui.$;
 const $$ = ui.$$;
@@ -1753,6 +1753,19 @@ function openConfig() {
 
 function wire() {
   $('btn-exec').onclick = () => { const v = $('cmd').value; $('cmd').value = ''; runCommand(v); };
+  // Click-only path to Model Court — EXECUTE's own meaning never changes
+  // (a bare ticker there still always means research). Reuses runCommand's
+  // own ticker-normalization regex and the CMDS word list so this works
+  // identically whether the box holds a bare ticker, `research PLTR`, or
+  // `court PLTR` already — the leading command word (if any) is stripped.
+  $('btn-court').onclick = () => {
+    const tokens = $('cmd').value.trim().split(/\s+/).filter(Boolean);
+    const sym = (CMDS.includes((tokens[0] || '').toLowerCase()) ? tokens[1] : tokens[0]) || '';
+    const t = sym.toUpperCase().replace(/[^A-Z0-9.=-]/g, '');
+    if (!t) { ui.toast('Type a ticker first, e.g. PLTR', 'warn'); return; }
+    $('cmd').value = '';
+    runModelCourt(t);
+  };
   $('btn-cfg').onclick  = openConfig;
   $('btn-data').onclick = () => ui.showDataModal(state.health, state.info);
 

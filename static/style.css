@@ -131,6 +131,7 @@ input::placeholder{color:var(--txt-muted);opacity:.7;}
 }
 .btn-g:hover{border-color:var(--border-hi);color:var(--txt);background:var(--bg-hover);}
 .btn-g.on{border-color:var(--accent-dim);color:var(--accent);}
+.btn-sub{display:block;font-size:7px;color:var(--txt-muted);letter-spacing:.05em;margin-top:1px;}
 
 .btn-danger{
   background:transparent;border:1px solid var(--red);color:var(--red);
