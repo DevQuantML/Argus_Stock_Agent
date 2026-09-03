@@ -419,6 +419,73 @@ js/tour.js            five-step coach-mark orientation (no imports, no network)
   (a failing module stub, a failing synthesis stub, both keyed on `reason`)
   — the existing section only ever stubbed the *success* shape for these
   two functions, so this exact regression had zero test coverage before.
+- **`run_perplexity_research()` leaked the operator's real position data through
+  the anonymous BYOK route — found live, on the actual deployed instance, not
+  by review.** `get_price_and_fundamentals()` unconditionally injects
+  `my_position`/`watchlist` into `stock` whenever the ticker matches a live
+  holding — correct for the owner's own authenticated call, and already
+  stripped once for `run_demo()`'s public `/api/demo/{ticker}` (see the
+  gotcha above). That strip never covered `run_perplexity_research()`, so
+  `GET /api/byok/{ticker}` — fully anonymous, no session, reachable the
+  moment `ALLOW_BYOK_VISITORS=1` — returned real shares, avg cost, thesis
+  text and stop-loss for any caller who guessed a ticker the operator holds.
+  Model Court reaches the same function with `override` set too, so an
+  authenticated owner loses their own position context there as well — an
+  accepted, minor UX cost for one invariant ("BYOK-funded research never
+  carries book context") rather than two different rules for two different
+  `override` callers. Fixed the same way as the `run_demo()` precedent: strip
+  `my_position`/`watchlist` from `stock` immediately after
+  `_get_local_bundle()`, gated on `override` being truthy — `override`
+  already means "this call is funded by a caller-supplied key, not the
+  owner's own configured provider" everywhere else in this file, so it is the
+  correct signal here too, not a new one invented for this fix. Confirmed the
+  rest of the blast radius is clean: `run_research_module()` and
+  `run_synthesis()` never expose raw `stock` at all, and `_build_context()`
+  builds prose that never references either key, so there is no indirect
+  leak through LLM-generated text. `scripts/verify_hardening.py` section 6b
+  reuses the same planted `secret_thesis`/`secret_watch_note` markers as the
+  `/api/demo` disclosure test and hits `/api/byok/AAPL` and `/api/byok/MSFT`
+  anonymously with `ALLOW_BYOK_VISITORS=1` forced on, asserting the response
+  carries neither key nor the planted secret text — stubbing `_call` rather
+  than `run_perplexity_research` itself, so the real strip logic actually
+  executes under test. **This was found by curling the live deployment after
+  redeploying, not by re-reading the diff** — the discipline that caught it.
+- **A Dockerfile refactor can make an existing hardening check pass for the
+  wrong reason.** Moving the real `uvicorn` invocation out of `Dockerfile`
+  and into `docker-entrypoint.sh` (see the non-root/volume-ownership gotcha
+  below) silently blinded `verify_hardening.py`'s pre-existing "every launch
+  command disables proxy headers" check: it scans `Dockerfile`/`README.md`/
+  `docs/HANDOFF.md` for lines starting with `"uvicorn "` or `"CMD ["`, and
+  after the refactor `Dockerfile` contains neither — the check found zero
+  matching lines and passed with an empty `bad` list, which reads identical
+  to "everything found was compliant." Caught by asking why a check still
+  passed after a change that should have affected it, not by trusting the
+  green result. Fixed by adding a second, content-based check that reads
+  `docker-entrypoint.sh` directly and asserts its `uvicorn api:app` line
+  carries `--no-proxy-headers` — verified with a genuine positive control
+  (temporarily stripped the flag, confirmed the new check FAILs, restored
+  the file and diffed it against the committed version to confirm exact
+  restoration) rather than assumed to work from reading the code.
+- **A non-root Docker image and a platform-mounted volume (Railway's
+  included) fight each other unless something chowns the mount after the
+  platform creates it.** The volume is created root-owned at container start
+  regardless of what `USER` the image declares, so `appuser` had no
+  permission to write the database path — `store.bootstrap()` failed with
+  "unable to open database file" on first deploy, even though the exact same
+  image ran fine locally without a mounted volume. Fixed via
+  `docker-entrypoint.sh`: the `Dockerfile` no longer sets `USER appuser` at
+  build time (that would make the chowning step itself non-root, unable to
+  fix the very problem it exists to fix); instead the entrypoint runs as
+  root just long enough to `mkdir -p`+`chown` the database directory, then
+  `exec su -s /bin/sh appuser -c "uvicorn ..."` — `su` without the `-`/login
+  flag preserves the environment by default, which matters here because it
+  is what carries Railway's injected `PORT`/`ARGUS_DB`/etc. through to the
+  actual application process. The chown is best-effort (`|| true`) — some
+  platforms mount an already-writable volume, or restrict `chown` even for
+  root — and a directory still unwritable after this step surfaces its own
+  clear `store.bootstrap()` error, which is the right failure mode. Root's
+  involvement ends at that one line; the process that actually handles
+  network traffic still never runs as root.
 - **An unknown ticker returns HTTP 200 with all-null fields.** yfinance does
   not error on a bogus symbol, so a null `price` is the only reliable
   "no such ticker" signal.

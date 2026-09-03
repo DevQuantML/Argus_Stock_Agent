@@ -1137,6 +1137,24 @@ def run_perplexity_research(ticker: str, question: str | None = None,
     logger.info("run_perplexity_research: gathering local data for %s (provider=%s)", ticker, provider)
     stock, quant, brent, context = _get_local_bundle(ticker)
 
+    # get_price_and_fundamentals() injects the operator's real position
+    # whenever the ticker matches a live holding — correct for the owner's
+    # OWN authenticated call (no override), the exact bug already fixed once
+    # for run_demo()'s public /api/demo/{ticker}. `override` truthy means
+    # this call is funded by a caller-supplied key, not the owner's own
+    # configured provider — the anonymous one-shot BYOK route
+    # (GET /api/byok/{ticker}) reaches this with NO session at all, so
+    # without this strip, any caller who could guess a ticker the operator
+    # holds got back real shares, cost basis, thesis text and stop-loss —
+    # live-verified against a real deploy, not caught by review. Model
+    # Court also passes override (it is BYOK too, just session-gated), so an
+    # authenticated owner loses their own position context there as well —
+    # an accepted, minor UX cost for one invariant ("BYOK-funded research
+    # never carries book context") rather than two different rules for two
+    # different override callers.
+    if override:
+        stock = {k: v for k, v in stock.items() if k not in ("my_position", "watchlist")}
+
     # ── Step 5: Main research ──────────────────────────────────────────────
     logger.info("run_perplexity_research: calling %s/%s for %s", provider, main_model, ticker)
     prompt = _research_prompt(ticker, context, question)

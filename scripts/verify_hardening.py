@@ -332,6 +332,28 @@ def main():
                 bad.append(s)
         check(f"{name}: every uvicorn command disables proxy headers", bad, [])
 
+    # docker-entrypoint.sh — the real uvicorn invocation moved here once the
+    # Dockerfile stopped using a plain CMD (needed to chown a mounted volume
+    # for the non-root user before dropping privileges; see that file's own
+    # comment). The Dockerfile/README/HANDOFF loop above only matches a line
+    # that STARTS WITH "uvicorn " or "CMD [", which is deliberately narrow to
+    # avoid flagging prose that merely mentions the command — but that same
+    # narrowness makes it blind to this file, where the real invocation sits
+    # embedded inside `exec su ... -c "uvicorn api:app ..."`. Without this,
+    # the Dockerfile loop finds zero command-shaped lines here, reports
+    # bad=[] (vacuously "clean"), and the guard silently stops guarding the
+    # one file that actually launches the server. A shell script has no
+    # prose-vs-command ambiguity to worry about — every line is real script
+    # content — so this checks CONTENT, not line-start shape.
+    entry_path = root / "docker-entrypoint.sh"
+    if entry_path.exists():
+        entry_text = entry_path.read_text(encoding="utf-8")
+        check("docker-entrypoint.sh: does contain the real uvicorn invocation",
+              "uvicorn api:app" in entry_text, True)
+        uvicorn_lines = [ln for ln in entry_text.splitlines() if "uvicorn api:app" in ln]
+        bad_entry = [ln for ln in uvicorn_lines if "--no-proxy-headers" not in ln]
+        check("docker-entrypoint.sh: that invocation disables proxy headers", bad_entry, [])
+
     # ── 6. /api/demo must never carry the operator's real book ────────────
     # get_price_and_fundamentals() is shared between the public, unauthenticated
     # demo path and the authenticated portfolio/research paths, and it injects
@@ -382,6 +404,51 @@ def main():
             os.environ.pop("AGENT_SECRET", None)
         else:
             os.environ["AGENT_SECRET"] = prev_secret
+
+    # ── 6b. The SAME disclosure, via the anonymous one-shot BYOK route ──────
+    # /api/demo/{ticker} was fixed for this once (section 6, above) — but
+    # GET /api/byok/{ticker} shares NONE of that route's code. It calls
+    # run_perplexity_research() directly, which — until now — never stripped
+    # my_position/watchlist at all, on ANY caller. Found live: a real deploy,
+    # queried anonymously with no session and a throwaway fake key, returned
+    # the operator's real shares, cost basis, and thesis text in the JSON.
+    # run_perplexity_research() now strips both whenever `override` is
+    # truthy (a caller-supplied key, never the owner's own configured
+    # provider) — this exercises the REAL function end to end, stubbing only
+    # the network call (_call), not run_perplexity_research itself, so the
+    # strip actually has to fire for this to pass.
+    import tools.perplexity_research as pr_mod
+    prev_byok = os.getenv("ALLOW_BYOK_VISITORS")
+    os.environ["ALLOW_BYOK_VISITORS"] = "1"
+    real_call = pr_mod._call
+    pr_mod._call = lambda *a, **k: "stubbed report text"
+    try:
+        r_byok_pos = client.get("/api/byok/AAPL", headers={
+            "X-Provider": "groq", "X-Provider-Key": "gsk_" + "z" * 40})
+        check("anonymous BYOK on a held ticker still returns 200", r_byok_pos.status_code, 200)
+        byok_stock = r_byok_pos.json().get("stock", {})
+        check("BYOK response carries no my_position key", "my_position" in byok_stock, False)
+        check("BYOK response body never contains the real thesis text",
+              secret_thesis in r_byok_pos.text, False)
+
+        r_byok_watch = client.get("/api/byok/MSFT", headers={
+            "X-Provider": "groq", "X-Provider-Key": "gsk_" + "z" * 40})
+        check("anonymous BYOK on a watched ticker still returns 200", r_byok_watch.status_code, 200)
+        byok_watch_stock = r_byok_watch.json().get("stock", {})
+        check("BYOK response carries no watchlist key", "watchlist" in byok_watch_stock, False)
+        check("BYOK response body never contains the real watch note",
+              secret_watch_note in r_byok_watch.text, False)
+    finally:
+        pr_mod._call = real_call
+        if prev_byok is None:
+            os.environ.pop("ALLOW_BYOK_VISITORS", None)
+        else:
+            os.environ["ALLOW_BYOK_VISITORS"] = prev_byok
+
+    # Clean up the planted position/watch row — later sections assert on a
+    # known-empty book, and this one must not leak state into them.
+    store.delete_position("AAPL")
+    store.delete_watch("MSFT")
 
     # ── 7. Owner-session revocation kills OTHER sessions, keeps the caller's own
     # revoke-all only ever targeted guest sessions — there was no way to cut off
