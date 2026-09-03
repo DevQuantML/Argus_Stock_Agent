@@ -1,10 +1,12 @@
 """
 api.py — FastAPI HTTP wrapper for cloud deployment.
 
-Once deployed, call your agent via HTTP from anywhere:
-    curl "https://your-app.railway.app/api/demo/PLTR"
-    curl -H "X-Agent-Key: $AGENT_SECRET" https://your-app.railway.app/api/research/PLTR
-    curl "https://your-app.railway.app/health"
+Once deployed, call your agent via HTTP from anywhere (this URL shape works
+identically whether the deploy target is Cloud Run, Railway, Fly, or Render —
+only the domain changes):
+    curl "https://your-app.example.com/api/demo/PLTR"
+    curl -H "X-Agent-Key: $AGENT_SECRET" https://your-app.example.com/api/research/PLTR
+    curl "https://your-app.example.com/health"
 
 Run locally:
     uvicorn api:app --reload
