@@ -50,6 +50,33 @@ from fastapi import BackgroundTasks, Depends, FastAPI, Header, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 
+# ── Postgres backend seam ────────────────────────────────────────────────
+# Chooses the storage backend ONCE, before anything in this process imports
+# `store` — including the plain `import store` two lines below, and the
+# internal `import store` inside tools/perplexity_research.py and
+# tools/stock_data.py (both imported further down this file). Python checks
+# sys.modules before ever touching the filesystem, so pre-registering the
+# name here makes every one of those imports resolve to the SAME module
+# object — real shared state, not a copy — without any of those three files
+# needing a conditional of their own. This MUST run before the first
+# `import store` anywhere in the process; it sits immediately above that
+# import on purpose, not by accident. (A per-call-site conditional was
+# considered and rejected: it is fragile by construction — a future 4th file
+# that imports `store` and forgets the conditional would silently read a
+# different database than the rest of the running process, the exact shape
+# of bug this codebase has been bitten by before — see the `state.tier`
+# mirror and `?v=` drift gotchas in CLAUDE.md.)
+#
+# store.py (SQLite) is the default and is NEVER edited or replaced when
+# DATABASE_URL is unset — every existing free harness that pokes its
+# internals (store._conn, store.DB_PATH, store._lock) keeps working exactly
+# as before. store_postgres.py (Cloud Run + Cloud SQL) is purely additive,
+# only ever reached when the operator sets DATABASE_URL.
+import sys
+if os.getenv("DATABASE_URL"):
+    import store_postgres
+    sys.modules["store"] = store_postgres
+
 import store
 from config import BRENT_LEVELS, GEO_EVENT_LIBRARY, GEO_TRANSMISSION
 from tools.notify import notify_telegram, start_telegram_reply_listener

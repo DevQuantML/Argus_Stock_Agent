@@ -926,6 +926,17 @@ def save_research_run(ticker: str, mode: str, tier: str,
     `guest_key_id IS ?` (not `=`) is deliberate: SQL `=` never matches NULL
     against NULL, so an owner row (guest_key_id always NULL) would silently
     fail to scope against itself with `=`. `IS` is the NULL-safe comparison.
+
+    `ORDER BY created_at DESC, id DESC` — found live while building this
+    prune's Postgres sibling (store_postgres.py): `_now()`'s resolution can
+    be coarser than a tight burst of saves lands within, so several rows can
+    share one `created_at` string. `created_at DESC` alone has no tiebreaker
+    then, and this DELETE's own ordering can disagree with
+    list_research_runs()'s separate SELECT on which tied rows count as
+    "newest" — silently pruning a row a caller was just shown as kept. `id`
+    is monotonic by construction (AUTOINCREMENT) and immune to clock
+    resolution, so it is the tiebreaker both this query and
+    list_research_runs()'s use, identically.
     """
     with _lock:
         conn = _connect()
@@ -939,7 +950,7 @@ def save_research_run(ticker: str, mode: str, tier: str,
             """DELETE FROM research_runs WHERE id IN (
                    SELECT id FROM research_runs
                    WHERE ticker = ? AND tier = ? AND guest_key_id IS ?
-                   ORDER BY created_at DESC
+                   ORDER BY created_at DESC, id DESC
                    LIMIT -1 OFFSET ?
                )""",
             (ticker, tier, guest_key_id, RESEARCH_HISTORY_LIMIT),
@@ -956,7 +967,7 @@ def list_research_runs(ticker: str, tier: str, guest_key_id: int | None,
     rows = _rows(
         "SELECT id, ticker, mode, payload, created_at FROM research_runs "
         "WHERE ticker = ? AND tier = ? AND guest_key_id IS ? "
-        "ORDER BY created_at DESC LIMIT ?",
+        "ORDER BY created_at DESC, id DESC LIMIT ?",
         (ticker, tier, guest_key_id, limit),
     )
     return [

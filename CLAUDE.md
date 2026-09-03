@@ -43,7 +43,13 @@ config.py                     MY_PORTFOLIO, WATCHLIST, BRENT_LEVELS, GEO_TRANSMI
                                GEO_EVENT_LIBRARY
 main.py                       CLI: python main.py setup | PLTR | scan | brent
 store.py                      SQLite — positions, watchlist, sessions, profile,
-                              guest keys + dive budget, access requests
+                              guest keys + dive budget, access requests. The
+                              default backend for local dev and every free
+                              harness; never edited or replaced.
+store_postgres.py             Cloud SQL sibling of store.py, same public
+                              surface, only reached when DATABASE_URL is set
+                              (Cloud Run deploy) — see the sys.modules gotcha
+                              below
 tools/perplexity_research.py  the ONLY AI path — prompts, modules, synthesis
 tools/gemini_native.py        Gemini's native endpoint wearing the OpenAI client's shape
                                (grounding is impossible via the compat endpoint)
@@ -759,6 +765,103 @@ js/tour.js            five-step coach-mark orientation (no imports, no network)
   actually run reads into the client-controlled part and silently restores the
   rate-limiter bypass. `scripts/verify_proxy_trust.py` asserts the boundary.
 
+- **`store.py` and `store_postgres.py` are two full sibling implementations
+  of the same function surface, chosen ONCE per process via a `sys.modules`
+  pre-registration in `api.py`, not per-call-site conditionals.** `store.py`
+  isn't only imported by `api.py` — `tools/perplexity_research.py` and
+  `tools/stock_data.py` both call `store.positions()`/`store.watchlist()`
+  directly, at request-serving time. A conditional import repeated at each
+  of those three files would be fragile by construction: a future 4th file
+  that imports `store` and forgets the conditional would silently read a
+  *different* database than the rest of the running process — the same
+  shape of bug as the `state.tier` mirror and `?v=` drift gotchas elsewhere
+  in this file. Instead, `api.py` does this once, before its own first
+  `import store` (which must stay physically after this block, not before):
+  ```python
+  if os.getenv("DATABASE_URL"):
+      import store_postgres
+      sys.modules["store"] = store_postgres
+  import store
+  ```
+  Because Python checks `sys.modules` before ever touching the filesystem,
+  every later `import store` anywhere in the process resolves to the same
+  real module object — genuine shared state, not a copy. A wildcard-import
+  facade (`from store_postgres import *`) was considered and rejected: a
+  function's closure captures its *defining* module's globals, so a test or
+  caller poking `store._conn = None` through a copy-based facade would never
+  be seen by the real backend's own `_connect()`. `store.py` (SQLite) is
+  therefore **never edited or replaced** — it stays exactly what every
+  existing free harness already exercises, and Postgres is purely additive,
+  reached only when the operator sets `DATABASE_URL` (the Cloud Run + Cloud
+  SQL deploy). `main.py` (the CLI) does not import `store` at all and needs
+  no equivalent — confirmed by grep before relying on it.
+- **A Postgres transaction aborts entirely on the first failed statement,
+  and SQLite doesn't work that way.** `store_postgres.py`'s
+  `consume_guest_unit()` deliberately provokes a unique-constraint failure
+  on a genuine race (two concurrent claims of the same guest-dive stage) and
+  catches it in Python — but on Postgres, catching the *exception* does not
+  un-abort the *transaction*: every earlier statement in that same
+  transaction (the `dive_ticker` UPDATE, already correctly bound) would be
+  silently discarded when the surrounding `_txn()` wrapper commits at the
+  end, unless the risky INSERT is wrapped in its own `SAVEPOINT` /
+  `ROLLBACK TO SAVEPOINT` first. store.py's SQLite version needed no
+  equivalent — sqlite3's default transaction handling is more forgiving
+  here. Proven live under real concurrency, not just reasoned about:
+  `scripts/verify_postgres_store.py` fires 8 threads at one stage and
+  asserts exactly one wins.
+- **SQLite `IS ?` (NULL-safe comparison, used to scope an owner row where
+  `guest_key_id` is always NULL) does not translate to Postgres `IS %s`.**
+  Standard SQL `IS` only accepts a literal (`NULL`/`TRUE`/`FALSE`/`UNKNOWN`)
+  on its right side, not a bound parameter — Postgres rejects it as a syntax
+  error. The correct, standard-SQL translation is `IS NOT DISTINCT FROM %s`,
+  used identically in `store_postgres.py`'s `save_research_run()` and
+  `list_research_runs()`.
+- **`ORDER BY created_at DESC` with no tiebreaker is not deterministic
+  under a tie, and research-run saves can tie.** Found live while stress-
+  testing `store_postgres.py`'s retention prune (25 rapid saves in one
+  test loop) — every row landed on the *identical* `created_at` string
+  because the loop ran faster than this system clock's resolution. Without
+  a tiebreaker, the prune's own `DELETE ... OFFSET` and
+  `list_research_runs()`'s separate `SELECT` can each resolve the tie
+  differently, so the prune can discard a row the very next read had just
+  shown as "kept." This is not Postgres-specific — `store.py`'s original
+  SQLite version has the identical `ORDER BY created_at DESC` with no
+  tiebreaker, so both files now sort `created_at DESC, id DESC` — `id` is
+  monotonic by construction and immune to clock resolution. Real production
+  usage (paid research runs, minutes apart) essentially never ties; this
+  was a real latent bug nonetheless, caught only because
+  `verify_postgres_store.py`'s stress test checks *which specific row*
+  survives a prune, not just the surviving count.
+- **Cloud SQL's `db-f1-micro`/`db-g1-small` shared-core tiers require
+  `--edition=enterprise` explicitly** — a newer `gcloud sql instances
+  create` defaults to the `ENTERPRISE_PLUS` edition on at least some
+  projects, which rejects those tier names outright
+  (`Invalid Tier (db-f1-micro) for (ENTERPRISE_PLUS) Edition`). Not a
+  deprecation of the tier itself, just an edition mismatch — pass the flag.
+- **Cloud Run's ephemeral filesystem means `POST /api/settings/provider-key`
+  (the CONFIG-modal path for adding a Groq/Perplexity key without a
+  restart) does not survive an instance recycle on this deploy target.**
+  `write_env_key()` writes to `.env` next to `api.py` inside the container
+  image layer, which was already true on Railway too (only `ARGUS_DB` sat
+  on a mounted volume there) — but Cloud Run's `min-instances=0` scale-to-
+  zero makes a fresh, `.env`-less container far more frequent than a
+  Railway restart ever was. `os.environ[key_name] = ...` still takes effect
+  immediately for the live process, so the change *appears* to work in the
+  same session; a cold start reverts it. Neither the anonymous BYOK route
+  nor Model Court depend on a server-persisted provider key, so this does
+  not block using either feature — it only affects an owner trying to give
+  *this specific instance* its own standing Perplexity/Groq key. A real fix
+  (writing through Secret Manager instead of a local file) is a deliberate
+  future decision, not built as part of this migration.
+- **`--max-instances=1` is still mandatory on Cloud Run even after moving
+  off SQLite.** Postgres itself handles genuine concurrent writers safely
+  (unlike SQLite), so the storage layer alone no longer forces a single
+  instance — but the in-memory rate limiter (`_rate_limit_store`, a plain
+  Python dict) is still per-process, not shared. Autoscaling to more than
+  one Cloud Run instance would let a caller get up to N× the intended
+  request budget by landing on different instances, silently reopening
+  exactly the kind of limiter bypass `TRUST_PROXY` guards against above.
+
 ## Verification harnesses
 
 Every one of these spends nothing. The quant pair reads yfinance statements,
@@ -775,6 +878,9 @@ scripts/verify_consistency.py     one quantity, one value — P&L rounding and ?
 scripts/verify_ticker_validation.py  every ticker write goes through the validator
 scripts/verify_docs.py            this file has not drifted from the tree
 scripts/verify_onboarding.py      the setup wizard's .env writer, and what /health leaks
+scripts/verify_postgres_store.py  store_postgres.py against a REAL local Postgres — the one
+                                   harness here that needs a database running, not free-as-in-
+                                   zero-setup; skips cleanly (exit 0) if none is reachable
 scripts/verify_byok_visitor.py    anonymous self-funded research: opt-in, key-scoped, never persisted;
                                    also Model Court: session gate, dual-key, graceful degradation
 ```
