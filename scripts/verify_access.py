@@ -1089,8 +1089,8 @@ def main():
     # needs its own proof rather than assuming the synthesis route's coverage
     # generalises.
     saved_mc = api.run_model_court
-    api.run_model_court = lambda ticker, question, pk, gk: {
-        "ticker": ticker, "mode": "model_court",
+    api.run_model_court = lambda ticker, question, pk, gk, provider_mode="both": {
+        "ticker": ticker, "mode": "model_court", "provider_mode": provider_mode,
         "perplexity": {"report": "p"}, "gemini": {"report": "g"},
         "comparison": "stub comparison", "comparison_note": None,
     }

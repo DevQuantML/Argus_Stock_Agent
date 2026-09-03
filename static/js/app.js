@@ -5,14 +5,14 @@
    Version query on each import so a redeploy can never pair a fresh app.js
    with a stale cached sub-module. Bump together with the ?v= in index.html. */
 
-import * as api from './api.js?v=35';
-import { drawChart, makeResponsive } from './chart.js?v=35';
-import { renderMarkdown, escapeHtml } from './md.js?v=35';
-import * as prefs from './theme.js?v=35';
-import * as ui from './ui.js?v=35';
-import * as views from './views.js?v=35';
-import * as tour from './tour.js?v=35';
-import { DISCLAIMER, FRESHNESS_NOTE, guestAllowanceLine } from './copy.js?v=35';
+import * as api from './api.js?v=37';
+import { drawChart, makeResponsive } from './chart.js?v=37';
+import { renderMarkdown, escapeHtml } from './md.js?v=37';
+import * as prefs from './theme.js?v=37';
+import * as ui from './ui.js?v=37';
+import * as views from './views.js?v=37';
+import * as tour from './tour.js?v=37';
+import { DISCLAIMER, FRESHNESS_NOTE, guestAllowanceLine } from './copy.js?v=37';
 
 const $  = ui.$;
 const $$ = ui.$$;
@@ -1032,7 +1032,7 @@ async function runModelCourt(sym) {
     return;
   }
 
-  const keys = await ui.showModelCourtKeys(sym);
+  const keys = await ui.showModelCourtKeys(sym, isOwner());
   if (!keys) return;
 
   state.busy = true;
@@ -1049,11 +1049,18 @@ async function runModelCourt(sym) {
     const ok = await loadFree(sym, { withPipeline: false });
     if (!ok) { cacheTab(sym); return; }
 
-    ui.writeLine('Running Perplexity + Gemini in parallel…', 'dim');
-    const res = await api.runModelCourt(sym, keys.perplexityKey, keys.geminiKey);
+    const mode = keys.providerMode || 'both';
+    const runningLine = mode === 'both' ? 'Running Perplexity + Gemini in parallel…'
+                       : mode === 'perplexity' ? 'Running Perplexity…' : 'Running Gemini…';
+    ui.writeLine(runningLine, 'dim');
+    const res = await api.runModelCourt(sym, keys.perplexityKey, keys.geminiKey,
+                                         { providerMode: mode });
 
-    // Same shape for all three sections: a heading, then either the real
-    // output or a plain failure/unavailable line — never both, never neither.
+    // Same shape per section: a heading, then either the real output or a
+    // plain failure/unavailable line — never both, never neither. A
+    // provider not requested this run (single-provider mode) gets no
+    // section at all rather than a misleading "failed" line for something
+    // that was never asked to run.
     const section = (label) => {
       o.appendChild(Object.assign(document.createElement('div'),
         { className: 'r-head', textContent: label }));
@@ -1065,19 +1072,32 @@ async function runModelCourt(sym) {
       o.appendChild(p);
     };
 
-    section('PERPLEXITY');
-    if (res.perplexity?.error) failLine(`Failed: ${res.perplexity.error}`);
-    else await typeBlock(o, res.perplexity?.report || '');
+    if (res.perplexity) {
+      section('PERPLEXITY');
+      if (res.perplexity.error) failLine(`Failed: ${res.perplexity.error}`);
+      else await typeBlock(o, res.perplexity.report || '');
+    }
 
-    section('GEMINI');
-    if (res.gemini?.error) failLine(`Failed: ${res.gemini.error}`);
-    else await typeBlock(o, res.gemini?.report || '');
+    if (res.gemini) {
+      section('GEMINI');
+      if (res.gemini.error) failLine(`Failed: ${res.gemini.error}`);
+      else await typeBlock(o, res.gemini.report || '');
+    }
 
-    section('COMPARISON');
-    if (res.comparison) await typeBlock(o, res.comparison);
-    else failLine(res.comparison_note || 'Comparison unavailable.', true);
+    // Single-provider mode never attempts a comparison (see run_model_court's
+    // own provider_mode == 'both' gate) — its comparison_note says so
+    // plainly, so a real section for it would just repeat that note as a
+    // heading over itself.
+    if (mode === 'both') {
+      section('COMPARISON');
+      if (res.comparison) await typeBlock(o, res.comparison);
+      else failLine(res.comparison_note || 'Comparison unavailable.', true);
+    }
 
-    ui.setStatus(res.comparison ? 'COMPLETE' : 'PARTIAL', res.comparison ? 'ok' : 'err');
+    const ranOk = mode === 'both' ? !!res.comparison
+                : mode === 'perplexity' ? !res.perplexity?.error
+                : !res.gemini?.error;
+    ui.setStatus(ranOk ? 'COMPLETE' : 'PARTIAL', ranOk ? 'ok' : 'err');
   } catch (err) {
     ui.setStatus('FAILED', 'err');
     ui.toast(err.message || 'Model Court failed.', 'error', 8000);
@@ -1151,9 +1171,13 @@ async function showHistory(rawSym) {
       section('REPORT');
       body(p.report);
     } else if (run.mode === 'model_court') {
-      section('PERPLEXITY'); body(p.perplexity?.report);
-      section('GEMINI');     body(p.gemini?.report);
-      section('COMPARISON'); body(p.comparison || p.comparison_note);
+      // Older saved runs predate provider_mode and are always 'both' in
+      // effect — default to it so history from before this field existed
+      // still renders both sections, same as it always has.
+      const pmode = p.provider_mode || 'both';
+      if (p.perplexity) { section('PERPLEXITY'); body(p.perplexity.report); }
+      if (p.gemini)     { section('GEMINI');     body(p.gemini.report); }
+      if (pmode === 'both') { section('COMPARISON'); body(p.comparison || p.comparison_note); }
     } else {
       body('');
     }

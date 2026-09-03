@@ -9,9 +9,9 @@
      2. Any string that originated from an LLM or from yfinance goes through
         textContent or renderMarkdown — never innerHTML with raw input. */
 
-import { renderMarkdown, escapeHtml } from './md.js?v=35';
-import { sparkline } from './chart.js?v=35';
-import * as prefs from './theme.js?v=35';
+import { renderMarkdown, escapeHtml } from './md.js?v=37';
+import { sparkline } from './chart.js?v=37';
+import * as prefs from './theme.js?v=37';
 
 export const $  = (id)  => document.getElementById(id);
 export const $$ = (sel) => Array.from(document.querySelectorAll(sel));
@@ -1219,7 +1219,7 @@ export function showCostModal(sym, provider, { tier = 'owner', guest = null } = 
     // guess dressed as a fact.
     const costLabel = (m) => {
       if (provider === 'groq') return '$0.00';
-      if (provider === 'gemini') return 'often free';
+      if (provider === 'gemini') return 'quota, if funded';
       return `~$${m.cost.toFixed(2)}`;
     };
 
@@ -1234,7 +1234,7 @@ export function showCostModal(sym, provider, { tier = 'owner', guest = null } = 
     const note = provider === 'groq'
       ? 'Running on GROQ — fast and free, but with no live web search the politician-trade and news modules fall back to model knowledge.'
       : provider === 'gemini'
-      ? "Running on GEMINI with live Google Search grounding — usually free within your own ~5,000 searches/month quota, then billed on your account beyond that (ai.google.dev/pricing). Answers cite the pages they used, though coverage is typically thinner than Perplexity's."
+      ? "Running on GEMINI with live Google Search grounding — confirmed live: real search queries, real cited sources. Needs your Google account's Gemini API billing enabled first (a prepay balance, separate from general Google Cloud billing — ai.google.dev/gemini-api/docs/billing#prepay); a zero-balance key is refused outright rather than merely billed at $0. Once funded, most calls draw from your free ~5,000 searches/month quota before any charge. Answers cite the pages they used, though coverage is typically thinner than Perplexity's."
       : 'Running on PERPLEXITY sonar-pro with live web search. Costs are estimates and vary with response length.';
 
     // The dollar column is the owner's concern. Showing "$0.21" to a guest who
@@ -1257,7 +1257,7 @@ export function showCostModal(sym, provider, { tier = 'owner', guest = null } = 
       : provider === 'groq'
       ? `<div class="cf-tot"><span class="l">ESTIMATED TOTAL</span><span class="v">$0.00 · FREE</span></div>`
       : provider === 'gemini'
-      ? `<div class="cf-tot"><span class="l">ESTIMATED TOTAL</span><span class="v">OFTEN FREE (SEE BELOW)</span></div>`
+      ? `<div class="cf-tot"><span class="l">ESTIMATED TOTAL</span><span class="v">QUOTA, IF BILLING IS ENABLED</span></div>`
       : `<div class="cf-tot"><span class="l">ESTIMATED TOTAL</span><span class="v" id="cf-total">$0.00</span></div>`;
 
     const { box, close } = modal(`
@@ -1532,6 +1532,16 @@ export function showConfigModal(authenticated, isOwner, checks, onAction, onPref
           <code>.env</code> on the server and live immediately — no restart,
           and the key is never shown here again once saved.
         </p>
+      </div>
+      <div class="fld">
+        <div class="fld-l">Model Court · Gemini</div>
+        ${pkRow('gemini', 'GEMINI', c.gemini_key)}
+        <p class="hint" style="line-height:1.8">
+          Not used for regular research — Model Court only, so you can skip
+          re-pasting it there. Needs prepay billing enabled on your Google
+          account first (ai.google.dev/gemini-api/docs/billing#prepay), same
+          write-only guarantee as the keys above.
+        </p>
       </div>` : '';
 
   const { box, close } = modal(`
@@ -1650,22 +1660,53 @@ export function confirmSpend(title, detail, cost) {
    pane, since this is reached from inside the terminal, not the pre-auth
    gate. Neither key is stored anywhere by this function; the caller
    receives them once and they go out of scope the moment the request that
-   uses them returns — same in-memory-only discipline as state.selfKey. */
-export function showModelCourtKeys(sym) {
+   uses them returns — same in-memory-only discipline as state.selfKey.
+
+   `isOwner` narrows the Gemini field from required to optional, matching
+   api_model_court's own owner-only fallback (api.py): the operator can
+   leave it blank and the server uses its own configured GEMINI_API_KEY
+   instead. A guest gets no such fallback — server-side AND here, both
+   fields stay required for them, since api.py never extends the operator's
+   stored key to anyone who isn't the operator.
+
+   Provider-mode toggle (BOTH / PERPLEXITY / GEMINI): added once both
+   providers started drawing real, funded credits rather than one of them
+   being effectively free — a caller who only wants one provider's take (or
+   is just sanity-checking one side) should not be forced to hold and spend
+   a key for the other. Only the field(s) the selected mode needs are shown
+   and required; server-side validation in api.py is mode-aware for the
+   same reason, so this is a real UX narrowing, not just cosmetic — an
+   unneeded field left blank was never going to be accepted as "both keys
+   required" once the mode says otherwise. */
+export function showModelCourtKeys(sym, isOwner) {
   return new Promise((resolve) => {
+    let mode = 'both';
+    const geminiHint = isOwner
+      ? '<div class="hint" style="margin-top:4px;font-size:10px">Leave blank to use your configured key, if set in ◈ CONFIG.</div>'
+      : '';
     const { box, close } = modal(`
       <div class="mdl-hd"><span>ARGUS://MODEL COURT · ${escapeHtml(sym)}</span><button data-close type="button">✕</button></div>
       <div class="mdl-b">
-        <p class="hint" style="margin:0 0 12px;line-height:1.8">Runs Perplexity and Gemini in
-          parallel on your own keys, then compares what each one caught. Neither key is
-          stored — paste them each time you run this.</p>
+        <p class="hint" style="margin:0 0 12px;line-height:1.8">Compares Perplexity and Gemini
+          on your own key(s). Neither key is stored — paste them each time you run this.
+          Both providers now spend real, funded credits — pick one side if you only need
+          one take, to avoid spending on both.</p>
         <div class="fld">
+          <div class="fld-l">Providers</div>
+          <div class="seg" id="mc-mode">
+            <button type="button" data-v="both">BOTH · COMPARE</button>
+            <button type="button" data-v="perplexity">PERPLEXITY ONLY</button>
+            <button type="button" data-v="gemini">GEMINI ONLY</button>
+          </div>
+        </div>
+        <div class="fld" id="mc-fld-pplx">
           <div class="fld-l">Perplexity key</div>
           <input id="mc-pplx" class="inp" type="password" autocomplete="off" spellcheck="false"/>
         </div>
-        <div class="fld">
-          <div class="fld-l">Gemini key</div>
+        <div class="fld" id="mc-fld-gemini">
+          <div class="fld-l">Gemini key${isOwner ? ' (optional)' : ''}</div>
           <input id="mc-gemini" class="inp" type="password" autocomplete="off" spellcheck="false"/>
+          ${geminiHint}
         </div>
         <div id="mc-err" class="gate-err"></div>
       </div>
@@ -1673,6 +1714,20 @@ export function showModelCourtKeys(sym) {
         <button class="btn-g" data-cancel type="button" style="padding:7px 14px">CANCEL</button>
         <button class="btn" data-run type="button">RUN MODEL COURT ▸</button>
       </div>`);
+
+    const fldPplx = box.querySelector('#mc-fld-pplx');
+    const fldGemini = box.querySelector('#mc-fld-gemini');
+    const modeSeg = box.querySelector('#mc-mode');
+    const paintMode = () => {
+      modeSeg.querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.v === mode));
+      fldPplx.hidden = mode === 'gemini';
+      fldGemini.hidden = mode === 'perplexity';
+    };
+    modeSeg.querySelectorAll('button').forEach(b => {
+      b.onclick = () => { mode = b.dataset.v; paintMode(); };
+    });
+    paintMode();
+
     const done = (v) => { close(); resolve(v); };
     box.querySelector('[data-cancel]').onclick = () => done(null);
     box.querySelector('[data-close]').onclick  = () => done(null);
@@ -1680,11 +1735,16 @@ export function showModelCourtKeys(sym) {
       const perplexityKey = box.querySelector('#mc-pplx').value.trim();
       const geminiKey = box.querySelector('#mc-gemini').value.trim();
       const err = box.querySelector('#mc-err');
-      if (!perplexityKey || !geminiKey) {
-        err.textContent = 'Both keys are required — Model Court compares two providers.';
+      const needPplx = mode !== 'gemini';
+      const needGemini = mode !== 'perplexity' && !isOwner;
+      if ((needPplx && !perplexityKey) || (needGemini && !geminiKey)) {
+        err.textContent = mode === 'both'
+          ? (isOwner ? 'Perplexity key is required.'
+                     : 'Both keys are required — Model Court compares two providers.')
+          : `${mode === 'perplexity' ? 'Perplexity' : 'Gemini'} key is required.`;
         return;
       }
-      done({ perplexityKey, geminiKey });
+      done({ perplexityKey, geminiKey, providerMode: mode });
     };
     box.querySelector('#mc-pplx').focus();
   });

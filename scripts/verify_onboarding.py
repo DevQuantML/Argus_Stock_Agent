@@ -364,24 +364,37 @@ def main():
         check("an unrecognised provider name is rejected with 400",
               r_bad_provider.status_code, 400)
 
-        # Gemini is a real entry in PROVIDER_KEY_NAMES (BYOK's benefit) but
-        # NOT in PERSISTENT_PROVIDERS — this is what proves the BYOK-only
-        # boundary from Phase 4 is enforced here, not just documented.
-        # Format-valid key on purpose: a rejection for being too-short would
-        # prove nothing about which provider check actually fired.
+        # Gemini moved from PROVIDER_KEY_NAMES-only (BYOK's benefit) into
+        # PERSISTENT_PROVIDERS too, once grounding was confirmed live via
+        # the native endpoint — CONFIG's route now accepts it. This does
+        # NOT reopen full parity: the saved key still never reaches
+        # _get_provider()'s no-override path (only Model Court's owner-only
+        # fallback reads GEMINI_API_KEY at all), so this only proves CONFIG
+        # accepts and persists it, not that the main pipeline uses it.
         r_gemini_via_config = owner.post("/api/settings/provider-key",
                                           json={"provider": "gemini", "key": "AIza" + "y" * 35})
-        check("Gemini is refused by CONFIG's route even with a format-valid key — BYOK-only",
-              r_gemini_via_config.status_code, 400)
-        check("...and nothing was ever written for it",
-              "GEMINI_API_KEY" in scratch_env.read_text(encoding="utf-8"), False)
+        check("Gemini is now accepted by CONFIG's route with a format-valid key",
+              r_gemini_via_config.status_code, 200)
+        check("...and the key is written to the scratch .env",
+              "GEMINI_API_KEY" in scratch_env.read_text(encoding="utf-8"), True)
+        check("...but a saved Gemini key is never echoed back in the response",
+              "AIza" in r_gemini_via_config.text, False)
+        # Clear it so it doesn't leak into a later section of this same run.
+        owner.post("/api/settings/provider-key", json={"provider": "gemini", "key": ""})
 
+        # Snapshot rather than assume-empty: the Gemini section above is the
+        # first successful write+clear in this run, and write_env_key never
+        # deletes a line for an empty value (same "blank line != absent" rule
+        # ARGUS_DB's own gotcha documents) — it leaves "GEMINI_API_KEY=\n"
+        # behind. The real thing this check proves is "a rejected write
+        # changes nothing," not "the file happens to be empty."
+        before_rejected_write = scratch_env.read_text(encoding="utf-8")
         r_bad_key = owner.post("/api/settings/provider-key",
                                 json={"provider": "groq", "key": "too-short"})
         check("a too-short key is rejected with 400 via the shared soft_validate",
               r_bad_key.status_code, 400)
         check("...and the rejected write never touches the scratch file",
-              scratch_env.read_text(encoding="utf-8"), "")
+              scratch_env.read_text(encoding="utf-8"), before_rejected_write)
 
         good_key = "gsk_" + "a" * 40
         r_ok = owner.post("/api/settings/provider-key",

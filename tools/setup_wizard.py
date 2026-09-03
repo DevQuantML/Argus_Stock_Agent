@@ -43,7 +43,9 @@ ENV_PLACEHOLDERS = {
 }
 
 # The full canonical map — every provider this app can build a client for,
-# including Gemini, which is BYOK-only (see PERSISTENT_PROVIDERS below).
+# including Gemini, whose persistence is narrowly scoped (see
+# PERSISTENT_PROVIDERS below — CONFIG-modal only, owner-only, and not wired
+# into the main research pipeline's own provider selection).
 # `/api/byok/*` routes check membership here, not a separately hardcoded
 # tuple, so a fourth provider added later needs one entry, not one entry
 # per call site scattered across the codebase.
@@ -54,12 +56,28 @@ PROVIDER_KEY_NAMES = {
 }
 
 # The narrower subset that can be PERSISTED — via this wizard, or via
-# POST /api/settings/provider-key (api.py). Gemini is deliberately absent:
-# BYOK-only for now (still-beta OpenAI-compat integration on Google's side —
-# see tools/perplexity_research.py's _GEMINI_EXTRA_BODY comment), never
-# offered here and never accepted by that route. Promoting it to full
-# parity is a later, separate decision, not an oversight.
-PERSISTENT_PROVIDERS = ("perplexity", "groq")
+# POST /api/settings/provider-key (api.py).
+#
+# Gemini WAS deliberately absent here: BYOK-only, because the original
+# concern was Google's OpenAI-compat endpoint being flagged still-beta. That
+# concern doesn't apply any more — tools/gemini_native.py never used the
+# compat endpoint in the first place (it exists specifically because
+# grounding is unavailable there), and grounding through it was live-tested
+# with a real key and confirmed working (real search_queries, real sources,
+# a correctly-dated answer). Promoting it here is that "later, separate
+# decision" actually being made, not an oversight or a reopened boundary.
+#
+# Still NOT offered by the CLI wizard's own [g]/[p] prompt below, and still
+# NOT reachable via _get_provider()'s no-override path in
+# perplexity_research.py — a configured GEMINI_API_KEY only ever gets used
+# where a call site explicitly reads it and passes it through `override=`
+# (currently: Model Court's owner-only convenience fallback in api.py). It
+# does not become a third fallback for the main research pipeline the way
+# Perplexity/Groq are, and the CLI wizard still leads a first-time user to
+# Groq/Perplexity only — this widened tuple only unlocks the CONFIG-modal
+# persistence path, which is already owner-only (require_owner on the
+# route) and now also gated per-field in the modal itself.
+PERSISTENT_PROVIDERS = ("perplexity", "groq", "gemini")
 
 PROVIDER_SIGNUP_URLS = {
     "perplexity": "https://www.perplexity.ai/settings/api",

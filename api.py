@@ -940,6 +940,14 @@ def health():
     search, Groq does not). Only `ai_provider` feeds the overall status —
     having just one of the two is a fully working configuration, not degraded.
 
+    gemini_key is reported too, same disclosure floor (presence only, never
+    a prefix/length/value) — but deliberately does NOT feed `ai_provider` or
+    `overall`: Gemini is not part of _get_provider()'s no-override fallback
+    chain, so a configured GEMINI_API_KEY with no Perplexity/Groq key set
+    would still leave the main research pipeline unable to serve a run.
+    This field exists so the CONFIG modal can show its own configured/not
+    status for Gemini's narrow, Model-Court-only use.
+
     Always returns HTTP 200 — never 500.
     Status field is "healthy" if all checks pass, "degraded" otherwise.
     """
@@ -950,6 +958,7 @@ def health():
     groq_key = os.getenv("GROQ_API_KEY")
     checks["perplexity_key"] = bool(perplexity_key)
     checks["groq_key"] = bool(groq_key)
+    checks["gemini_key"] = bool(os.getenv("GEMINI_API_KEY"))
     checks["ai_provider"] = bool(perplexity_key or groq_key)
     if not checks["ai_provider"]:
         logger.warning("health: no AI provider — set PERPLEXITY_API_KEY or GROQ_API_KEY")
@@ -1684,13 +1693,21 @@ def api_model_court(
     ticker: str,
     request: Request,
     question: str = Query(default=None, max_length=_MAX_QUESTION_LEN),
+    provider_mode: str = Query(default="both"),
     x_perplexity_key: str = Header(default=None, alias="X-Perplexity-Key"),
     x_gemini_key: str = Header(default=None, alias="X-Gemini-Key"),
     x_agent_key: str = Header(default=None, alias="X-Agent-Key"),
 ):
     """
-    Run Perplexity and Gemini on the same ticker in parallel, using the
-    caller's own two keys, and return a comparison of what each caught.
+    Run Perplexity and/or Gemini on the same ticker, using the caller's own
+    key(s), and (in "both" mode) return a comparison of what each caught.
+
+    `provider_mode` — "both" (default) | "perplexity" | "gemini". Added once
+    both providers started drawing real, funded credits: a caller checking
+    just one provider, or who only wants that one provider's take, should
+    not be forced to also hold and spend a key for the other. Validation
+    below is mode-aware for the same reason — it only demands the key(s)
+    the selected mode actually needs.
 
     Requires a session (owner or guest) — see the module comment above for
     why that's the gate rather than anonymity. Neither the owner's nor a
@@ -1706,26 +1723,53 @@ def api_model_court(
     `request`/`x_agent_key` are declared here (not just on the
     require_session dependency) so this function can call _auth_ctx() itself
     and learn the caller's tier — needed to scope the saved history row to
-    the right owner/guest identity. require_session's own signature returns
-    None, not an AuthCtx, so there is nothing to pull that from via
-    dependency injection alone.
+    the right owner/guest identity, and now also to decide the Gemini-key
+    fallback below.
+
+    Owner-only convenience: if the caller is the OWNER and omits
+    X-Gemini-Key, fall back to a server-configured GEMINI_API_KEY (settable
+    via CONFIG once "gemini" was added to PERSISTENT_PROVIDERS — see
+    tools/setup_wizard.py). A guest — or anyone without a session, though
+    require_session already excludes that case — gets NO such fallback and
+    must always supply their own key, same as today. This is a deliberate,
+    narrow exception to "both keys are always the caller's own": it saves
+    the operator re-pasting a key they already own on every call, without
+    ever exposing a stored server credential to a caller who isn't the
+    operator. Perplexity is unchanged — still always required from the
+    caller here, even for the owner, who has never been able to omit it.
     """
-    for key_value, key_label in ((x_perplexity_key, "X-Perplexity-Key"),
-                                  (x_gemini_key, "X-Gemini-Key")):
+    if provider_mode not in ("both", "perplexity", "gemini"):
+        return JSONResponse(status_code=400, content={
+            "error": "provider_mode must be one of: both, perplexity, gemini"})
+
+    ctx = _auth_ctx(request, x_agent_key)
+    if (ctx is not None and ctx.tier == "owner" and not x_gemini_key
+            and provider_mode in ("both", "gemini")):
+        x_gemini_key = os.getenv("GEMINI_API_KEY") or x_gemini_key
+
+    # Only the key(s) the selected mode actually needs are required — a
+    # Perplexity-only run must not be blocked on a missing Gemini key the
+    # caller was never going to spend, and vice versa.
+    needed = []
+    if provider_mode in ("both", "perplexity"):
+        needed.append((x_perplexity_key, "X-Perplexity-Key"))
+    if provider_mode in ("both", "gemini"):
+        needed.append((x_gemini_key, "X-Gemini-Key"))
+    for key_value, key_label in needed:
         ok, reason = soft_validate(key_value or "")
         if not ok:
             return JSONResponse(status_code=400,
                                  content={"error": f"{key_label}: {reason}"})
 
     try:
-        result = run_model_court(ticker, question, x_perplexity_key, x_gemini_key)
+        result = run_model_court(ticker, question, x_perplexity_key, x_gemini_key,
+                                  provider_mode=provider_mode)
         if "error" in result and "ticker" not in result:
             return JSONResponse(status_code=500, content={"error": "internal server error"})
         # require_session already gated this to owner-or-guest — ctx cannot
         # actually be None here, but the check is kept explicit rather than
         # assumed. Best-effort: a history-save failure must never turn a
         # completed (and possibly billed) comparison into an error response.
-        ctx = _auth_ctx(request, x_agent_key)
         if ctx is not None:
             try:
                 store.save_research_run(result.get("ticker", ticker.upper()), "model_court",
@@ -2226,7 +2270,7 @@ class ProviderKeyBody(BaseModel):
 
 @app.post("/api/settings/provider-key", dependencies=[Depends(require_owner)])
 def api_settings_provider_key(body: ProviderKeyBody):
-    """Set or clear a Groq/Perplexity credential from the browser.
+    """Set or clear a Groq/Perplexity/Gemini credential from the browser.
 
     Owner-only, and more strictly so than the book writes above: this sets
     the credential every future paid research call on this instance will
@@ -2243,11 +2287,15 @@ def api_settings_provider_key(body: ProviderKeyBody):
     for these two keys: presence only, never a prefix, length, or value.
 
     Deliberately checks PERSISTENT_PROVIDERS, not the wider PROVIDER_KEY_NAMES
-    _byok_auth() uses — Gemini is BYOK-only for now (still-beta upstream
-    integration), so this route refuses it even though PROVIDER_KEY_NAMES
-    itself already has a "gemini" entry for BYOK's benefit. Without this
-    explicit check, the generic .get() lookup below would silently start
-    accepting a persisted Gemini key the moment that dict gained the entry.
+    _byok_auth() uses — the two lists diverge on purpose. Gemini IS now in
+    PERSISTENT_PROVIDERS (grounding confirmed live via the native endpoint;
+    see tools/setup_wizard.py's comment on that constant), so this route
+    accepts it — but a saved GEMINI_API_KEY still does nothing for the main
+    research pipeline: _get_provider()'s no-override path never reads it,
+    only Model Court's owner-only fallback does. Without the
+    PERSISTENT_PROVIDERS check here, the generic .get() lookup below would
+    accept ANY name in PROVIDER_KEY_NAMES the moment that dict gained an
+    entry — this route's whole point is being the narrower of the two.
     """
     if body.provider not in PERSISTENT_PROVIDERS:
         return JSONResponse(status_code=400, content={

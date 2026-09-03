@@ -315,11 +315,15 @@ export async function postByokSynthesis(ticker, provider, key, payload, { signal
    request-level failure (bad key format, no session, disabled instance,
    internal error) is still a non-2xx status and still throws — that check
    lives in request() above, unconditionally, before this line is reached. */
-export async function runModelCourt(ticker, perplexityKey, geminiKey, { question, signal } = {}) {
-  const q = question ? `?question=${encodeURIComponent(question)}` : '';
+export async function runModelCourt(ticker, perplexityKey, geminiKey,
+                                     { question, providerMode = 'both', signal } = {}) {
+  const params = new URLSearchParams();
+  if (question) params.set('question', question);
+  if (providerMode !== 'both') params.set('provider_mode', providerMode);
+  const q = params.toString() ? `?${params.toString()}` : '';
   return request(`/api/model-court/${encodeURIComponent(ticker)}${q}`, {
     method: 'POST', signal,
-    headers: { 'X-Perplexity-Key': perplexityKey, 'X-Gemini-Key': geminiKey },
+    headers: { 'X-Perplexity-Key': perplexityKey || '', 'X-Gemini-Key': geminiKey || '' },
   });
 }
 

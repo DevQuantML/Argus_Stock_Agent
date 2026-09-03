@@ -1272,17 +1272,35 @@ def _model_court_prompt(ticker: str, perplexity_report: str, gemini_report: str)
     )
 
 
-def run_model_court(ticker: str, question: str | None,
-                     perplexity_key: str, gemini_key: str) -> dict:
-    """
-    Run Perplexity and Gemini on the same ticker in parallel, using the
-    caller's own two keys, then produce a comparison of what each caught.
+_MODEL_COURT_PROVIDER_MODES = ("both", "perplexity", "gemini")
 
-    Always returns a dict — never raises. Degrades gracefully: if one side
-    fails, the side that succeeded is still returned, with a note on why
-    the comparison could not run rather than discarding a working result
-    because its partner failed.
+
+def run_model_court(ticker: str, question: str | None,
+                     perplexity_key: str, gemini_key: str,
+                     provider_mode: str = "both") -> dict:
     """
+    Run Perplexity and/or Gemini on the same ticker, using the caller's own
+    key(s), then (in "both" mode) produce a comparison of what each caught.
+
+    `provider_mode` — "both" (default, original behaviour), "perplexity", or
+    "gemini". Added once both providers started drawing on real, funded
+    credits rather than one of them being effectively free: a caller who
+    just wants to sanity-check ONE provider (or genuinely only wants one
+    provider's take) should not be forced to also spend on the other, and
+    the comparison step (a THIRD paid call) only ever makes sense when both
+    sides actually ran. Single-provider mode needs only that one key —
+    api.py's own validation is mode-aware for the same reason: it must not
+    demand a Gemini key from someone who explicitly asked for
+    Perplexity-only, or vice versa.
+
+    Always returns a dict — never raises. In "both" mode, degrades
+    gracefully: if one side fails, the side that succeeded is still
+    returned, with a note on why the comparison could not run rather than
+    discarding a working result because its partner failed.
+    """
+    if provider_mode not in _MODEL_COURT_PROVIDER_MODES:
+        provider_mode = "both"
+
     try:
         ticker = validate_ticker(ticker)
     except ValueError as exc:
@@ -1292,15 +1310,23 @@ def run_model_court(ticker: str, question: str | None,
                                      label="QUESTION")
                 if question else None)
 
-    logger.info("run_model_court: running Perplexity + Gemini in parallel for %s", ticker)
+    want_pplx = provider_mode in ("both", "perplexity")
+    want_gemini = provider_mode in ("both", "gemini")
+
+    logger.info("run_model_court: running provider_mode=%s for %s", provider_mode, ticker)
     pplx_status, gemini_status = {}, {}
+    pplx_result, gemini_result = None, None
     with ThreadPoolExecutor(max_workers=2) as pool:
         pplx_future = pool.submit(run_perplexity_research, ticker, question,
-                                   ("perplexity", perplexity_key), status=pplx_status)
+                                   ("perplexity", perplexity_key), status=pplx_status
+                                   ) if want_pplx else None
         gemini_future = pool.submit(run_perplexity_research, ticker, question,
-                                     ("gemini", gemini_key), status=gemini_status)
-        pplx_result = pplx_future.result()
-        gemini_result = gemini_future.result()
+                                     ("gemini", gemini_key), status=gemini_status
+                                     ) if want_gemini else None
+        if pplx_future is not None:
+            pplx_result = pplx_future.result()
+        if gemini_future is not None:
+            gemini_result = gemini_future.result()
 
     # run_perplexity_research's own return dict only carries a top-level
     # "error" key for a STRUCTURAL failure (bad ticker, no provider
@@ -1311,30 +1337,49 @@ def run_model_court(ticker: str, question: str | None,
     # single most common real-world failure (an invalid key), which would
     # silently skip the "one side failed" degradation this function exists
     # to provide AND spend a third paid call comparing two failure strings.
-    if pplx_status.get("failed") and "error" not in pplx_result:
+    if pplx_result is not None and pplx_status.get("failed") and "error" not in pplx_result:
         pplx_result["error"] = _PROVIDER_REASON_TEXT.get(
             pplx_status.get("reason"), "provider call failed")
-    if gemini_status.get("failed") and "error" not in gemini_result:
+    if gemini_result is not None and gemini_status.get("failed") and "error" not in gemini_result:
         gemini_result["error"] = _PROVIDER_REASON_TEXT.get(
             gemini_status.get("reason"), "provider call failed")
 
-    pplx_ok = "error" not in pplx_result
-    gemini_ok = "error" not in gemini_result
+    # "not requested" reads as neither True nor False in ok-terms — only a
+    # side that actually ran can be judged ok/not-ok. Keeps the "both failed"
+    # / comparison-eligibility logic below meaningful in single-provider mode
+    # instead of tripping on a side that was never asked to run at all.
+    pplx_ok = pplx_result is not None and "error" not in pplx_result
+    gemini_ok = gemini_result is not None and "error" not in gemini_result
 
-    if not pplx_ok and not gemini_ok:
+    if provider_mode == "both" and not pplx_ok and not gemini_ok:
         logger.warning("run_model_court: both providers failed for %s", ticker)
         return {
             "ticker": ticker,
             "mode": "model_court",
+            "provider_mode": provider_mode,
             "timestamp": datetime.now().isoformat(),
             "error": "both providers failed",
+            "perplexity": pplx_result,
+            "gemini": gemini_result,
+        }
+    if provider_mode != "both" and not (pplx_ok or gemini_ok):
+        only = "Perplexity" if provider_mode == "perplexity" else "Gemini"
+        logger.warning("run_model_court: %s failed for %s (single-provider mode)", only, ticker)
+        return {
+            "ticker": ticker,
+            "mode": "model_court",
+            "provider_mode": provider_mode,
+            "timestamp": datetime.now().isoformat(),
+            "error": f"{only} failed",
             "perplexity": pplx_result,
             "gemini": gemini_result,
         }
 
     comparison = None
     comparison_note = None
-    if pplx_ok and gemini_ok:
+    if provider_mode != "both":
+        comparison_note = "Single-provider run — no comparison to make."
+    elif pplx_ok and gemini_ok:
         logger.info("run_model_court: both succeeded for %s, generating comparison", ticker)
         try:
             client, main_model, _debate, _provider, _extra = _get_provider(
@@ -1361,6 +1406,7 @@ def run_model_court(ticker: str, question: str | None,
     return {
         "ticker": ticker,
         "mode": "model_court",
+        "provider_mode": provider_mode,
         "timestamp": datetime.now().isoformat(),
         "perplexity": pplx_result,
         "gemini": gemini_result,
