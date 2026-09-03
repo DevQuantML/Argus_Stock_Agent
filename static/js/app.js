@@ -5,14 +5,14 @@
    Version query on each import so a redeploy can never pair a fresh app.js
    with a stale cached sub-module. Bump together with the ?v= in index.html. */
 
-import * as api from './api.js?v=34';
-import { drawChart, makeResponsive } from './chart.js?v=34';
-import { renderMarkdown, escapeHtml } from './md.js?v=34';
-import * as prefs from './theme.js?v=34';
-import * as ui from './ui.js?v=34';
-import * as views from './views.js?v=34';
-import * as tour from './tour.js?v=34';
-import { DISCLAIMER, FRESHNESS_NOTE, guestAllowanceLine } from './copy.js?v=34';
+import * as api from './api.js?v=35';
+import { drawChart, makeResponsive } from './chart.js?v=35';
+import { renderMarkdown, escapeHtml } from './md.js?v=35';
+import * as prefs from './theme.js?v=35';
+import * as ui from './ui.js?v=35';
+import * as views from './views.js?v=35';
+import * as tour from './tour.js?v=35';
+import { DISCLAIMER, FRESHNESS_NOTE, guestAllowanceLine } from './copy.js?v=35';
 
 const $  = ui.$;
 const $$ = ui.$$;
@@ -68,6 +68,35 @@ const isVisitor = () => tier() === 'visitor';
 
 const FOLD_KEY  = 'argus.folded';
 const FOCUS_KEY = 'argus.focus';
+const HIST_KEY  = 'argus.selfKeyHistory';
+// Newest N per ticker — matches store.RESEARCH_HISTORY_LIMIT's intent
+// (bounded growth), kept independently since this cache lives in the
+// browser, not the server.
+const HIST_LIMIT = 20;
+
+/* Client-side research history for the ONE tier that has no session to save
+   against server-side: a self-key (BYOK) visitor. Owner and guest history is
+   server-side (store.research_runs) and fetched via api.getResearchHistory —
+   this is deliberately NOT used for them, so there is exactly one source of
+   truth per tier rather than two caches that can drift apart. localStorage
+   is per-browser, so this never survives a device change or a private
+   window, unlike the server-side path — an accepted, stated trade-off for a
+   tier that by definition has no account to attach permanent history to. */
+function loadLocalHistory(sym) {
+  try {
+    const all = JSON.parse(localStorage.getItem(HIST_KEY) || '{}');
+    return Array.isArray(all[sym]) ? all[sym] : [];
+  } catch { return []; }
+}
+function saveLocalHistory(sym, mode, payload) {
+  try {
+    const all = JSON.parse(localStorage.getItem(HIST_KEY) || '{}');
+    const list = Array.isArray(all[sym]) ? all[sym] : [];
+    list.unshift({ mode, payload, created_at: new Date().toISOString() });
+    all[sym] = list.slice(0, HIST_LIMIT);
+    localStorage.setItem(HIST_KEY, JSON.stringify(all));
+  } catch { /* private mode, or storage full — history is a convenience, not core */ }
+}
 
 /* The watchlist used to live in localStorage. It is server-side now, so an
    add or remove survives a browser wipe and reaches the research prompts. */
@@ -953,6 +982,11 @@ async function runSelfKeyResearch(sym, question, o) {
         policy: texts.policy || '', patterns: texts.patterns || '',
       }, { signal: controller.signal });
 
+      // A self-key run has no session, so nothing saved this server-side —
+      // the owner/guest loop above doesn't need this call because
+      // api_research_synthesis already persists it (store.research_runs).
+      saveLocalHistory(sym, 'synthesis', res);
+
       ui.renderVerdict(o, res.synthesis);
       if (res.bull_case || res.bear_case) {
         o.appendChild(Object.assign(document.createElement('div'),
@@ -1054,6 +1088,95 @@ async function runModelCourt(sym) {
     state.busy = false;
     $('btn-exec').disabled = false;
   }
+}
+
+const HIST_MODE_LABEL = { full: 'FULL REPORT', synthesis: 'STAGED VERDICT', model_court: 'MODEL COURT' };
+
+/* Recall list for a ticker's saved research. Owner/guest read the server
+   (store.research_runs, via api.getResearchHistory); a self-key visitor —
+   the only tier that ever has anything to recall with no session — reads
+   its own localStorage cache instead. A plain visitor or guest with no
+   self-key and nothing saved yet just sees the empty state; there is no
+   third source to check. */
+async function showHistory(rawSym) {
+  if (state.busy) { ui.toast('A run is already in flight.', 'warn'); return; }
+  const sym = String(rawSym || '').trim().toUpperCase().replace(/[^A-Z0-9.=-]/g, '');
+  if (!sym) { ui.toast('Usage: history <SYM>', 'warn'); return; }
+
+  openTab(sym);
+  ui.clearOut();
+  ui.writeTitle(`ARGUS://${sym} · HISTORY`);
+  const o = ui.out();
+
+  let runs;
+  if (isOwner() || tier() === 'guest') {
+    try {
+      runs = (await api.getResearchHistory(sym)).runs || [];
+    } catch (err) {
+      ui.toast(err.message || 'Could not load history.', 'error');
+      cacheTab(sym);
+      return;
+    }
+  } else {
+    runs = loadLocalHistory(sym);
+  }
+
+  if (!runs.length) {
+    ui.writeLine(`No saved research for ${sym} yet — run \`research ${sym}\` or `
+               + `\`court ${sym}\` first.`, 'dim');
+    cacheTab(sym);
+    return;
+  }
+
+  const list = document.createElement('div');
+  list.className = 'hist-list';
+  const detail = document.createElement('div');
+  detail.className = 'hist-detail';
+
+  const renderDetail = (run) => {
+    detail.innerHTML = '';
+    const p = run.payload || {};
+    const section = (label) => detail.appendChild(Object.assign(
+      document.createElement('div'), { className: 'r-head', textContent: label }));
+    const body = (text) => {
+      const b = document.createElement('div');
+      b.className = 'r-body';
+      b.innerHTML = renderMarkdown(text || '(not available)');
+      detail.appendChild(b);
+    };
+
+    if (run.mode === 'synthesis') {
+      ui.renderVerdict(detail, p.synthesis || '');
+    } else if (run.mode === 'full') {
+      section('REPORT');
+      body(p.report);
+    } else if (run.mode === 'model_court') {
+      section('PERPLEXITY'); body(p.perplexity?.report);
+      section('GEMINI');     body(p.gemini?.report);
+      section('COMPARISON'); body(p.comparison || p.comparison_note);
+    } else {
+      body('');
+    }
+  };
+
+  runs.forEach((run, i) => {
+    const row = document.createElement('button');
+    row.type = 'button';
+    row.className = 'btn-g hist-row';
+    row.style.cssText = 'display:block;width:100%;text-align:left;margin-bottom:4px;padding:8px 10px';
+    const when = new Date(run.created_at).toLocaleString();
+    row.textContent = `${HIST_MODE_LABEL[run.mode] || run.mode} — ${when}`;
+    row.onclick = () => {
+      list.querySelectorAll('.hist-row').forEach(n => n.classList.remove('on'));
+      row.classList.add('on');
+      renderDetail(run);
+    };
+    list.appendChild(row);
+    if (i === 0) { row.classList.add('on'); renderDetail(run); }
+  });
+
+  o.append(list, detail);
+  cacheTab(sym);
 }
 
 /* Typewriter that can be interrupted by Stop. */
@@ -1167,7 +1290,8 @@ async function inspect(sym) {
 /* ── Command parser ──────────────────────────────────────────────────── */
 
 const CMDS = ['research', 'quant', 'chart', 'scan', 'brent', 'pos', 'add', 'rm',
-              'portfolio', 'profile', 'focus', 'clear', 'tour', 'request', 'help', 'court'];
+              'portfolio', 'profile', 'focus', 'clear', 'tour', 'request', 'help', 'court',
+              'history'];
 
 /* Refuse a book edit before it reaches the network. The server enforces this
    with a 403 regardless; catching it here means the reader gets a sentence
@@ -1280,6 +1404,10 @@ async function runCommand(raw) {
       if (!arg) { ui.toast('Usage: court <SYM>', 'warn'); return; }
       await runModelCourt(arg); return;
 
+    case 'history':
+      if (!arg) { ui.toast('Usage: history <SYM>', 'warn'); return; }
+      await showHistory(arg); return;
+
     default: {
       // Bare ticker is the most common input — treat it as research.
       const guess = head.toUpperCase().replace(/[^A-Z0-9.=-]/g, '');
@@ -1302,6 +1430,7 @@ function wireHints() {
 
   const HINTS = [
     ['research', 'full staged brief'], ['court', 'Perplexity vs Gemini, compared'],
+    ['history', 'past research, saved'],
     ['quant', 'free metrics only'],
     ['chart', 'price + reference lines'], ['scan', 'sweep all holdings'],
     ['brent', 'framework detail'], ['pos', 'open inspector'],

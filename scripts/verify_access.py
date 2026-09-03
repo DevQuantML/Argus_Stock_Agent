@@ -1050,6 +1050,73 @@ def main():
     check("CONTROL: the code scan still sees the real request body",
           "chat_id" in notify_code, True)
 
+    # ── Research history ─────────────────────────────────────────────────
+    # Owner/guest only, server-side (store.research_runs) — anonymous and
+    # BYOK research is deliberately never saved here (see the schema comment
+    # in store.py); the frontend keeps its own localStorage recall for that
+    # tier instead, untested here since it has nothing to do with this file.
+    section("research history — save on success, strict tier/guest scoping")
+    api._rate_limit_store.clear()  # a clean budget for this section's own calls
+
+    saved_synthesis = api.run_synthesis
+    api.run_synthesis = lambda ticker, modules: {
+        "ticker": ticker, "mode": "synthesis", "synthesis": "BUY TRANCHE — stub",
+        "bull_case": "b", "bear_case": "b2",
+    }
+    try:
+        r = oc.post("/api/research/HIST1/synthesis",
+                    json={"report": "r", "context": "c", "policy": "p", "patterns": "pt"})
+        check("owner synthesis call still 200 with history-save wired in", r.status_code, 200)
+        rh = oc.get("/api/research/HIST1/history").json()
+        check("owner sees exactly the 1 run just saved", len(rh["runs"]), 1)
+        check("...tagged with the right mode", rh["runs"][0]["mode"], "synthesis")
+        check("...carrying the actual payload, not a stub", rh["runs"][0]["payload"]["synthesis"],
+              "BUY TRANCHE — stub")
+    finally:
+        api.run_synthesis = saved_synthesis
+
+    check("anonymous history request is 401, not a silent empty list",
+          anon.get("/api/research/HIST1/history").status_code, 401)
+
+    hist_guest_key = store.create_guest_key("history@example.com")[1]
+    hc = TestClient(api.app)
+    hc.post("/api/session", json={"key": hist_guest_key})
+    check("a guest sees NONE of the owner's history for the same ticker",
+          len(hc.get("/api/research/HIST1/history").json()["runs"]), 0)
+
+    # Model Court's own save point — a different route, a different auth
+    # dependency shape (require_session, not require_auth taking ctx), so it
+    # needs its own proof rather than assuming the synthesis route's coverage
+    # generalises.
+    saved_mc = api.run_model_court
+    api.run_model_court = lambda ticker, question, pk, gk: {
+        "ticker": ticker, "mode": "model_court",
+        "perplexity": {"report": "p"}, "gemini": {"report": "g"},
+        "comparison": "stub comparison", "comparison_note": None,
+    }
+    try:
+        r = hc.post("/api/model-court/HIST2", headers={
+            "X-Perplexity-Key": "pplx-" + "p" * 40, "X-Gemini-Key": "AIza" + "g" * 35})
+        check("guest model-court call still 200 with history-save wired in", r.status_code, 200)
+        gh = hc.get("/api/research/HIST2/history").json()
+        check("the guest sees their own model_court run", len(gh["runs"]), 1)
+        check("...tagged correctly", gh["runs"][0]["mode"], "model_court")
+        check("the owner does NOT see the guest's model_court run",
+              len(oc.get("/api/research/HIST2/history").json()["runs"]), 0)
+    finally:
+        api.run_model_court = saved_mc
+
+    hist_guest_key2 = store.create_guest_key("history2@example.com")[1]
+    hc2 = TestClient(api.app)
+    hc2.post("/api/session", json={"key": hist_guest_key2})
+    check("a second guest sees NONE of the first guest's history either",
+          len(hc2.get("/api/research/HIST2/history").json()["runs"]), 0)
+
+    check("a ticker with no saved runs returns an empty list, not an error",
+          oc.get("/api/research/NOSUCHHIST/history").status_code, 200)
+    check("...specifically an empty list",
+          oc.get("/api/research/NOSUCHHIST/history").json()["runs"], [])
+
     # ── Final cost assertion ───────────────────────────────────────────────
     section("cost — no unintended provider call remains outstanding")
     check("provider invocation count since the last deliberate stub hit", calls, [])

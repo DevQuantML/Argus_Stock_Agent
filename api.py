@@ -1147,6 +1147,13 @@ def api_research(ticker: str, question: str = Query(default=None, max_length=_MA
         result = run_perplexity_research(ticker, question)
         if "error" in result and "ticker" not in result:
             return JSONResponse(status_code=500, content={"error": "internal server error"})
+        # require_owner gates this whole route, so tier is always "owner" here
+        # — no ctx lookup needed. Best-effort: a history-save failure must
+        # never turn a successful research call into a 500 for the caller.
+        try:
+            store.save_research_run(ticker, "full", "owner", None, result)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("api_research: history save failed (type=%s)", type(exc).__name__)
         return result
     except Exception as exc:
         logger.debug("api_research: error (type=%s): %s", type(exc).__name__, exc)
@@ -1376,11 +1383,45 @@ def api_research_synthesis(ticker: str, body: SynthesisBody,
                 status_code=502,
                 content={"error": result["error"], "code": "provider_unavailable"},
             )
+        # Best-effort: a history-save failure must never turn a successful,
+        # already-billed synthesis into an error response for the caller.
+        try:
+            store.save_research_run(sym, "synthesis", ctx.tier, ctx.guest_key_id, result)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("api_research_synthesis: history save failed (type=%s)", type(exc).__name__)
         return result
     except Exception as exc:
         logger.debug("api_research_synthesis: error (type=%s): %s", type(exc).__name__, exc)
         _refund_if_free(ctx, "synthesis", None)
         return JSONResponse(status_code=500, content={"error": "internal server error"})
+
+
+@app.get("/api/research/{ticker}/history", dependencies=[Depends(require_session)])
+def api_research_history(ticker: str, request: Request,
+                         x_agent_key: str = Header(default=None, alias="X-Agent-Key")):
+    """
+    Past research saved for this ticker, newest first — owner or guest only.
+
+    Anonymous visitor/BYOK research is never saved server-side (see the
+    research_runs schema comment in store.py), so there is nothing for this
+    route to serve for those tiers; the frontend keeps its own recall for
+    them in localStorage instead.
+
+    Scoped strictly to the caller's own (tier, guest_key_id) — a guest sees
+    only their own history, never another guest's or the owner's, even by
+    guessing a ticker that happens to have saved rows.
+    """
+    sym, bad = _validated_ticker(ticker)
+    if bad is not None:
+        return bad
+    # require_session already gated this to owner-or-guest — ctx cannot
+    # actually be None here, but the check is kept explicit rather than
+    # assumed, matching require_owner/require_auth's own internal pattern.
+    ctx = _auth_ctx(request, x_agent_key)
+    if ctx is None:
+        return JSONResponse(status_code=401, detail=_unauthorized_detail(request))
+    runs = store.list_research_runs(sym, ctx.tier, ctx.guest_key_id)
+    return {"ticker": sym, "runs": runs}
 
 
 # ── Anonymous, self-funded BYOK research ───────────────────────────────────
@@ -1612,9 +1653,11 @@ def api_byok_synthesis(
 @app.post("/api/model-court/{ticker}", dependencies=[Depends(require_session)])
 def api_model_court(
     ticker: str,
+    request: Request,
     question: str = Query(default=None, max_length=_MAX_QUESTION_LEN),
     x_perplexity_key: str = Header(default=None, alias="X-Perplexity-Key"),
     x_gemini_key: str = Header(default=None, alias="X-Gemini-Key"),
+    x_agent_key: str = Header(default=None, alias="X-Agent-Key"),
 ):
     """
     Run Perplexity and Gemini on the same ticker in parallel, using the
@@ -1630,6 +1673,13 @@ def api_model_court(
     Named headers (X-Perplexity-Key / X-Gemini-Key) rather than the generic
     X-Provider/X-Provider-Key pair /api/byok/* uses — this route always
     needs exactly these two, never an arbitrary provider choice.
+
+    `request`/`x_agent_key` are declared here (not just on the
+    require_session dependency) so this function can call _auth_ctx() itself
+    and learn the caller's tier — needed to scope the saved history row to
+    the right owner/guest identity. require_session's own signature returns
+    None, not an AuthCtx, so there is nothing to pull that from via
+    dependency injection alone.
     """
     for key_value, key_label in ((x_perplexity_key, "X-Perplexity-Key"),
                                   (x_gemini_key, "X-Gemini-Key")):
@@ -1642,6 +1692,17 @@ def api_model_court(
         result = run_model_court(ticker, question, x_perplexity_key, x_gemini_key)
         if "error" in result and "ticker" not in result:
             return JSONResponse(status_code=500, content={"error": "internal server error"})
+        # require_session already gated this to owner-or-guest — ctx cannot
+        # actually be None here, but the check is kept explicit rather than
+        # assumed. Best-effort: a history-save failure must never turn a
+        # completed (and possibly billed) comparison into an error response.
+        ctx = _auth_ctx(request, x_agent_key)
+        if ctx is not None:
+            try:
+                store.save_research_run(result.get("ticker", ticker.upper()), "model_court",
+                                        ctx.tier, ctx.guest_key_id, result)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("api_model_court: history save failed (type=%s)", type(exc).__name__)
         return result
     except Exception as exc:  # noqa: BLE001 — type only, matching /api/byok/*'s own reasoning:
         # two different callers' money on this one request, not just one.

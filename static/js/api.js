@@ -250,6 +250,16 @@ export async function getResearch(ticker, question) {
   );
 }
 
+/* Saved research runs for a ticker — owner or guest only (session cookie
+   travels automatically, same as every other authed call). Anonymous and
+   self-key research is never on the server; app.js falls back to its own
+   localStorage cache for those tiers instead of calling this. */
+export async function getResearchHistory(ticker) {
+  return throwIfErrorField(
+    await request(`/api/research/${encodeURIComponent(ticker)}/history`, {}),
+  );
+}
+
 /* Anonymous, self-funded research — a visitor's OWN key, sent per-request as
    a header exactly like X-Agent-Key already works, never stored by this
    module. No session, no cookie needed for this one. May 403 if the
