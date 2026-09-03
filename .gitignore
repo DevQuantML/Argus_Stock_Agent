@@ -48,3 +48,7 @@ Thumbs.db
 argus*.db
 argus*.db-wal
 argus*.db-shm
+
+# graphify's generated AST cache + wiki output — regenerable, and large
+# (2.5MB+, grows with every run). Never belongs in the repo or the image.
+graphify-out/

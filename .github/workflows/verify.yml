@@ -25,3 +25,5 @@ jobs:
       - run: python scripts/verify_consistency.py
       - run: python scripts/verify_docs.py
       - run: python scripts/verify_access.py
+      - run: python scripts/verify_onboarding.py
+      - run: python scripts/verify_byok_visitor.py

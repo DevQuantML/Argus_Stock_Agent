@@ -16,6 +16,10 @@ argus.db-shm
 # Agent tooling. .claude/worktrees/ holds a full second checkout of this repo.
 .claude
 
+# graphify's generated AST cache + wiki output — regenerable, adds nothing
+# to a running container, and only bloats the image layer.
+graphify-out/
+
 # Python cache
 __pycache__
 *.pyc
