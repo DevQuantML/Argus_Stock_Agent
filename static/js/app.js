@@ -5,14 +5,14 @@
    Version query on each import so a redeploy can never pair a fresh app.js
    with a stale cached sub-module. Bump together with the ?v= in index.html. */
 
-import * as api from './api.js?v=41';
-import { drawChart, makeResponsive } from './chart.js?v=41';
-import { renderMarkdown, escapeHtml } from './md.js?v=41';
-import * as prefs from './theme.js?v=41';
-import * as ui from './ui.js?v=41';
-import * as views from './views.js?v=41';
-import * as tour from './tour.js?v=41';
-import { DISCLAIMER, FRESHNESS_NOTE, guestAllowanceLine } from './copy.js?v=41';
+import * as api from './api.js?v=42';
+import { drawChart, makeResponsive } from './chart.js?v=42';
+import { renderMarkdown, escapeHtml } from './md.js?v=42';
+import * as prefs from './theme.js?v=42';
+import * as ui from './ui.js?v=42';
+import * as views from './views.js?v=42';
+import * as tour from './tour.js?v=42';
+import { DISCLAIMER, FRESHNESS_NOTE, guestAllowanceLine } from './copy.js?v=42';
 
 const $  = ui.$;
 const $$ = ui.$$;
@@ -1850,8 +1850,6 @@ function wire() {
   $('btn-cfg').onclick  = openConfig;
   $('btn-data').onclick = () => ui.showDataModal(state.health, state.info);
 
-  let paused = false;
-  $('btn-tape').onclick = () => { paused = !paused; ui.setTapePaused(paused); };
   // Click any tape symbol — the user's own holdings/watchlist or a market
   // reference ticker (SPY/QQQ/DIA) — to open its free overview. Wired once:
   // renderTape() only ever replaces #tape's children, so this delegated

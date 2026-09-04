@@ -9,9 +9,9 @@
      2. Any string that originated from an LLM or from yfinance goes through
         textContent or renderMarkdown — never innerHTML with raw input. */
 
-import { renderMarkdown, escapeHtml } from './md.js?v=41';
-import { sparkline } from './chart.js?v=41';
-import * as prefs from './theme.js?v=41';
+import { renderMarkdown, escapeHtml } from './md.js?v=42';
+import { sparkline } from './chart.js?v=42';
+import * as prefs from './theme.js?v=42';
 
 export const $  = (id)  => document.getElementById(id);
 export const $$ = (sel) => Array.from(document.querySelectorAll(sel));
@@ -225,12 +225,6 @@ export function wireTapeClicks(onSym) {
     const tk = e.target.closest('.tk');
     if (tk?.dataset.sym) onSym(tk.dataset.sym);
   });
-}
-
-export function setTapePaused(paused) {
-  $('tape')?.classList.toggle('paused', paused);
-  const b = $('btn-tape');
-  if (b) { b.textContent = paused ? '▶' : '⏸'; b.setAttribute('aria-label', paused ? 'Resume ticker' : 'Pause ticker'); }
 }
 
 /* ── Brent panel ─────────────────────────────────────────────────────── */
