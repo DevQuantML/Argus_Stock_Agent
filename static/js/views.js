@@ -4,11 +4,11 @@
    portfolio overview, profile. Kept out of ui.js so that file stays about the
    terminal chrome. */
 
-import * as api from './api.js?v=40';
-import { renderMarkdown, escapeHtml } from './md.js?v=40';
-import * as ui from './ui.js?v=40';
-import * as prefs from './theme.js?v=40';
-import { DISCLAIMER, PRIVACY_NOTE, FRESHNESS_NOTE, guestAllowanceLine } from './copy.js?v=40';
+import * as api from './api.js?v=41';
+import { renderMarkdown, escapeHtml } from './md.js?v=41';
+import * as ui from './ui.js?v=41';
+import * as prefs from './theme.js?v=41';
+import { DISCLAIMER, PRIVACY_NOTE, FRESHNESS_NOTE, guestAllowanceLine } from './copy.js?v=41';
 
 const $ = ui.$;
 const el = ui.el;

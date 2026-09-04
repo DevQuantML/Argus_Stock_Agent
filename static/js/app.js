@@ -5,14 +5,14 @@
    Version query on each import so a redeploy can never pair a fresh app.js
    with a stale cached sub-module. Bump together with the ?v= in index.html. */
 
-import * as api from './api.js?v=40';
-import { drawChart, makeResponsive } from './chart.js?v=40';
-import { renderMarkdown, escapeHtml } from './md.js?v=40';
-import * as prefs from './theme.js?v=40';
-import * as ui from './ui.js?v=40';
-import * as views from './views.js?v=40';
-import * as tour from './tour.js?v=40';
-import { DISCLAIMER, FRESHNESS_NOTE, guestAllowanceLine } from './copy.js?v=40';
+import * as api from './api.js?v=41';
+import { drawChart, makeResponsive } from './chart.js?v=41';
+import { renderMarkdown, escapeHtml } from './md.js?v=41';
+import * as prefs from './theme.js?v=41';
+import * as ui from './ui.js?v=41';
+import * as views from './views.js?v=41';
+import * as tour from './tour.js?v=41';
+import { DISCLAIMER, FRESHNESS_NOTE, guestAllowanceLine } from './copy.js?v=41';
 
 const $  = ui.$;
 const $$ = ui.$$;
@@ -25,6 +25,10 @@ const state = {
   brent: null,
   portfolio: [],       // live positions from /api/portfolio
   rows: [],            // merged watchlist rows
+  marketRows: [],      // broad-market reference tickers (SPY/QQQ/DIA) — tape
+                        // display only, deliberately never merged into
+                        // `rows`: that array drives the watchlist panel's
+                        // HELD/WATCHING counts and P&L total.
   provider: 'perplexity',
 
   ticker: null,
@@ -204,6 +208,20 @@ async function bootSequence() {
 
 /* ── Painting ────────────────────────────────────────────────────────── */
 
+// Well-known ETF proxies, not raw index symbols: validate_ticker() only
+// accepts [A-Z0-9.-]{1,12}, so Yahoo's caret-prefixed index notation
+// (^GSPC, ^IXIC) would be rejected outright. SPY/QQQ/DIA are how retail
+// platforms represent these benchmarks anyway.
+const MARKET_TICKERS = ['SPY', 'QQQ', 'DIA']; // S&P 500, Nasdaq-100, Dow
+
+/* The tape shows the user's own rows plus the fixed market tickers, but the
+   two are never the same array — see state.marketRows' own comment. */
+function tapeItems() {
+  return [...state.rows, ...state.marketRows]
+    .filter(r => r.last !== null)
+    .map(r => ({ sym: r.sym, price: r.last, chg: r.chg, currency: r.currency }));
+}
+
 function paintAll() {
   ui.renderStatus(state.health, state.provider === 'groq' ? 'GROQ' : 'PERPLEXITY');
   ui.renderKeyState(tier(), api.auth.guest);
@@ -213,9 +231,7 @@ function paintAll() {
   ui.renderBrent(state.brent, state.levels);
   ui.renderGeo(state.info?.geo_transmission, state.info?.portfolio || [], (t) => runCommand(`research ${t}`));
   buildRows();
-  ui.renderTape(state.rows.filter(r => r.last !== null).map(r => ({
-    sym: r.sym, price: r.last, chg: r.chg, currency: r.currency,
-  })));
+  ui.renderTape(tapeItems());
 }
 
 function buildRows() {
@@ -245,6 +261,7 @@ function buildRows() {
   ui.renderWatchFooter(rows, state.totals);
   loadSparklines();
   loadWatchPrices();
+  loadMarketPrices();
 }
 
 /* Sparklines land after the table so rows appear immediately. Failures are
@@ -279,8 +296,35 @@ function loadWatchPrices() {
         row.currency = d.stock.currency;
         ui.renderWatchlist(state.rows, (s) => runCommand(`research ${s}`), (s) => inspect(s));
         ui.renderWatchFooter(state.rows, state.totals);
-        ui.renderTape(state.rows.filter(x => x.last !== null)
-          .map(x => ({ sym: x.sym, price: x.last, chg: x.chg, currency: x.currency })));
+        ui.renderTape(tapeItems());
+      })
+      .catch(() => {});
+  }
+}
+
+/* Broad-market reference tickers (SPY/QQQ/DIA) for the tape — same one-shot
+   free-quant pattern as loadWatchPrices() above, but writing to
+   state.marketRows, never state.rows: these are display-only benchmarks,
+   not the user's own holdings or watchlist, and must never affect the
+   watchlist panel's counts or P&L total. inspect(sym) (wired via
+   ui.wireTapeClicks in wire()) already renders a graceful "not held and
+   not on the watchlist" overview for exactly this case — nothing new
+   needed there. */
+let marketPricesFetched = false;
+function loadMarketPrices() {
+  if (marketPricesFetched) return;
+  marketPricesFetched = true;
+  state.marketRows = MARKET_TICKERS.map(sym => ({ sym, last: null, currency: null, chg: null }));
+  for (const sym of MARKET_TICKERS) {
+    api.getQuant(sym)
+      .then(d => {
+        const price = d?.stock?.price;
+        if (price === null || price === undefined) return;
+        const row = state.marketRows.find(x => x.sym === sym);
+        if (!row) return;
+        row.last = Number(price);
+        row.currency = d.stock.currency;
+        ui.renderTape(tapeItems());
       })
       .catch(() => {});
   }
@@ -1319,8 +1363,29 @@ function brentDetail() {
 async function inspect(sym) {
   ui.openInspector(sym, { }, null);
   try {
+    // api.getQuant() calls the anonymous-safe /api/demo/{ticker} — the exact
+    // route that deliberately strips my_position/watchlist for EVERY caller,
+    // by the same fix that closed the BYOK anonymous book-disclosure bug.
+    // That's correct for that route: it also serves keyless GitHub visitors
+    // with no session at all. It means the inspector, wired to this same
+    // call, could never show the owner their own held position — found live
+    // by clicking a held ticker in the tape and getting "not held" back for
+    // a position the owner plainly holds. The fix is not to loosen /api/demo
+    // (that would reopen the disclosure for every anonymous caller); it's to
+    // merge in data this session is ALREADY entitled to and already holds in
+    // memory: /api/portfolio (session-gated) for a held position, /api/info
+    // for a watchlist entry. Anonymous/guest-without-that-ticker callers get
+    // neither merged in, so they see exactly the same public view as before.
     const d = await api.getQuant(sym);
-    ui.openInspector(sym, d.stock || {}, d.quant || {});
+    const stock = { ...(d.stock || {}) };
+    const pf = state.portfolio.find(p => p.ticker === sym);
+    if (pf?.my_position) {
+      stock.my_position = pf.my_position;
+    } else {
+      const wl = state.info?.watchlist?.[sym];
+      if (wl) stock.watchlist = wl;
+    }
+    ui.openInspector(sym, stock, d.quant || {});
   } catch (err) {
     ui.toast(err.message, 'error');
     ui.closeInspector();
@@ -1787,6 +1852,11 @@ function wire() {
 
   let paused = false;
   $('btn-tape').onclick = () => { paused = !paused; ui.setTapePaused(paused); };
+  // Click any tape symbol — the user's own holdings/watchlist or a market
+  // reference ticker (SPY/QQQ/DIA) — to open its free overview. Wired once:
+  // renderTape() only ever replaces #tape's children, so this delegated
+  // listener survives every repaint with nothing to rewire.
+  ui.wireTapeClicks((sym) => inspect(sym));
 
   $('btn-stop').onclick = () => {
     if (state.cancelType) state.cancelType();

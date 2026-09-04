@@ -223,7 +223,8 @@ input::placeholder{color:var(--txt-muted);opacity:.7;}
 .tape-view{flex:1;overflow:hidden;min-width:0;}
 #tape{display:inline-flex;white-space:nowrap;animation:tape var(--tape-dur) linear infinite;font-size:10px;}
 #tape.paused{animation-play-state:paused;}
-.tk{padding:0 14px;display:inline-flex;gap:6px;align-items:center;}
+.tk{padding:0 14px;display:inline-flex;gap:6px;align-items:center;cursor:pointer;}
+.tk:hover .tk-s{color:var(--accent);}
 .tk-s{color:var(--txt-head);}
 .tk-p{color:var(--white);font-variant-numeric:tabular-nums;}
 .tk-c{font-variant-numeric:tabular-nums;}

@@ -9,9 +9,9 @@
      2. Any string that originated from an LLM or from yfinance goes through
         textContent or renderMarkdown — never innerHTML with raw input. */
 
-import { renderMarkdown, escapeHtml } from './md.js?v=40';
-import { sparkline } from './chart.js?v=40';
-import * as prefs from './theme.js?v=40';
+import { renderMarkdown, escapeHtml } from './md.js?v=41';
+import { sparkline } from './chart.js?v=41';
+import * as prefs from './theme.js?v=41';
 
 export const $  = (id)  => document.getElementById(id);
 export const $$ = (sel) => Array.from(document.querySelectorAll(sel));
@@ -201,6 +201,7 @@ export function renderTape(items) {
   const build = () => {
     for (const it of items) {
       const w = el('span', 'tk');
+      w.dataset.sym = it.sym;
       w.append(el('span', 'tk-s', it.sym));
       w.append(el('span', 'tk-p', it.price === null ? '—' : money(it.price, it.currency)));
       const c = num(it.chg);
@@ -209,6 +210,21 @@ export function renderTape(items) {
     }
   };
   build(); build();
+}
+
+/* One-time click delegation for the tape — renderTape() replaces #tape's
+   children on every refresh but never the container itself, so a listener
+   attached here survives every re-render with nothing to rewire. Reads
+   .dataset.sym from whichever .tk span was actually clicked, so it always
+   reflects what's currently rendered regardless of how many times the tape
+   has repainted since this was wired. */
+export function wireTapeClicks(onSym) {
+  const host = $('tape');
+  if (!host) return;
+  host.addEventListener('click', (e) => {
+    const tk = e.target.closest('.tk');
+    if (tk?.dataset.sym) onSym(tk.dataset.sym);
+  });
 }
 
 export function setTapePaused(paused) {
