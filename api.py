@@ -1726,26 +1726,34 @@ def api_model_court(
     the right owner/guest identity, and now also to decide the Gemini-key
     fallback below.
 
-    Owner-only convenience: if the caller is the OWNER and omits
-    X-Gemini-Key, fall back to a server-configured GEMINI_API_KEY (settable
-    via CONFIG once "gemini" was added to PERSISTENT_PROVIDERS — see
-    tools/setup_wizard.py). A guest — or anyone without a session, though
-    require_session already excludes that case — gets NO such fallback and
-    must always supply their own key, same as today. This is a deliberate,
-    narrow exception to "both keys are always the caller's own": it saves
-    the operator re-pasting a key they already own on every call, without
-    ever exposing a stored server credential to a caller who isn't the
-    operator. Perplexity is unchanged — still always required from the
-    caller here, even for the owner, who has never been able to omit it.
+    Owner-only convenience: if the caller is the OWNER and omits either
+    header, fall back to that provider's server-configured key —
+    PERPLEXITY_API_KEY (the operator's own regular research-engine
+    credential, already used for every normal /api/research/* call) or
+    GEMINI_API_KEY (settable via CONFIG once "gemini" was added to
+    PERSISTENT_PROVIDERS — see tools/setup_wizard.py). Both fall back the
+    same way now — the asymmetry this docstring used to describe (Perplexity
+    always required, only Gemini optional) was the CONFIG-modal support for
+    persisting a Gemini key arriving one commit later than Model Court's own
+    owner fallback; there was never a reason to treat them differently once
+    both keys can be configured server-side. A guest — or anyone without a
+    session, though require_session already excludes that case — gets NO
+    such fallback for either key and must always supply their own, same as
+    today. This is a deliberate, narrow exception to "both keys are always
+    the caller's own": it saves the operator re-pasting keys they already
+    own on every call, without ever exposing a stored server credential to
+    a caller who isn't the operator.
     """
     if provider_mode not in ("both", "perplexity", "gemini"):
         return JSONResponse(status_code=400, content={
             "error": "provider_mode must be one of: both, perplexity, gemini"})
 
     ctx = _auth_ctx(request, x_agent_key)
-    if (ctx is not None and ctx.tier == "owner" and not x_gemini_key
-            and provider_mode in ("both", "gemini")):
-        x_gemini_key = os.getenv("GEMINI_API_KEY") or x_gemini_key
+    if ctx is not None and ctx.tier == "owner":
+        if not x_perplexity_key and provider_mode in ("both", "perplexity"):
+            x_perplexity_key = os.getenv("PERPLEXITY_API_KEY") or x_perplexity_key
+        if not x_gemini_key and provider_mode in ("both", "gemini"):
+            x_gemini_key = os.getenv("GEMINI_API_KEY") or x_gemini_key
 
     # Only the key(s) the selected mode actually needs are required — a
     # Perplexity-only run must not be blocked on a missing Gemini key the

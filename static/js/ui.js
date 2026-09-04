@@ -9,9 +9,9 @@
      2. Any string that originated from an LLM or from yfinance goes through
         textContent or renderMarkdown — never innerHTML with raw input. */
 
-import { renderMarkdown, escapeHtml } from './md.js?v=38';
-import { sparkline } from './chart.js?v=38';
-import * as prefs from './theme.js?v=38';
+import { renderMarkdown, escapeHtml } from './md.js?v=39';
+import { sparkline } from './chart.js?v=39';
+import * as prefs from './theme.js?v=39';
 
 export const $  = (id)  => document.getElementById(id);
 export const $$ = (sel) => Array.from(document.querySelectorAll(sel));
@@ -1655,42 +1655,54 @@ export function confirmSpend(title, detail, cost) {
   });
 }
 
-/* Model Court needs BOTH keys at once, from an already-unlocked caller
-   (owner or guest) — a separate, smaller form from the full BYOK landing
-   pane, since this is reached from inside the terminal, not the pre-auth
-   gate. Neither key is stored anywhere by this function; the caller
-   receives them once and they go out of scope the moment the request that
-   uses them returns — same in-memory-only discipline as state.selfKey.
+const MC_COST_NOTE = {
+  both: '2 Perplexity calls (research + comparison) + 1 Gemini call.',
+  perplexity: '1 Perplexity call.',
+  gemini: '1 Gemini call, against your funded quota.',
+};
 
-   `isOwner` narrows the Gemini field from required to optional, matching
-   api_model_court's own owner-only fallback (api.py): the operator can
-   leave it blank and the server uses its own configured GEMINI_API_KEY
-   instead. A guest gets no such fallback — server-side AND here, both
-   fields stay required for them, since api.py never extends the operator's
-   stored key to anyone who isn't the operator.
+/* Model Court needs a key per provider it runs, from an already-unlocked
+   caller (owner or guest) — a separate, smaller form from the full BYOK
+   landing pane, since this is reached from inside the terminal, not the
+   pre-auth gate. A key typed here is never stored by this function; it
+   goes out of scope the moment the request that uses it returns — same
+   in-memory-only discipline as state.selfKey.
+
+   `configured` ({perplexity, gemini}, owner-only — always {} for a guest)
+   names which providers the operator already has on file in ◈ CONFIG.
+   Matching api_model_court's own owner-only fallback (api.py, symmetric
+   for both providers as of this pass — it used to be Gemini-only, back
+   when Gemini was the only one of the two persistable via CONFIG): for
+   each provider the current mode needs, if it's in `configured` the field
+   is replaced with a plain "using your configured key" status line —
+   nothing to paste, nothing shown as a blank input pretending to be
+   optional — and the whole modal becomes a cost-confirmation step, no key
+   entry at all, exactly when the owner has already configured everything
+   the selected mode needs. A guest gets no such fallback — server-side
+   AND here, every field the mode needs stays a real required input, since
+   api.py never extends the operator's stored key to anyone who isn't the
+   operator.
 
    Provider-mode toggle (BOTH / PERPLEXITY / GEMINI): added once both
    providers started drawing real, funded credits rather than one of them
    being effectively free — a caller who only wants one provider's take (or
    is just sanity-checking one side) should not be forced to hold and spend
-   a key for the other. Only the field(s) the selected mode needs are shown
-   and required; server-side validation in api.py is mode-aware for the
-   same reason, so this is a real UX narrowing, not just cosmetic — an
-   unneeded field left blank was never going to be accepted as "both keys
-   required" once the mode says otherwise. */
-export function showModelCourtKeys(sym, isOwner) {
+   a key for the other. Switching modes re-evaluates which fields are
+   needed AND which of those are already configured, so e.g. an owner with
+   only Perplexity on file sees a live Gemini field appear the moment they
+   pick BOTH or GEMINI ONLY, and it disappears again back on PERPLEXITY
+   ONLY. */
+export function showModelCourtKeys(sym, isOwner, configured) {
+  const cfg = configured || {};
   return new Promise((resolve) => {
     let mode = 'both';
-    const geminiHint = isOwner
-      ? '<div class="hint" style="margin-top:4px;font-size:10px">Leave blank to use your configured key, if set in ◈ CONFIG.</div>'
-      : '';
     const { box, close } = modal(`
       <div class="mdl-hd"><span>ARGUS://MODEL COURT · ${escapeHtml(sym)}</span><button data-close type="button">✕</button></div>
       <div class="mdl-b">
         <p class="hint" style="margin:0 0 12px;line-height:1.8">Compares Perplexity and Gemini
-          on your own key(s). Neither key is stored — paste them each time you run this.
-          Both providers now spend real, funded credits — pick one side if you only need
-          one take, to avoid spending on both.</p>
+          on your own key(s). A pasted key is never stored — only for this one run. Both
+          providers now spend real, funded credits — pick one side if you only need one
+          take, to avoid spending on both.</p>
         <div class="fld">
           <div class="fld-l">Providers</div>
           <div class="seg" id="mc-mode">
@@ -1704,10 +1716,10 @@ export function showModelCourtKeys(sym, isOwner) {
           <input id="mc-pplx" class="inp" type="password" autocomplete="off" spellcheck="false"/>
         </div>
         <div class="fld" id="mc-fld-gemini">
-          <div class="fld-l">Gemini key${isOwner ? ' (optional)' : ''}</div>
+          <div class="fld-l">Gemini key</div>
           <input id="mc-gemini" class="inp" type="password" autocomplete="off" spellcheck="false"/>
-          ${geminiHint}
         </div>
+        <div class="cf-tot" id="mc-cost"><span class="l">COST ALERT</span><span class="v" id="mc-cost-v"></span></div>
         <div id="mc-err" class="gate-err"></div>
       </div>
       <div class="mdl-f">
@@ -1718,10 +1730,36 @@ export function showModelCourtKeys(sym, isOwner) {
     const fldPplx = box.querySelector('#mc-fld-pplx');
     const fldGemini = box.querySelector('#mc-fld-gemini');
     const modeSeg = box.querySelector('#mc-mode');
+    const costV = box.querySelector('#mc-cost-v');
+
+    // Replaces a field with a plain status line when this owner already has
+    // that provider configured AND the current mode actually needs it —
+    // this is the "skip key entry" fast path, not just a hint text change.
+    const paintField = (fld, input, label, provider) => {
+      const need = provider === 'perplexity' ? mode !== 'gemini' : mode !== 'perplexity';
+      if (!need) { fld.hidden = true; return; }
+      fld.hidden = false;
+      const isConfigured = isOwner && cfg[provider];
+      fld.querySelector('.fld-l').textContent = label;
+      input.hidden = !!isConfigured;
+      let status = fld.querySelector('.mc-cfg-status');
+      if (isConfigured) {
+        if (!status) {
+          status = document.createElement('div');
+          status.className = 'mc-cfg-status hint';
+          status.style.cssText = 'color:var(--green)';
+          fld.appendChild(status);
+        }
+        status.textContent = `✓ using your configured ${label.replace(' key', '')} key`;
+      } else if (status) {
+        status.remove();
+      }
+    };
     const paintMode = () => {
       modeSeg.querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.v === mode));
-      fldPplx.hidden = mode === 'gemini';
-      fldGemini.hidden = mode === 'perplexity';
+      paintField(fldPplx, box.querySelector('#mc-pplx'), 'Perplexity key', 'perplexity');
+      paintField(fldGemini, box.querySelector('#mc-gemini'), 'Gemini key', 'gemini');
+      costV.textContent = MC_COST_NOTE[mode];
     };
     modeSeg.querySelectorAll('button').forEach(b => {
       b.onclick = () => { mode = b.dataset.v; paintMode(); };
@@ -1735,18 +1773,22 @@ export function showModelCourtKeys(sym, isOwner) {
       const perplexityKey = box.querySelector('#mc-pplx').value.trim();
       const geminiKey = box.querySelector('#mc-gemini').value.trim();
       const err = box.querySelector('#mc-err');
-      const needPplx = mode !== 'gemini';
-      const needGemini = mode !== 'perplexity' && !isOwner;
+      // A field the owner already has configured is satisfied by that
+      // fallback (server-side, api.py) regardless of what's typed here —
+      // it isn't "required" in the sense of needing input from this modal.
+      const needPplx = mode !== 'gemini' && !(isOwner && cfg.perplexity);
+      const needGemini = mode !== 'perplexity' && !(isOwner && cfg.gemini);
       if ((needPplx && !perplexityKey) || (needGemini && !geminiKey)) {
-        err.textContent = mode === 'both'
-          ? (isOwner ? 'Perplexity key is required.'
-                     : 'Both keys are required — Model Court compares two providers.')
-          : `${mode === 'perplexity' ? 'Perplexity' : 'Gemini'} key is required.`;
+        const missing = [needPplx && !perplexityKey && 'Perplexity',
+                          needGemini && !geminiKey && 'Gemini'].filter(Boolean);
+        err.textContent = `${missing.join(' and ')} key is required.`;
         return;
       }
       done({ perplexityKey, geminiKey, providerMode: mode });
     };
-    box.querySelector('#mc-pplx').focus();
+    const firstInput = [box.querySelector('#mc-pplx'), box.querySelector('#mc-gemini')]
+      .find(el => el && !el.hidden && !el.closest('.fld').hidden);
+    firstInput?.focus();
   });
 }
 

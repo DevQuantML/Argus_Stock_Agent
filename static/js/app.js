@@ -5,14 +5,14 @@
    Version query on each import so a redeploy can never pair a fresh app.js
    with a stale cached sub-module. Bump together with the ?v= in index.html. */
 
-import * as api from './api.js?v=38';
-import { drawChart, makeResponsive } from './chart.js?v=38';
-import { renderMarkdown, escapeHtml } from './md.js?v=38';
-import * as prefs from './theme.js?v=38';
-import * as ui from './ui.js?v=38';
-import * as views from './views.js?v=38';
-import * as tour from './tour.js?v=38';
-import { DISCLAIMER, FRESHNESS_NOTE, guestAllowanceLine } from './copy.js?v=38';
+import * as api from './api.js?v=39';
+import { drawChart, makeResponsive } from './chart.js?v=39';
+import { renderMarkdown, escapeHtml } from './md.js?v=39';
+import * as prefs from './theme.js?v=39';
+import * as ui from './ui.js?v=39';
+import * as views from './views.js?v=39';
+import * as tour from './tour.js?v=39';
+import { DISCLAIMER, FRESHNESS_NOTE, guestAllowanceLine } from './copy.js?v=39';
 
 const $  = ui.$;
 const $$ = ui.$$;
@@ -1032,7 +1032,16 @@ async function runModelCourt(sym) {
     return;
   }
 
-  const keys = await ui.showModelCourtKeys(sym, isOwner());
+  // Owner-only: which providers are already configured server-side (◈
+  // CONFIG), so showModelCourtKeys can skip asking for a key it can
+  // already fall back to (api_model_court's own owner-only fallback).
+  // Never sent for a guest — state.health.checks is read regardless, but
+  // showModelCourtKeys only consults `configured` when isOwner() is true.
+  const configured = {
+    perplexity: !!state.health?.checks?.perplexity_key,
+    gemini: !!state.health?.checks?.gemini_key,
+  };
+  const keys = await ui.showModelCourtKeys(sym, isOwner(), configured);
   if (!keys) return;
 
   state.busy = true;
