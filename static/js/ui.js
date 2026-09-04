@@ -9,9 +9,9 @@
      2. Any string that originated from an LLM or from yfinance goes through
         textContent or renderMarkdown — never innerHTML with raw input. */
 
-import { renderMarkdown, escapeHtml } from './md.js?v=39';
-import { sparkline } from './chart.js?v=39';
-import * as prefs from './theme.js?v=39';
+import { renderMarkdown, escapeHtml } from './md.js?v=40';
+import { sparkline } from './chart.js?v=40';
+import * as prefs from './theme.js?v=40';
 
 export const $  = (id)  => document.getElementById(id);
 export const $$ = (sel) => Array.from(document.querySelectorAll(sel));
@@ -1656,7 +1656,7 @@ export function confirmSpend(title, detail, cost) {
 }
 
 const MC_COST_NOTE = {
-  both: '2 Perplexity calls (research + comparison) + 1 Gemini call.',
+  both: '2 Perplexity calls (research + master analysis) + 1 Gemini call.',
   perplexity: '1 Perplexity call.',
   gemini: '1 Gemini call, against your funded quota.',
 };
@@ -1699,10 +1699,11 @@ export function showModelCourtKeys(sym, isOwner, configured) {
     const { box, close } = modal(`
       <div class="mdl-hd"><span>ARGUS://MODEL COURT · ${escapeHtml(sym)}</span><button data-close type="button">✕</button></div>
       <div class="mdl-b">
-        <p class="hint" style="margin:0 0 12px;line-height:1.8">Compares Perplexity and Gemini
-          on your own key(s). A pasted key is never stored — only for this one run. Both
-          providers now spend real, funded credits — pick one side if you only need one
-          take, to avoid spending on both.</p>
+        <p class="hint" style="margin:0 0 12px;line-height:1.8">Runs Perplexity and Gemini on
+          your own key(s), then writes one master analysis anchored on the locally computed
+          metrics. A pasted key is never stored — only for this one run. Both providers
+          spend real, funded credits — pick one side if you only need that provider's
+          brief, though a single side produces no master analysis.</p>
         <div class="fld">
           <div class="fld-l">Providers</div>
           <div class="seg" id="mc-mode">

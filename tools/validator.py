@@ -249,16 +249,27 @@ def sanitize_prompt_text(text, max_len: int = _MAX_PROMPT_TEXT_LEN,
     return f"<<<UNTRUSTED:{label}>>>\n{cleaned}\n<<<END:{label}>>>"
 
 
-def guard_tool_output(text: str) -> str:
+def guard_tool_output(text: str, max_len: int = _MAX_TOOL_OUTPUT_LEN) -> str:
     """
     Sanitise tool output before it is added to the agent message history.
 
     Two defences:
-    1. Truncate to MAX_TOOL_OUTPUT_LEN to prevent token flooding.
+    1. Truncate to `max_len` to prevent token flooding.
     2. Detect and redact known prompt-injection phrases; log a WARNING.
 
     This is the primary injection surface — apply it to EVERY tool result
     before Claude sees it.
+
+    `max_len` defaults to _MAX_TOOL_OUTPUT_LEN (4000), so every existing
+    caller behaves exactly as before. It exists because that fixed 4000 was
+    silently contradicting the `max_tokens` its callers asked for: a request
+    for 2500 tokens can return ~10000 characters, and the cap cut it to 4000
+    mid-sentence. Found live — a research brief lost its closing VERDICT and
+    NEXT CATALYST sections, and a Model Court master analysis lost its
+    WHAT BREAKS IT / WHAT TO DO sections, with no error and nothing in the
+    logs. The truncation defence is about bounding what a *chained* call
+    feeds the next model, so it stays — but the bound belongs proportional
+    to what the caller actually requested, which is what _call() now passes.
 
     Returns:
         Sanitised string (never raises).
@@ -267,8 +278,8 @@ def guard_tool_output(text: str) -> str:
         text = str(text)
 
     # 1. Truncate
-    if len(text) > _MAX_TOOL_OUTPUT_LEN:
-        text = text[:_MAX_TOOL_OUTPUT_LEN]
+    if len(text) > max_len:
+        text = text[:max_len]
 
     # 2. Detect injection attempts (case-insensitive)
     text_lower = text.lower()

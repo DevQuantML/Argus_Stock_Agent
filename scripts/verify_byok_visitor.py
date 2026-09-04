@@ -627,10 +627,10 @@ def main():
           degraded_body.get("perplexity", {}).get("error"), "the key was rejected")
     check("the working side's report made it through",
           degraded_body.get("gemini", {}).get("report"), "STUBBED GEMINI REPORT")
-    check("comparison was skipped — needs both sides",
-          degraded_body.get("comparison"), None)
+    check("master analysis was skipped — needs both sides",
+          degraded_body.get("analysis"), None)
     check("...with a note explaining why, naming the failed provider",
-          "Perplexity" in (degraded_body.get("comparison_note") or ""), True)
+          "Perplexity" in (degraded_body.get("analysis_note") or ""), True)
     check("no comparison call was attempted for the degraded request",
           len(mc_comparison_calls), 0)
 
@@ -644,10 +644,10 @@ def main():
     check("Gemini stub reached exactly once", len(mc_gemini_calls), 1)
     check("the comparison stub was reached exactly once", len(mc_comparison_calls), 1)
     full_body = r_full.json()
-    check("the comparison text made it into the response",
-          full_body.get("comparison"), "STUBBED COMPARISON — A caught X, B caught Y")
-    check("no comparison_note on a fully successful run",
-          full_body.get("comparison_note"), None)
+    check("the master analysis text made it into the response",
+          full_body.get("analysis"), "STUBBED COMPARISON — A caught X, B caught Y")
+    check("no analysis_note on a fully successful run",
+          full_body.get("analysis_note"), None)
     check("the raw Perplexity key never appears anywhere in the response body",
           good_pplx in r_full.text, False)
     check("the raw Gemini key never appears anywhere in the response body",

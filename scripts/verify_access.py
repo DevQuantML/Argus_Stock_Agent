@@ -1092,7 +1092,7 @@ def main():
     api.run_model_court = lambda ticker, question, pk, gk, provider_mode="both": {
         "ticker": ticker, "mode": "model_court", "provider_mode": provider_mode,
         "perplexity": {"report": "p"}, "gemini": {"report": "g"},
-        "comparison": "stub comparison", "comparison_note": None,
+        "analysis": "stub analysis", "analysis_note": None,
     }
     try:
         r = hc.post("/api/model-court/HIST2", headers={

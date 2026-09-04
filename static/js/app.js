@@ -5,14 +5,14 @@
    Version query on each import so a redeploy can never pair a fresh app.js
    with a stale cached sub-module. Bump together with the ?v= in index.html. */
 
-import * as api from './api.js?v=39';
-import { drawChart, makeResponsive } from './chart.js?v=39';
-import { renderMarkdown, escapeHtml } from './md.js?v=39';
-import * as prefs from './theme.js?v=39';
-import * as ui from './ui.js?v=39';
-import * as views from './views.js?v=39';
-import * as tour from './tour.js?v=39';
-import { DISCLAIMER, FRESHNESS_NOTE, guestAllowanceLine } from './copy.js?v=39';
+import * as api from './api.js?v=40';
+import { drawChart, makeResponsive } from './chart.js?v=40';
+import { renderMarkdown, escapeHtml } from './md.js?v=40';
+import * as prefs from './theme.js?v=40';
+import * as ui from './ui.js?v=40';
+import * as views from './views.js?v=40';
+import * as tour from './tour.js?v=40';
+import { DISCLAIMER, FRESHNESS_NOTE, guestAllowanceLine } from './copy.js?v=40';
 
 const $  = ui.$;
 const $$ = ui.$$;
@@ -1081,29 +1081,31 @@ async function runModelCourt(sym) {
       o.appendChild(p);
     };
 
+    // Master analysis leads. It is the thing the reader acts on; the two
+    // briefs underneath are the audit trail for it — worth keeping (you can
+    // always check what each search actually claimed) but not worth reading
+    // first. Single-provider mode never produces one (run_model_court gates
+    // it on provider_mode == 'both'), and its note says so plainly, so a
+    // heading over that note would just repeat itself.
+    if (mode === 'both') {
+      section('MASTER ANALYSIS');
+      if (res.analysis) await typeBlock(o, res.analysis);
+      else failLine(res.analysis_note || 'Master analysis unavailable.', true);
+    }
+
     if (res.perplexity) {
-      section('PERPLEXITY');
+      section('PERPLEXITY · SOURCE BRIEF');
       if (res.perplexity.error) failLine(`Failed: ${res.perplexity.error}`);
       else await typeBlock(o, res.perplexity.report || '');
     }
 
     if (res.gemini) {
-      section('GEMINI');
+      section('GEMINI · SOURCE BRIEF');
       if (res.gemini.error) failLine(`Failed: ${res.gemini.error}`);
       else await typeBlock(o, res.gemini.report || '');
     }
 
-    // Single-provider mode never attempts a comparison (see run_model_court's
-    // own provider_mode == 'both' gate) — its comparison_note says so
-    // plainly, so a real section for it would just repeat that note as a
-    // heading over itself.
-    if (mode === 'both') {
-      section('COMPARISON');
-      if (res.comparison) await typeBlock(o, res.comparison);
-      else failLine(res.comparison_note || 'Comparison unavailable.', true);
-    }
-
-    const ranOk = mode === 'both' ? !!res.comparison
+    const ranOk = mode === 'both' ? !!res.analysis
                 : mode === 'perplexity' ? !res.perplexity?.error
                 : !res.gemini?.error;
     ui.setStatus(ranOk ? 'COMPLETE' : 'PARTIAL', ranOk ? 'ok' : 'err');
@@ -1184,9 +1186,14 @@ async function showHistory(rawSym) {
       // effect — default to it so history from before this field existed
       // still renders both sections, same as it always has.
       const pmode = p.provider_mode || 'both';
-      if (p.perplexity) { section('PERPLEXITY'); body(p.perplexity.report); }
-      if (p.gemini)     { section('GEMINI');     body(p.gemini.report); }
-      if (pmode === 'both') { section('COMPARISON'); body(p.comparison || p.comparison_note); }
+      // `analysis` replaced `comparison` when the third call stopped being a
+      // document diff and became the investment analysis. Rows saved before
+      // that rename still carry the old keys, so read either — a recall list
+      // that silently blanked older runs would be worse than the rename.
+      const master = p.analysis || p.analysis_note || p.comparison || p.comparison_note;
+      if (pmode === 'both') { section('MASTER ANALYSIS'); body(master); }
+      if (p.perplexity) { section('PERPLEXITY · SOURCE BRIEF'); body(p.perplexity.report); }
+      if (p.gemini)     { section('GEMINI · SOURCE BRIEF');     body(p.gemini.report); }
     } else {
       body('');
     }
@@ -1462,7 +1469,7 @@ function wireHints() {
   let idx = -1;
 
   const HINTS = [
-    ['research', 'full staged brief'], ['court', 'Perplexity vs Gemini, compared'],
+    ['research', 'full staged brief'], ['court', 'both models, one master analysis'],
     ['history', 'past research, saved'],
     ['quant', 'free metrics only'],
     ['chart', 'price + reference lines'], ['scan', 'sweep all holdings'],
