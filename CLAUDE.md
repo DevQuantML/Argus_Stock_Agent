@@ -444,11 +444,15 @@ js/tour.js            five-step coach-mark orientation (no imports, no network)
   `_get_local_bundle()`, gated on `override` being truthy — `override`
   already means "this call is funded by a caller-supplied key, not the
   owner's own configured provider" everywhere else in this file, so it is the
-  correct signal here too, not a new one invented for this fix. Confirmed the
-  rest of the blast radius is clean: `run_research_module()` and
-  `run_synthesis()` never expose raw `stock` at all, and `_build_context()`
-  builds prose that never references either key, so there is no indirect
-  leak through LLM-generated text. `scripts/verify_hardening.py` section 6b
+  correct signal here too, not a new one invented for this fix. **The
+  blast-radius note that used to sit here was WRONG and is corrected in the
+  next gotcha below** — it claimed `_build_context()` "builds prose that
+  never references either key, so there is no indirect leak." It does not
+  reference `stock`'s keys, true; it calls `store.positions()` itself, which
+  the check missed entirely, and the book kept reaching BYOK callers through
+  the *prompt* for another day. `run_research_module()` and
+  `run_synthesis()` genuinely never expose raw `stock`, which is the part of
+  that claim that held. `scripts/verify_hardening.py` section 6b
   reuses the same planted `secret_thesis`/`secret_watch_note` markers as the
   `/api/demo` disclosure test and hits `/api/byok/AAPL` and `/api/byok/MSFT`
   anonymously with `ALLOW_BYOK_VISITORS=1` forced on, asserting the response
@@ -456,6 +460,32 @@ js/tour.js            five-step coach-mark orientation (no imports, no network)
   than `run_perplexity_research` itself, so the real strip logic actually
   executes under test. **This was found by curling the live deployment after
   redeploying, not by re-reading the diff** — the discipline that caught it.
+- **The same book leak had a SECOND path — the prompt — and the fix above
+  never touched it.** Stripping `my_position`/`watchlist` off `stock` cleans
+  what comes BACK. It says nothing about what goes OUT. `_build_context()`
+  called `store.positions()`/`store.watchlist()` on its own and baked an
+  `ACTIVE POSITION` block (shares, average cost, stop-loss, tranches, and the
+  operator's private thesis) straight into the context string — and that
+  string is **cached** by `_get_local_bundle()` and handed to every caller,
+  including the three that accept an `override`
+  (`run_research_module`, `run_synthesis`, `run_perplexity_research`). So an
+  anonymous `/api/byok/{ticker}` visitor's own Perplexity/Groq/Gemini account
+  received the operator's book inside the prompt — invisible in the HTTP
+  response, sitting in a stranger's provider history. Model Court's guest
+  tier had the same exposure. Found by **capturing the actual prompt string**
+  on an override call and grepping it for a planted thesis, specifically
+  because the previous gotcha's confident "no indirect leak" claim deserved
+  a test rather than trust. The fix inverts the default so the bug is
+  unrepresentable rather than patched: `_book_block(ticker)` is now separate,
+  `_get_local_bundle()`'s cached context is **always** book-free, and a
+  caller entitled to the book appends it explicitly (`if not override:
+  context += _book_block(ticker)`). A fourth caller added later gets the safe
+  string by default and has to opt in. `verify_hardening.py` section 6c
+  asserts **both directions** — the BYOK prompt carries neither the thesis nor
+  the `ACTIVE POSITION` header, AND a positive control that the owner's own
+  run still does, because a leak test that only checks the negative keeps
+  passing if the book stops reaching anyone and silently guts the owner's
+  own research.
 - **A Dockerfile refactor can make an existing hardening check pass for the
   wrong reason.** Moving the real `uvicorn` invocation out of `Dockerfile`
   and into `docker-entrypoint.sh` (see the non-root/volume-ownership gotcha

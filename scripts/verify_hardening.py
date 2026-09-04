@@ -445,6 +445,45 @@ def main():
         else:
             os.environ["ALLOW_BYOK_VISITORS"] = prev_byok
 
+    # ── 6c. The same disclosure again, one layer deeper: the PROMPT ─────────
+    # 6b proves the book never comes back in the RESPONSE. It says nothing
+    # about what was SENT. Those are different code paths, and the response
+    # fix (stripping stock's my_position/watchlist keys) never touched the
+    # prompt: _build_context() called store.positions() itself, so the
+    # operator's shares, average cost, stop-loss and private thesis rode the
+    # CACHED context string into every BYOK caller's own provider account —
+    # a stranger's Perplexity/Groq/Gemini history, for an anonymous
+    # /api/byok/{ticker} visitor. Found by capturing the actual prompt rather
+    # than re-reading the diff, after a comment in this repo claimed that
+    # exact path was clean.
+    #
+    # The book now lives in _book_block() and is appended ONLY when
+    # `override` is falsy. This asserts both directions — a leak test that
+    # only checks the negative would still pass if the book stopped being
+    # sent to ANYONE, which would silently gut the owner's own research.
+    captured_prompts = []
+    pr_mod._call = lambda prompt, *a, **k: (captured_prompts.append(prompt), "stubbed")[1]
+    try:
+        pr_mod._local_cache.clear()
+        pr_mod.run_perplexity_research("AAPL", None, override=("groq", "gsk_" + "z" * 40))
+        byok_prompts = "\n".join(captured_prompts)
+        check("BYOK prompt never carries the operator's thesis text",
+              secret_thesis in byok_prompts, False)
+        check("BYOK prompt never carries the ACTIVE POSITION block",
+              "ACTIVE POSITION" in byok_prompts, False)
+
+        captured_prompts.clear()
+        pr_mod._local_cache.clear()
+        pr_mod.run_perplexity_research("AAPL", None)  # owner path, no override
+        owner_prompts = "\n".join(captured_prompts)
+        check("positive control: the owner's OWN run still gets the book",
+              secret_thesis in owner_prompts, True)
+        check("...including the ACTIVE POSITION block",
+              "ACTIVE POSITION" in owner_prompts, True)
+    finally:
+        pr_mod._call = real_call
+        pr_mod._local_cache.clear()
+
     # Clean up the planted position/watch row — later sections assert on a
     # known-empty book, and this one must not leak state into them.
     store.delete_position("AAPL")
