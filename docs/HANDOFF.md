@@ -2,11 +2,23 @@
 
 Last updated: 2026-08-23
 
-> **Most recent change (2026-08-23): geo-transmission grew sector search and
-> earnings prompting.** `GEO_TRANSMISSION` (§1, §10.6) now drives a sector
-> search command and prompts the research pipeline with the ticker's next
-> earnings date, threaded through as a question the AI modules answer
-> directly rather than a generic macro pass. If you are holding a mental
+> **Most recent change (2026-08-23, corrected 2026-09-05): three separate
+> additions, not one.** An earlier version of this note described a "sector
+> search command" and conflated all three into a single earnings-question
+> flow — neither is accurate; corrected here rather than left standing.
+> (1) The geo panel auto-populates: `GEO_TRANSMISSION` (§1, §10.6) is still
+> hand-curated exactly as the operator wrote it and always wins, but any
+> event they haven't mapped is now filled in from a new `GEO_EVENT_LIBRARY`,
+> matched against the sector on every actual held/watched position by
+> *prefix*, not substring — "Technology"/"Semiconductors" match "tech" /
+> "semiconductor", "Fintech" correctly still does not match "tech". Zero live
+> fetch, zero cost, no news feed. (2) The command line now captures anything
+> typed after a ticker as a free-text question and threads it into the
+> research pipeline's `question` parameter, which already existed end-to-end
+> but had no caller — there is no dedicated "sector search command". (3)
+> Independently of (2), the default research brief now asks for the next
+> earnings date and an upside/downside estimate as a standing bullet, so a
+> user gets it without typing a question at all. If you are holding a mental
 > model where geo-transmission only feeds the public/private data boundary
 > at `/api/meta`, it is out of date — that boundary is unchanged, this is
 > additive.
