@@ -904,3 +904,160 @@ Per-user sandboxes (each guest with their own book), any outbound email or SMTP
 integration, automated key issuance, payment or credit metering beyond the
 one-dive counter, and OAuth. The model here is a trusted circle around one
 operator's terminal, and each of those is a different product.
+
+## 11. Cloud Run + Cloud SQL migration, Gemini promotion, Model Court modes (2026-09-04)
+
+### 11.1 Why this happened
+
+The instance had just gone live on Railway when a real, live-discovered
+vulnerability (§ below) and persistent dashboard confusion (a CRASHED
+deployment display for what was actually a stale entry, project- vs
+account-scoped tokens) made the platform itself worth reconsidering. Asked
+directly why not Google Cloud — nothing structurally prevented it. The honest
+tradeoff: this app's hard constraint (`--workers 1`, one global SQLite
+connection behind a `threading.Lock`, no horizontal scaling) maps cleanly onto
+a Compute Engine VM but awkwardly onto Cloud Run, whose only persistent-storage
+option for a local file (a GCS FUSE mount) is genuinely risky for SQLite
+specifically — no real file locking, and an instance can be recreated
+mid-write. Chose the bigger job: Cloud Run, with SQLite replaced by Cloud SQL
+Postgres for the deploy target, rather than working around the fragility.
+
+### 11.2 store_postgres.py — a full sibling, not a shared-SQL layer
+
+`store.py` (SQLite) is untouched and stays the default for local dev and every
+free harness. `store_postgres.py` is a complete second implementation of the
+same public function surface, chosen once per process via a `sys.modules`
+pre-registration in `api.py`, before its own first `import store` —
+`tools/perplexity_research.py` and `tools/stock_data.py` also import `store`
+directly, so the choice has to be made once, process-wide, not per call site
+(a per-call-site conditional was considered and rejected as the same shape of
+bug as the `state.tier` mirror and `?v=` drift gotchas already in this repo).
+See `CLAUDE.md`'s Gotchas for the exact mechanism and why a wildcard-import
+facade doesn't work here (a function's closure captures its *defining*
+module's globals, so a facade module can't correctly proxy mutable state like
+`_conn`).
+
+Two real bugs found by testing, not written and assumed correct:
+
+- **`consume_guest_unit`'s atomic claim needed a `SAVEPOINT`** — Postgres
+  aborts the whole surrounding transaction on a failed statement, unlike
+  sqlite3; without it, a genuine concurrent-claim race would silently discard
+  the already-correct `dive_ticker` binding alongside the expected conflict.
+  Proven under real concurrency: `verify_postgres_store.py` fires 8 threads at
+  one stage and asserts exactly one wins.
+- **`ORDER BY created_at DESC` with no tiebreaker isn't deterministic under a
+  tie** — a 25-row stress-test loop landed every row on the identical
+  timestamp (clock resolution, not a Postgres quirk), so the retention prune
+  and the history `SELECT` could disagree on which rows counted as "newest."
+  Latent in `store.py`'s original SQLite version too (same query shape); both
+  files now sort `created_at DESC, id DESC`.
+
+Live-verified against real Cloud SQL, not just the local harness: owner login,
+a real position write/read-back round-trip, the anonymous BYOK route
+re-confirmed clean of book data on the new backend, and the session cookie
+confirmed `Secure` with HSTS present (proving `TRUST_PROXY=1` took effect
+behind Cloud Run's own proxy).
+
+### 11.3 A live vulnerability, found by curling the deployment, not by review
+
+`GET /api/byok/{ticker}` — fully anonymous, gated only by
+`ALLOW_BYOK_VISITORS=1` — was returning the operator's real `my_position` and
+`watchlist` data for any ticker matching a live holding. Found by curling the
+freshly-deployed Railway URL to confirm the visitor flag was working, not
+reported by anyone. `run_perplexity_research()` never stripped this data the
+way `run_demo()`'s public `/api/demo/{ticker}` already does; Model Court hits
+the same function via `override` too, so it got the same fix. Fixed by
+stripping `my_position`/`watchlist` from `stock` whenever `override` is set —
+the existing signal for "funded by a caller-supplied key, not the owner's own
+provider." A second, unrelated bug surfaced while re-verifying: the Dockerfile
+refactor for the non-root/volume fix (§11.5) had silently blinded the existing
+"every launch disables `--no-proxy-headers`" check, which now scans zero
+matching lines and passes vacuously. Fixed with a content-based check on
+`docker-entrypoint.sh`, proven with a positive control (break the flag, watch
+it fail, restore it).
+
+### 11.4 Gemini — confirmed live, promoted to owner-persistable
+
+Grounding with Google Search was an open question in every prior session:
+request shape accepted, but whether `groundingMetadata` survives is a
+different question from whether the request is well-formed, and it needed a
+real, funded key to answer. Confirmed this session via `tools/gemini_native.py`
+directly: real `search_queries`, real cited `sources`, a correctly-dated
+answer. The "still-beta OpenAI-compat" concern that kept Gemini BYOK-only
+never applied to this path — the native endpoint exists specifically because
+grounding is unavailable through the compat layer.
+
+`PERSISTENT_PROVIDERS` (`tools/setup_wizard.py`) now includes `"gemini"`, so
+the owner can save a `GEMINI_API_KEY` from ◈ CONFIG, same write-only guarantee
+as Perplexity/Groq. This does **not** reopen full parity: a saved key still
+never reaches `_get_provider()`'s no-override path — only Model Court's new
+owner-only fallback (`api_model_court`) reads it, and only for the owner,
+never a guest. `/health` reports `checks.gemini_key` for the CONFIG UI, kept
+deliberately out of the `ai_provider`/overall-status calculation.
+
+Two harness bugs found while wiring this up, both from re-running the suite
+rather than trusting a single green pass:
+
+- `verify_access.py`'s Model Court stub still had `run_model_court`'s OLD
+  signature (no `provider_mode`); the route's new keyword call broke it, the
+  resulting 500 was silently absorbed by the harness's non-raising `check()`,
+  and the script crashed several lines later on an empty list. Fixed the stub
+  to match the real signature.
+- `verify_onboarding.py`'s "a rejected write touches nothing" assertion
+  assumed the scratch `.env` was byte-for-byte empty at that point — true only
+  because nothing had written to it yet. The new Gemini test section is the
+  first successful write+clear in that run and leaves `GEMINI_API_KEY=\n`
+  behind (`write_env_key` never deletes a line for an empty value — same
+  "blank line ≠ absent" rule `ARGUS_DB` already documents). Fixed to
+  snapshot-and-compare instead of assume-empty.
+
+### 11.5 Model Court — single-provider mode
+
+Added once both providers started drawing real, funded credits rather than
+one of them being effectively free: a caller checking just one provider, or
+who only wants that provider's take, should not be forced to also spend on
+the other, and the comparison step (a third paid call) only makes sense when
+both sides actually ran. `provider_mode` (`"both"` | `"perplexity"` |
+`"gemini"`) threads through `run_model_court()`, the route's validation (only
+the key(s) the selected mode needs are required), and the frontend — a
+`BOTH · COMPARE / PERPLEXITY ONLY / GEMINI ONLY` toggle in the key-entry
+modal, mode-aware live rendering, and mode-aware saved-history rendering (an
+unrequested provider reads as "not requested," never as a misleading
+"failed").
+
+Live-verified end to end, not just unit-tested: a real `GEMINI ONLY` run on
+PLTR through the owner's CONFIG-saved key with nothing pasted into the modal —
+real grounded output, `perplexity: null`, comparison correctly skipped with
+its own note, saved to history tagged `provider_mode=gemini`, and the saved
+run re-rendered correctly from that history.
+
+### 11.6 Non-root Docker + platform-mounted volume
+
+Railway's (and any platform's) mounted volume is created root-owned at
+container start regardless of the image's declared `USER`, so `appuser` had
+no permission to write the database path — `store.bootstrap()` failed with
+"unable to open database file" on first deploy, though the identical image
+ran fine locally with no mounted volume. Fixed via `docker-entrypoint.sh`: the
+Dockerfile no longer sets `USER appuser` at build time (that would make the
+chowning step itself non-root, unable to fix the problem it exists to fix);
+the entrypoint runs as root just long enough to `mkdir -p`+`chown` the
+database directory, then `exec su -s /bin/sh appuser -c "uvicorn ..."` — `su`
+without the login flag preserves the environment by default, carrying the
+platform's injected `PORT`/`ARGUS_DB` through. Not needed on the Cloud Run
+path (no local file, no volume), but left in place — SQLite via `ARGUS_DB`
+remains fully supported on any platform that isn't Cloud Run.
+
+### 11.7 Verification
+
+`scripts/verify_postgres_store.py` (new) mirrors `verify_access.py`'s
+assertions — sessions, guest budget atomicity under real concurrency,
+research-run retention/scoping, access-request anti-enumeration — against a
+**real** Postgres, the one harness in this repo that needs a database running
+rather than being free-as-in-zero-setup. CI gained a `postgres:16` service
+container and a step running it on every PR. All 8 free harnesses plus this
+one green, run repeatedly through this work, not once at the end.
+
+**Left genuinely open:** the Telegram push notification for a new access
+request was never live-tested against the Cloud Run deployment specifically
+(the session cookie's `Secure` flag was verified live; the push was not) —
+worth doing before or shortly after this lands on `main`.

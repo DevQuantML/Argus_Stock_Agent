@@ -1,10 +1,12 @@
 """
 api.py — FastAPI HTTP wrapper for cloud deployment.
 
-Once deployed, call your agent via HTTP from anywhere:
-    curl "https://your-app.railway.app/api/demo/PLTR"
-    curl -H "X-Agent-Key: $AGENT_SECRET" https://your-app.railway.app/api/research/PLTR
-    curl "https://your-app.railway.app/health"
+Once deployed, call your agent via HTTP from anywhere (this URL shape works
+identically whether the deploy target is Cloud Run, Railway, Fly, or Render —
+only the domain changes):
+    curl "https://your-app.example.com/api/demo/PLTR"
+    curl -H "X-Agent-Key: $AGENT_SECRET" https://your-app.example.com/api/research/PLTR
+    curl "https://your-app.example.com/health"
 
 Run locally:
     uvicorn api:app --reload
@@ -50,16 +52,52 @@ from fastapi import BackgroundTasks, Depends, FastAPI, Header, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 
+# ── Postgres backend seam ────────────────────────────────────────────────
+# Chooses the storage backend ONCE, before anything in this process imports
+# `store` — including the plain `import store` two lines below, and the
+# internal `import store` inside tools/perplexity_research.py and
+# tools/stock_data.py (both imported further down this file). Python checks
+# sys.modules before ever touching the filesystem, so pre-registering the
+# name here makes every one of those imports resolve to the SAME module
+# object — real shared state, not a copy — without any of those three files
+# needing a conditional of their own. This MUST run before the first
+# `import store` anywhere in the process; it sits immediately above that
+# import on purpose, not by accident. (A per-call-site conditional was
+# considered and rejected: it is fragile by construction — a future 4th file
+# that imports `store` and forgets the conditional would silently read a
+# different database than the rest of the running process, the exact shape
+# of bug this codebase has been bitten by before — see the `state.tier`
+# mirror and `?v=` drift gotchas in CLAUDE.md.)
+#
+# store.py (SQLite) is the default and is NEVER edited or replaced when
+# DATABASE_URL is unset — every existing free harness that pokes its
+# internals (store._conn, store.DB_PATH, store._lock) keeps working exactly
+# as before. store_postgres.py (Cloud Run + Cloud SQL) is purely additive,
+# only ever reached when the operator sets DATABASE_URL.
+import sys
+if os.getenv("DATABASE_URL"):
+    import store_postgres
+    sys.modules["store"] = store_postgres
+
 import store
 from config import BRENT_LEVELS, GEO_EVENT_LIBRARY, GEO_TRANSMISSION
 from tools.notify import notify_telegram, start_telegram_reply_listener
 from tools.oil_price import get_brent_price, get_brent_signal
 from tools.perplexity_research import (
+    _PROVIDER_REASON_TEXT,
     run_demo,
+    run_model_court,
     run_perplexity_research,
     run_portfolio_outlook,
     run_research_module,
     run_synthesis,
+)
+from tools.setup_wizard import (
+    PERSISTENT_PROVIDERS,
+    PROVIDER_KEY_NAMES,
+    ensure_agent_secret,
+    soft_validate,
+    write_env_key,
 )
 from tools.stock_data import (
     get_news,
@@ -71,8 +109,43 @@ from tools.validator import _MAX_QUESTION_LEN, sanitize_prompt_text, validate_ti
 from tools.xirr import xirr
 
 _STATIC_DIR = Path(__file__).parent / "static"
+_ENV_FILE_PATH = Path(__file__).parent / ".env"
+_ENV_EXAMPLE_PATH = Path(__file__).parent / ".env.example"
 
 logger = logging.getLogger(__name__)
+
+# First-run bootstrap: AGENT_SECRET must exist before anyone can unlock as
+# owner, and nothing else — not the browser, not the CLI wizard — can supply
+# the FIRST one, since proving ownership requires already knowing it. This is
+# what makes starting the server the only step that ever needs a terminal;
+# every AI-provider key after that is added from the browser's CONFIG modal
+# (POST /api/settings/provider-key, further down). Never touches
+# PERPLEXITY_API_KEY/GROQ_API_KEY — those stay genuinely absent until the
+# operator adds one, on purpose. Skipped whenever AGENT_SECRET is already
+# set — including by every verification harness, which all set a real value
+# in os.environ before importing this module, so this branch is only ever
+# live on a genuinely fresh clone with no .env at all.
+if not os.getenv("AGENT_SECRET"):
+    try:
+        _generated_secret = ensure_agent_secret(_ENV_FILE_PATH, _ENV_EXAMPLE_PATH)
+        if _generated_secret:
+            # Set explicitly, never via load_dotenv(override=True) — that
+            # would reload every OTHER key in the file over whatever this
+            # process already has, which is wrong the moment anything
+            # (a test harness, a container's own env) intentionally set a
+            # different value for something else.
+            os.environ["AGENT_SECRET"] = _generated_secret
+            logger.critical("=" * 64)
+            logger.critical("First run — generated your AGENT_SECRET (saved to .env):")
+            logger.critical("    %s", _generated_secret)
+            logger.critical('Paste it into "I HAVE A KEY" in the browser to unlock.')
+            logger.critical("This will not be shown again — find it in .env if you lose it.")
+            logger.critical("=" * 64)
+    except Exception as _bootstrap_secret_exc:  # noqa: BLE001 — must never block startup
+        logger.warning(
+            "could not auto-generate AGENT_SECRET (%s) — set it manually in .env",
+            _bootstrap_secret_exc,
+        )
 
 try:
     store.bootstrap()
@@ -375,6 +448,22 @@ _PATH_BUDGETS: tuple[tuple[str, str, int, int], ...] = (
     # fail-closing new IPs — acceptable here, and the persistent caps in
     # store.create_access_request() are the defence that survives a restart.
     ("/api/access-request", "signup", 5, 3600),
+    # Anonymous and opt-in (ALLOW_BYOK_VISITORS) — no session, no owner
+    # entitlement standing behind it. The AI spend is the visitor's own, but
+    # the yfinance calls and CPU inside run_perplexity_research() /
+    # run_research_module() / run_synthesis() are the operator's. Sized for
+    # the STAGED pipeline's usage pattern (5 requests per full run — report,
+    # context, policy, patterns, synthesis), not the one-shot route alone:
+    # 20/300s is ~4 full runs per 5 minutes, still well under "market"'s
+    # effective 150/5min despite also being anonymous.
+    ("/api/byok",       "byok",   20, 300),
+    # Session-gated (owner or guest — never anonymous), but a compound,
+    # expensive operation: two provider calls plus a third comparison call
+    # per request, on the caller's own keys. Reuses the SAME bucket
+    # /api/portfolio already uses for "fans out to multiple upstream calls,
+    # requires a session" rather than inventing a new one — this is exactly
+    # that shape again.
+    ("/api/model-court", "heavy",  10, 60),
 )
 _API_DEFAULT_BUDGET = ("default", 60, 60)
 
@@ -851,6 +940,14 @@ def health():
     search, Groq does not). Only `ai_provider` feeds the overall status —
     having just one of the two is a fully working configuration, not degraded.
 
+    gemini_key is reported too, same disclosure floor (presence only, never
+    a prefix/length/value) — but deliberately does NOT feed `ai_provider` or
+    `overall`: Gemini is not part of _get_provider()'s no-override fallback
+    chain, so a configured GEMINI_API_KEY with no Perplexity/Groq key set
+    would still leave the main research pipeline unable to serve a run.
+    This field exists so the CONFIG modal can show its own configured/not
+    status for Gemini's narrow, Model-Court-only use.
+
     Always returns HTTP 200 — never 500.
     Status field is "healthy" if all checks pass, "degraded" otherwise.
     """
@@ -861,6 +958,7 @@ def health():
     groq_key = os.getenv("GROQ_API_KEY")
     checks["perplexity_key"] = bool(perplexity_key)
     checks["groq_key"] = bool(groq_key)
+    checks["gemini_key"] = bool(os.getenv("GEMINI_API_KEY"))
     checks["ai_provider"] = bool(perplexity_key or groq_key)
     if not checks["ai_provider"]:
         logger.warning("health: no AI provider — set PERPLEXITY_API_KEY or GROQ_API_KEY")
@@ -1087,6 +1185,13 @@ def api_research(ticker: str, question: str = Query(default=None, max_length=_MA
         result = run_perplexity_research(ticker, question)
         if "error" in result and "ticker" not in result:
             return JSONResponse(status_code=500, content={"error": "internal server error"})
+        # require_owner gates this whole route, so tier is always "owner" here
+        # — no ctx lookup needed. Best-effort: a history-save failure must
+        # never turn a successful research call into a 500 for the caller.
+        try:
+            store.save_research_run(ticker, "full", "owner", None, result)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("api_research: history save failed (type=%s)", type(exc).__name__)
         return result
     except Exception as exc:
         logger.debug("api_research: error (type=%s): %s", type(exc).__name__, exc)
@@ -1316,10 +1421,373 @@ def api_research_synthesis(ticker: str, body: SynthesisBody,
                 status_code=502,
                 content={"error": result["error"], "code": "provider_unavailable"},
             )
+        # Best-effort: a history-save failure must never turn a successful,
+        # already-billed synthesis into an error response for the caller.
+        try:
+            store.save_research_run(sym, "synthesis", ctx.tier, ctx.guest_key_id, result)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("api_research_synthesis: history save failed (type=%s)", type(exc).__name__)
         return result
     except Exception as exc:
         logger.debug("api_research_synthesis: error (type=%s): %s", type(exc).__name__, exc)
         _refund_if_free(ctx, "synthesis", None)
+        return JSONResponse(status_code=500, content={"error": "internal server error"})
+
+
+@app.get("/api/research/{ticker}/history", dependencies=[Depends(require_session)])
+def api_research_history(ticker: str, request: Request,
+                         x_agent_key: str = Header(default=None, alias="X-Agent-Key")):
+    """
+    Past research saved for this ticker, newest first — owner or guest only.
+
+    Anonymous visitor/BYOK research is never saved server-side (see the
+    research_runs schema comment in store.py), so there is nothing for this
+    route to serve for those tiers; the frontend keeps its own recall for
+    them in localStorage instead.
+
+    Scoped strictly to the caller's own (tier, guest_key_id) — a guest sees
+    only their own history, never another guest's or the owner's, even by
+    guessing a ticker that happens to have saved rows.
+    """
+    sym, bad = _validated_ticker(ticker)
+    if bad is not None:
+        return bad
+    # require_session already gated this to owner-or-guest — ctx cannot
+    # actually be None here, but the check is kept explicit rather than
+    # assumed, matching require_owner/require_auth's own internal pattern.
+    ctx = _auth_ctx(request, x_agent_key)
+    if ctx is None:
+        return JSONResponse(status_code=401, detail=_unauthorized_detail(request))
+    runs = store.list_research_runs(sym, ctx.tier, ctx.guest_key_id)
+    return {"ticker": sym, "runs": runs}
+
+
+# ── Anonymous, self-funded BYOK research ───────────────────────────────────
+# Placed after SynthesisBody (used by api_byok_synthesis below) rather than
+# alongside /api/demo — Python evaluates parameter type annotations at
+# def-time, not lazily, so this block must live after that class exists.
+
+def _byok_auth(x_provider: str | None, x_provider_key: str | None):
+    """Shared gate for every /api/byok/* route: feature flag, provider name,
+    key format. Returns (override_tuple, None) on success, or (None,
+    error_response) to return verbatim.
+
+    Off by default: refuses outright unless the operator has set
+    ALLOW_BYOK_VISITORS in .env. Every /api/byok/* route is anonymous-
+    reachable and spends the OPERATOR's yfinance quota and CPU on every call
+    even though the AI spend is the visitor's own — an operator updating an
+    existing deployment should not wake up with this newly reachable.
+
+    soft_validate() runs before any provider call on every route that calls
+    this — proven by a counting stub in scripts/verify_byok_visitor.py, not
+    just asserted here.
+    """
+    if not os.getenv("ALLOW_BYOK_VISITORS"):
+        return None, JSONResponse(status_code=403, content={
+            "error": "self-funded research is not enabled on this instance"})
+
+    # Membership in the one canonical map, not a hardcoded tuple re-typed
+    # per call site — this is what makes Gemini reachable here specifically
+    # (BYOK) while POST /api/settings/provider-key, checking PERSISTENT_
+    # PROVIDERS instead, keeps refusing it. Two constants, two scopes, no
+    # copy that can silently drift from the other.
+    if x_provider not in PROVIDER_KEY_NAMES:
+        return None, JSONResponse(status_code=400, content={
+            "error": f"X-Provider header must be one of: {', '.join(sorted(PROVIDER_KEY_NAMES))}"})
+
+    ok, reason = soft_validate(x_provider_key or "")
+    if not ok:
+        return None, JSONResponse(status_code=400, content={"error": reason})
+
+    return (x_provider, x_provider_key), None
+
+
+def _byok_module_response(ticker: str, module: str, question: str | None,
+                           override: tuple[str, str]):
+    """Mirrors _module_response()'s shape for the anonymous BYOK path: no
+    guest gate (there is no session to gate) and no refund bookkeeping
+    (nothing was ever charged to any allowance — this caller has none).
+
+    Unlike _module_response() (the owner/guest staged pipeline), this path
+    does NOT reuse run_research_module()'s own generic error text
+    ("the research provider is unavailable right now") verbatim. That
+    genericism is deliberate over there — a guest must never be told to
+    edit the OPERATOR's .env — but it is actively unhelpful here: the key
+    that failed is the CALLER's own, so telling them nothing more specific
+    than "unavailable" leaves them unable to tell "my key is wrong" from
+    "I'm rate-limited" from "this instance has no path to the provider at
+    all". _PROVIDER_REASON_TEXT is the same translation run_model_court
+    already uses for exactly this reason — one vocabulary, one meaning,
+    reused rather than re-invented per caller."""
+    sym, bad = _validated_ticker(ticker)
+    if bad is not None:
+        return bad
+    try:
+        result = run_research_module(ticker.upper(), module, question, override=override)
+        if "error" in result:
+            reason_text = _PROVIDER_REASON_TEXT.get(result.get("reason"), "provider call failed")
+            return JSONResponse(status_code=502,
+                                 content={"error": reason_text, "code": "provider_unavailable"})
+        return result
+    except Exception as exc:  # noqa: BLE001 — type only, see api_byok_research's docstring
+        logger.debug("api_byok_%s: error (type=%s)", module, type(exc).__name__)
+        return JSONResponse(status_code=500, content={"error": "internal server error"})
+
+
+@app.get("/api/byok/{ticker}")
+def api_byok_research(
+    ticker: str,
+    x_provider: str = Header(default=None, alias="X-Provider"),
+    x_provider_key: str = Header(default=None, alias="X-Provider-Key"),
+    question: str = Query(default=None, max_length=_MAX_QUESTION_LEN),
+):
+    """
+    Anonymous, self-funded research — a visitor's OWN Groq/Perplexity key,
+    never the operator's. No session, no AGENT_SECRET, no guest key. See
+    _byok_auth()'s docstring for the shared security model every /api/byok/*
+    route holds to.
+
+    One-shot: report + bull/bear in a single call. Kept alongside the staged
+    routes below for the same reason /api/research/{ticker} (legacy) is kept
+    alongside /api/research/{ticker}/{module} — curl-friendly, one round trip.
+
+    The key from these two headers is used for exactly this one call via
+    run_perplexity_research(..., override=(provider, key)) — see that
+    function and _get_provider()'s docstring for the full chain. It is
+    never written to os.environ, never persisted to .env, never logged, and
+    the exception handler below deliberately logs only the exception TYPE,
+    not its message, because unlike every other error path in this file
+    that message could in rare cases echo request context back from an SDK
+    — and this is one of the routes in the whole app answering with a
+    different, unrelated person's money on every single call.
+    """
+    override, err = _byok_auth(x_provider, x_provider_key)
+    if err is not None:
+        return err
+
+    ticker = ticker.upper()
+    try:
+        result = run_perplexity_research(ticker, question, override=override)
+        if "error" in result and "ticker" not in result:
+            return JSONResponse(status_code=500, content={"error": "internal server error"})
+        return result
+    except Exception as exc:  # noqa: BLE001 — see docstring on why only the type is logged
+        logger.debug("api_byok_research: error (type=%s)", type(exc).__name__)
+        return JSONResponse(status_code=500, content={"error": "internal server error"})
+
+
+# ── Staged BYOK pipeline ────────────────────────────────────────────────
+# Mirrors /api/research/{ticker}/{module} exactly, so the frontend can offer
+# the same à-la-carte per-module UX (ui.showCostModal's owner branch) to a
+# self-funded visitor — pick which stages to run, see each render as it
+# lands, stop between stages. Every route here shares _byok_auth()'s
+# security model; none of it is repeated per-route.
+
+@app.get("/api/byok/{ticker}/report")
+def api_byok_report(
+    ticker: str,
+    question: str = Query(default=None, max_length=_MAX_QUESTION_LEN),
+    x_provider: str = Header(default=None, alias="X-Provider"),
+    x_provider_key: str = Header(default=None, alias="X-Provider-Key"),
+):
+    """Anonymous, self-funded — stage 1 of 5. See api_byok_research's docstring."""
+    override, err = _byok_auth(x_provider, x_provider_key)
+    if err is not None:
+        return err
+    return _byok_module_response(ticker, "report", question, override)
+
+
+@app.get("/api/byok/{ticker}/context")
+def api_byok_context(
+    ticker: str,
+    x_provider: str = Header(default=None, alias="X-Provider"),
+    x_provider_key: str = Header(default=None, alias="X-Provider-Key"),
+):
+    """Anonymous, self-funded — stage 2 of 5."""
+    override, err = _byok_auth(x_provider, x_provider_key)
+    if err is not None:
+        return err
+    return _byok_module_response(ticker, "context", None, override)
+
+
+@app.get("/api/byok/{ticker}/policy")
+def api_byok_policy(
+    ticker: str,
+    x_provider: str = Header(default=None, alias="X-Provider"),
+    x_provider_key: str = Header(default=None, alias="X-Provider-Key"),
+):
+    """Anonymous, self-funded — stage 3 of 5."""
+    override, err = _byok_auth(x_provider, x_provider_key)
+    if err is not None:
+        return err
+    return _byok_module_response(ticker, "policy", None, override)
+
+
+@app.get("/api/byok/{ticker}/patterns")
+def api_byok_patterns(
+    ticker: str,
+    x_provider: str = Header(default=None, alias="X-Provider"),
+    x_provider_key: str = Header(default=None, alias="X-Provider-Key"),
+):
+    """Anonymous, self-funded — stage 4 of 5."""
+    override, err = _byok_auth(x_provider, x_provider_key)
+    if err is not None:
+        return err
+    return _byok_module_response(ticker, "patterns", None, override)
+
+
+@app.post("/api/byok/{ticker}/synthesis")
+def api_byok_synthesis(
+    ticker: str,
+    body: SynthesisBody,
+    x_provider: str = Header(default=None, alias="X-Provider"),
+    x_provider_key: str = Header(default=None, alias="X-Provider-Key"),
+):
+    """
+    Anonymous, self-funded — stage 5 of 5: stitched verdict + bull/bear.
+
+    Fences the posted module text exactly like /api/research/{ticker}/synthesis
+    does, and for the identical reason — this is untrusted input steering three
+    more paid calls, and a guard that runs for only some callers is a guard
+    waiting to be bypassed. Applied here even though the "cost" is the
+    caller's own: prompt injection could still misdirect the verdict, which is
+    a correctness problem independent of who is paying.
+    """
+    override, err = _byok_auth(x_provider, x_provider_key)
+    if err is not None:
+        return err
+
+    sym, bad = _validated_ticker(ticker)
+    if bad is not None:
+        return bad
+
+    fenced = {
+        k: sanitize_prompt_text(v, label=f"MODULE_{k.upper()}") if v else v
+        for k, v in body.model_dump().items()
+    }
+
+    try:
+        result = run_synthesis(ticker.upper(), fenced, override=override)
+        if "error" in result:
+            # Same reasoning as _byok_module_response: this is the caller's
+            # own key, so the specific reason (not run_synthesis's own
+            # generic, owner/guest-safe text) is what's actually useful here.
+            reason_text = _PROVIDER_REASON_TEXT.get(result.get("reason"), "provider call failed")
+            return JSONResponse(status_code=502,
+                                 content={"error": reason_text, "code": "provider_unavailable"})
+        return result
+    except Exception as exc:  # noqa: BLE001 — type only, see api_byok_research's docstring
+        logger.debug("api_byok_synthesis: error (type=%s)", type(exc).__name__)
+        return JSONResponse(status_code=500, content={"error": "internal server error"})
+
+
+# ── Model Court — Perplexity + Gemini in parallel, compared ────────────────
+# Different trust model from /api/byok/* above: this requires a SESSION
+# (owner or guest via require_session), not anonymity — decided explicitly
+# in chat rather than left implicit. A real allowlist/access-code gate
+# beyond "any session" was requested for a later phase; this is the honest
+# interim boundary, not that boundary's finished version.
+
+@app.post("/api/model-court/{ticker}", dependencies=[Depends(require_session)])
+def api_model_court(
+    ticker: str,
+    request: Request,
+    question: str = Query(default=None, max_length=_MAX_QUESTION_LEN),
+    provider_mode: str = Query(default="both"),
+    x_perplexity_key: str = Header(default=None, alias="X-Perplexity-Key"),
+    x_gemini_key: str = Header(default=None, alias="X-Gemini-Key"),
+    x_agent_key: str = Header(default=None, alias="X-Agent-Key"),
+):
+    """
+    Run Perplexity and/or Gemini on the same ticker, using the caller's own
+    key(s), and (in "both" mode) return a comparison of what each caught.
+
+    `provider_mode` — "both" (default) | "perplexity" | "gemini". Added once
+    both providers started drawing real, funded credits: a caller checking
+    just one provider, or who only wants that one provider's take, should
+    not be forced to also hold and spend a key for the other. Validation
+    below is mode-aware for the same reason — it only demands the key(s)
+    the selected mode actually needs.
+
+    Requires a session (owner or guest) — see the module comment above for
+    why that's the gate rather than anonymity. Neither the owner's nor a
+    guest's existing entitlements extend here: both keys are the caller's
+    own, this never touches the guest dive budget, and neither key is ever
+    written to os.environ, persisted to .env, or logged — same guarantee
+    every BYOK path in this file already holds, extended to two keys.
+
+    Named headers (X-Perplexity-Key / X-Gemini-Key) rather than the generic
+    X-Provider/X-Provider-Key pair /api/byok/* uses — this route always
+    needs exactly these two, never an arbitrary provider choice.
+
+    `request`/`x_agent_key` are declared here (not just on the
+    require_session dependency) so this function can call _auth_ctx() itself
+    and learn the caller's tier — needed to scope the saved history row to
+    the right owner/guest identity, and now also to decide the Gemini-key
+    fallback below.
+
+    Owner-only convenience: if the caller is the OWNER and omits either
+    header, fall back to that provider's server-configured key —
+    PERPLEXITY_API_KEY (the operator's own regular research-engine
+    credential, already used for every normal /api/research/* call) or
+    GEMINI_API_KEY (settable via CONFIG once "gemini" was added to
+    PERSISTENT_PROVIDERS — see tools/setup_wizard.py). Both fall back the
+    same way now — the asymmetry this docstring used to describe (Perplexity
+    always required, only Gemini optional) was the CONFIG-modal support for
+    persisting a Gemini key arriving one commit later than Model Court's own
+    owner fallback; there was never a reason to treat them differently once
+    both keys can be configured server-side. A guest — or anyone without a
+    session, though require_session already excludes that case — gets NO
+    such fallback for either key and must always supply their own, same as
+    today. This is a deliberate, narrow exception to "both keys are always
+    the caller's own": it saves the operator re-pasting keys they already
+    own on every call, without ever exposing a stored server credential to
+    a caller who isn't the operator.
+    """
+    if provider_mode not in ("both", "perplexity", "gemini"):
+        return JSONResponse(status_code=400, content={
+            "error": "provider_mode must be one of: both, perplexity, gemini"})
+
+    ctx = _auth_ctx(request, x_agent_key)
+    if ctx is not None and ctx.tier == "owner":
+        if not x_perplexity_key and provider_mode in ("both", "perplexity"):
+            x_perplexity_key = os.getenv("PERPLEXITY_API_KEY") or x_perplexity_key
+        if not x_gemini_key and provider_mode in ("both", "gemini"):
+            x_gemini_key = os.getenv("GEMINI_API_KEY") or x_gemini_key
+
+    # Only the key(s) the selected mode actually needs are required — a
+    # Perplexity-only run must not be blocked on a missing Gemini key the
+    # caller was never going to spend, and vice versa.
+    needed = []
+    if provider_mode in ("both", "perplexity"):
+        needed.append((x_perplexity_key, "X-Perplexity-Key"))
+    if provider_mode in ("both", "gemini"):
+        needed.append((x_gemini_key, "X-Gemini-Key"))
+    for key_value, key_label in needed:
+        ok, reason = soft_validate(key_value or "")
+        if not ok:
+            return JSONResponse(status_code=400,
+                                 content={"error": f"{key_label}: {reason}"})
+
+    try:
+        result = run_model_court(ticker, question, x_perplexity_key, x_gemini_key,
+                                  provider_mode=provider_mode)
+        if "error" in result and "ticker" not in result:
+            return JSONResponse(status_code=500, content={"error": "internal server error"})
+        # require_session already gated this to owner-or-guest — ctx cannot
+        # actually be None here, but the check is kept explicit rather than
+        # assumed. Best-effort: a history-save failure must never turn a
+        # completed (and possibly billed) comparison into an error response.
+        if ctx is not None:
+            try:
+                store.save_research_run(result.get("ticker", ticker.upper()), "model_court",
+                                        ctx.tier, ctx.guest_key_id, result)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("api_model_court: history save failed (type=%s)", type(exc).__name__)
+        return result
+    except Exception as exc:  # noqa: BLE001 — type only, matching /api/byok/*'s own reasoning:
+        # two different callers' money on this one request, not just one.
+        logger.debug("api_model_court: error (type=%s)", type(exc).__name__)
         return JSONResponse(status_code=500, content={"error": "internal server error"})
 
 
@@ -1796,6 +2264,72 @@ def api_watchlist_delete(ticker: str):
     except ValueError as exc:
         return JSONResponse(status_code=400, content={"error": str(exc)})
     return {"ok": removed, "watchlist": store.watchlist()}
+
+
+# ── AI provider key (owner only) ────────────────────────────────────────
+# Lets an already-unlocked owner connect a Groq/Perplexity key from the
+# browser's CONFIG modal instead of editing .env or running the CLI wizard —
+# both remain valid alternatives, this is a third path, not a replacement.
+
+class ProviderKeyBody(BaseModel):
+    provider: str = Field(max_length=16)
+    key: str = Field(default="", max_length=512)
+
+
+@app.post("/api/settings/provider-key", dependencies=[Depends(require_owner)])
+def api_settings_provider_key(body: ProviderKeyBody):
+    """Set or clear a Groq/Perplexity/Gemini credential from the browser.
+
+    Owner-only, and more strictly so than the book writes above: this sets
+    the credential every future paid research call on this instance will
+    use, with no per-caller budget to bound a mistake — exactly the kind of
+    route require_owner exists for.
+
+    An empty `key` is a deliberate "clear this provider" action, not an
+    error — soft_validate() only runs against a non-empty value.
+
+    The raw key is never echoed back, not even masked. Unlike the CLI
+    wizard's stdout confirmation (which never leaves the machine that ran
+    it), this response travels over HTTP and can land in browser history or
+    devtools — so it gets the same disclosure floor /health already holds
+    for these two keys: presence only, never a prefix, length, or value.
+
+    Deliberately checks PERSISTENT_PROVIDERS, not the wider PROVIDER_KEY_NAMES
+    _byok_auth() uses — the two lists diverge on purpose. Gemini IS now in
+    PERSISTENT_PROVIDERS (grounding confirmed live via the native endpoint;
+    see tools/setup_wizard.py's comment on that constant), so this route
+    accepts it — but a saved GEMINI_API_KEY still does nothing for the main
+    research pipeline: _get_provider()'s no-override path never reads it,
+    only Model Court's owner-only fallback does. Without the
+    PERSISTENT_PROVIDERS check here, the generic .get() lookup below would
+    accept ANY name in PROVIDER_KEY_NAMES the moment that dict gained an
+    entry — this route's whole point is being the narrower of the two.
+    """
+    if body.provider not in PERSISTENT_PROVIDERS:
+        return JSONResponse(status_code=400, content={
+            "error": f"provider must be one of: {', '.join(PERSISTENT_PROVIDERS)}"})
+    key_name = PROVIDER_KEY_NAMES.get(body.provider)
+
+    if body.key:
+        ok, reason = soft_validate(body.key)
+        if not ok:
+            return JSONResponse(status_code=400, content={"error": reason})
+
+    try:
+        write_env_key(_ENV_FILE_PATH, key_name, body.key)
+    except OSError as exc:
+        # A read-only mount or a permission error, not a user-input mistake —
+        # 500, not 400, and never str(exc) verbatim: some OSError messages
+        # embed the full filesystem path, which is server-internal detail an
+        # HTTP caller has no business seeing, owner or not.
+        logger.warning("api_settings_provider_key: could not write .env (%s)", exc)
+        return JSONResponse(status_code=500, content={
+            "error": "could not save to .env on the server — check it exists and is writable"})
+
+    # Live immediately — _get_provider() reads os.getenv() at call time, so
+    # the very next research request picks this up with no restart.
+    os.environ[key_name] = body.key
+    return {"ok": True, "provider": body.provider, "configured": bool(body.key)}
 
 
 # ── Portfolio analytics (free) ─────────────────────────────────────────────

@@ -800,12 +800,107 @@ def main():
         ("Error code: 429 - rate limit",      "ratelimit", False),
         ("Request timeout after 30s",         "timeout", True),
         ("connection reset by peer",          "error", True),
+        # Billing exhaustion is NOT a rate limit, though both are 429
+        # RESOURCE_EXHAUSTED. Seen live from Gemini as "Your prepayment
+        # credits are depleted." Reporting it as a rate limit tells the
+        # reader to wait and retry against an account that will never serve
+        # them until it is topped up. Nothing was billed, so a guest's stage
+        # is refunded either way (cost_incurred False).
+        ("Error code: 429 - {'error': {'message': 'Your prepayment credits are "
+         "depleted.', 'status': 'RESOURCE_EXHAUSTED'}}", "quota", False),
+        ("Error code: 429 - You exceeded your current quota", "quota", False),
     ]:
         st = {}
         out = pr._call("p", client=_Boom(msg), status=st)
         check(f"_call reports reason={reason} for {msg[:22]!r}", st.get("reason"), reason)
         check(f"...and cost_incurred={cost}", st.get("cost_incurred"), cost)
         check("...and still returns a string for the callers that want one", out, "")
+
+    # ── The misclassification that blamed a user's key for our own typo ────
+    # _GEMINI_MAIN shipped as "gemini-3-flash", which is not a real model id.
+    # Google's OpenAI-compat layer wraps request-shape faults in OpenAI's
+    # taxonomy — `invalid_request_error`, `INVALID_ARGUMENT` — and _call's old
+    # matcher tested a bare `"invalid" in err`, so EVERY such fault landed in
+    # the auth branch and surfaced as "the key was rejected". Two good keys
+    # were rotated chasing it. These cases pin the boundary: a fault in OUR
+    # request must never be reported as the caller's credential.
+    for msg, reason, label in [
+        ("Error code: 404 - {'error': {'message': 'models/gemini-3-flash is not found "
+         "for API version v1beta', 'status': 'NOT_FOUND'}}", "not_found", "a wrong model id"),
+        ("Error code: 400 - {'error': {'message': 'Invalid JSON payload received.', "
+         "'type': 'invalid_request_error'}}", "bad_request", "a malformed request body"),
+        ("Error code: 400 - {'error': {'status': 'INVALID_ARGUMENT', 'message': "
+         "'Request contains an invalid argument.'}}", "bad_request", "a bare INVALID_ARGUMENT"),
+    ]:
+        st = {}
+        pr._call("p", client=_Boom(msg), status=st)
+        check(f"{label} reports reason={reason}, NOT auth", st.get("reason"), reason)
+        check("...and is never billed", st.get("cost_incurred"), False)
+        # Substring-matched against the BLAMING phrasings specifically, not a
+        # bare "your key" — the correct text says "not your key", which of
+        # course contains "your key". That naive check is what this line was
+        # first written as, and it failed on correct copy.
+        _txt = pr._PROVIDER_REASON_TEXT[reason].lower()
+        check(f"...and {label} never tells the caller to check their key",
+              any(p in _txt for p in ("check your key", "the key was rejected",
+                                      "your key was rejected")), False)
+        check(f"...and {label} says outright it is this server's fault",
+              "not your key" in pr._PROVIDER_REASON_TEXT[reason].lower(), True)
+
+    # The genuine credential rejection Google actually sends — which ALSO
+    # carries INVALID_ARGUMENT — must still read as auth. Tightening the
+    # matcher above must not have thrown out the real case with the false one.
+    for _msg, _label in [
+        ("Error code: 400 - {'error': {'message': 'API key not valid. Please pass a "
+         "valid API key.', 'status': 'INVALID_ARGUMENT'}}", "'API key not valid'"),
+        # Google's OTHER wording for the same thing — HTTP 400, INVALID_ARGUMENT,
+        # no 401 and no "not valid" anywhere. Caught live: the first pass at the
+        # tightened matcher missed it and filed a genuinely bad key under
+        # bad_request, i.e. told the caller to report OUR bug for THEIR typo.
+        ("Error code: 400 - {'error': {'message': 'Please pass a valid API key', "
+         "'status': 'INVALID_ARGUMENT'}}", "bare 'Please pass a valid API key'"),
+    ]:
+        st = {}
+        pr._call("p", client=_Boom(_msg), status=st)
+        check(f"a real {_label} is STILL auth, despite INVALID_ARGUMENT",
+              st.get("reason"), "auth")
+
+    # "wait and retry" vs "retrying cannot help" must not read alike.
+    check("quota exhaustion tells the reader retrying will NOT help",
+          "will not help" in pr._PROVIDER_REASON_TEXT["quota"].lower(), True)
+    check("...while a real rate limit DOES tell them to retry",
+          "retry" in pr._PROVIDER_REASON_TEXT["ratelimit"].lower(), True)
+    check("...and quota is never mistaken for the caller's key being bad",
+          "key" in pr._PROVIDER_REASON_TEXT["quota"].lower(), False)
+
+    # The model id itself. A harness cannot ask Google what exists, but it can
+    # refuse to let the exact retired string come back.
+    check("_GEMINI_MAIN is not the bogus 'gemini-3-flash'",
+          pr._GEMINI_MAIN, "gemini-3.7-flash")
+    check("_GEMINI_FAST likewise", pr._GEMINI_FAST, "gemini-3.7-flash")
+
+    # The key must never reach a log line, including the new message logging.
+    class _BoomKeyed(_Boom):
+        api_key = "gsk_" + "s" * 40
+
+    import logging as _logging
+    _cap = []
+
+    class _Cap(_logging.Handler):
+        def emit(self, rec):
+            _cap.append(rec.getMessage())
+
+    _h = _Cap()
+    pr.logger.addHandler(_h)
+    try:
+        pr._call("p", client=_BoomKeyed("Error code: 401 - key gsk_" + "s" * 40 + " rejected"),
+                 status={})
+    finally:
+        pr.logger.removeHandler(_h)
+    check("CONTROL: the new failure logging does emit the provider message",
+          any("rejected" in m for m in _cap), True)
+    check("...but the caller's key is redacted out of it",
+          any("gsk_" + "s" * 40 in m for m in _cap), False)
 
     # The route turns that into a 502 with a code, not a 200 with prose.
     prov_key = store.create_guest_key("provider@example.com")[1]
@@ -954,6 +1049,73 @@ def main():
           "parse_mode" in notify_code, False)
     check("CONTROL: the code scan still sees the real request body",
           "chat_id" in notify_code, True)
+
+    # ── Research history ─────────────────────────────────────────────────
+    # Owner/guest only, server-side (store.research_runs) — anonymous and
+    # BYOK research is deliberately never saved here (see the schema comment
+    # in store.py); the frontend keeps its own localStorage recall for that
+    # tier instead, untested here since it has nothing to do with this file.
+    section("research history — save on success, strict tier/guest scoping")
+    api._rate_limit_store.clear()  # a clean budget for this section's own calls
+
+    saved_synthesis = api.run_synthesis
+    api.run_synthesis = lambda ticker, modules: {
+        "ticker": ticker, "mode": "synthesis", "synthesis": "BUY TRANCHE — stub",
+        "bull_case": "b", "bear_case": "b2",
+    }
+    try:
+        r = oc.post("/api/research/HIST1/synthesis",
+                    json={"report": "r", "context": "c", "policy": "p", "patterns": "pt"})
+        check("owner synthesis call still 200 with history-save wired in", r.status_code, 200)
+        rh = oc.get("/api/research/HIST1/history").json()
+        check("owner sees exactly the 1 run just saved", len(rh["runs"]), 1)
+        check("...tagged with the right mode", rh["runs"][0]["mode"], "synthesis")
+        check("...carrying the actual payload, not a stub", rh["runs"][0]["payload"]["synthesis"],
+              "BUY TRANCHE — stub")
+    finally:
+        api.run_synthesis = saved_synthesis
+
+    check("anonymous history request is 401, not a silent empty list",
+          anon.get("/api/research/HIST1/history").status_code, 401)
+
+    hist_guest_key = store.create_guest_key("history@example.com")[1]
+    hc = TestClient(api.app)
+    hc.post("/api/session", json={"key": hist_guest_key})
+    check("a guest sees NONE of the owner's history for the same ticker",
+          len(hc.get("/api/research/HIST1/history").json()["runs"]), 0)
+
+    # Model Court's own save point — a different route, a different auth
+    # dependency shape (require_session, not require_auth taking ctx), so it
+    # needs its own proof rather than assuming the synthesis route's coverage
+    # generalises.
+    saved_mc = api.run_model_court
+    api.run_model_court = lambda ticker, question, pk, gk, provider_mode="both": {
+        "ticker": ticker, "mode": "model_court", "provider_mode": provider_mode,
+        "perplexity": {"report": "p"}, "gemini": {"report": "g"},
+        "analysis": "stub analysis", "analysis_note": None,
+    }
+    try:
+        r = hc.post("/api/model-court/HIST2", headers={
+            "X-Perplexity-Key": "pplx-" + "p" * 40, "X-Gemini-Key": "AIza" + "g" * 35})
+        check("guest model-court call still 200 with history-save wired in", r.status_code, 200)
+        gh = hc.get("/api/research/HIST2/history").json()
+        check("the guest sees their own model_court run", len(gh["runs"]), 1)
+        check("...tagged correctly", gh["runs"][0]["mode"], "model_court")
+        check("the owner does NOT see the guest's model_court run",
+              len(oc.get("/api/research/HIST2/history").json()["runs"]), 0)
+    finally:
+        api.run_model_court = saved_mc
+
+    hist_guest_key2 = store.create_guest_key("history2@example.com")[1]
+    hc2 = TestClient(api.app)
+    hc2.post("/api/session", json={"key": hist_guest_key2})
+    check("a second guest sees NONE of the first guest's history either",
+          len(hc2.get("/api/research/HIST2/history").json()["runs"]), 0)
+
+    check("a ticker with no saved runs returns an empty list, not an error",
+          oc.get("/api/research/NOSUCHHIST/history").status_code, 200)
+    check("...specifically an empty list",
+          oc.get("/api/research/NOSUCHHIST/history").json()["runs"], [])
 
     # ── Final cost assertion ───────────────────────────────────────────────
     section("cost — no unintended provider call remains outstanding")

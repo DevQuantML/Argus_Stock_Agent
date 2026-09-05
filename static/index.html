@@ -7,8 +7,8 @@
 <meta name="description" content="Brent-gated equity research terminal. Live quant, staged AI research, one clear verdict."/>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%23060810'/%3E%3Cpath d='M6 23 L16 7 L26 23' stroke='%23E8900A' stroke-width='2.5' fill='none' stroke-linejoin='round'/%3E%3Cpath d='M11 19 h10' stroke='%23E8900A' stroke-width='2.5'/%3E%3C/svg%3E"/>
 <!-- Blocking, non-module: applies accent/tempo/CRT before first paint. -->
-<script src="/static/js/theme-boot.js?v=18"></script>
-<link rel="stylesheet" href="/static/style.css?v=18"/>
+<script src="/static/js/theme-boot.js?v=42"></script>
+<link rel="stylesheet" href="/static/style.css?v=42"/>
 </head>
 <body>
 
@@ -67,7 +67,6 @@
 
   <!-- TICKER TAPE -->
   <div id="tape-wrap">
-    <button id="btn-tape" type="button" aria-label="Pause ticker tape">⏸</button>
     <div class="tape-view"><div id="tape"></div></div>
   </div>
 
@@ -79,6 +78,9 @@
            aria-label="Command line"/>
     <span class="kbd">↵ ENTER</span>
     <button id="btn-exec" class="btn" type="button">EXECUTE</button>
+    <button id="btn-court" class="btn-g" type="button" title="Runs Perplexity + Gemini, then one master analysis">
+      COURT ▸<span class="btn-sub">GEM+PPLX</span>
+    </button>
     <div id="cmd-hint" class="hidden"></div>
   </div>
 
@@ -137,6 +139,8 @@
         <div class="panel-h" style="margin-bottom:8px"><button class="chev" type="button" data-panel="cmds" aria-label="Collapse Commands">▾</button>COMMANDS://REF</div>
         <div class="cmdref" id="cmdref">
           <div data-cmd="research "><b>research</b> <i>&lt;SYM&gt;</i> <span>full staged brief</span></div>
+          <div data-cmd="court "><b>court</b> <i>&lt;SYM&gt;</i> <span>both models, one master analysis</span></div>
+          <div data-cmd="history "><b>history</b> <i>&lt;SYM&gt;</i> <span>past research, saved</span></div>
           <div data-cmd="quant "><b>quant</b> <i>&lt;SYM&gt;</i> <span>free metrics only</span></div>
           <div data-cmd="chart "><b>chart</b> <i>&lt;SYM&gt;</i> <span>price + reference lines</span></div>
           <div data-cmd="scan"><b>scan</b> <span>check every holding</span></div>
@@ -197,6 +201,6 @@
 
 <div id="toasts" aria-live="polite"></div>
 
-<script type="module" src="/static/js/app.js?v=18"></script>
+<script type="module" src="/static/js/app.js?v=42"></script>
 </body>
 </html>

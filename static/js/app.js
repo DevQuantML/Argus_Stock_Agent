@@ -5,14 +5,14 @@
    Version query on each import so a redeploy can never pair a fresh app.js
    with a stale cached sub-module. Bump together with the ?v= in index.html. */
 
-import * as api from './api.js?v=18';
-import { drawChart, makeResponsive } from './chart.js?v=18';
-import { renderMarkdown, escapeHtml } from './md.js?v=18';
-import * as prefs from './theme.js?v=18';
-import * as ui from './ui.js?v=18';
-import * as views from './views.js?v=18';
-import * as tour from './tour.js?v=18';
-import { DISCLAIMER, FRESHNESS_NOTE, guestAllowanceLine } from './copy.js?v=18';
+import * as api from './api.js?v=42';
+import { drawChart, makeResponsive } from './chart.js?v=42';
+import { renderMarkdown, escapeHtml } from './md.js?v=42';
+import * as prefs from './theme.js?v=42';
+import * as ui from './ui.js?v=42';
+import * as views from './views.js?v=42';
+import * as tour from './tour.js?v=42';
+import { DISCLAIMER, FRESHNESS_NOTE, guestAllowanceLine } from './copy.js?v=42';
 
 const $  = ui.$;
 const $$ = ui.$$;
@@ -25,6 +25,10 @@ const state = {
   brent: null,
   portfolio: [],       // live positions from /api/portfolio
   rows: [],            // merged watchlist rows
+  marketRows: [],      // broad-market reference tickers (SPY/QQQ/DIA) — tape
+                        // display only, deliberately never merged into
+                        // `rows`: that array drives the watchlist panel's
+                        // HELD/WATCHING counts and P&L total.
   provider: 'perplexity',
 
   ticker: null,
@@ -40,6 +44,14 @@ const state = {
   cancelType: null,    // aborts an in-flight typewriter
   profile: null,       // onboarding answers — drives the tailored defaults
   view: 'research',    // research | portfolio | profile
+
+  // A visitor's OWN Groq/Perplexity key, from the landing gate's BRING YOUR
+  // OWN KEY pane. Deliberately a plain module-scope field, never
+  // localStorage/sessionStorage — AGENT_SECRET was moved OFF exactly that
+  // kind of storage once its XSS-readability was recognised as a real risk,
+  // and a visitor's own paid key gets at least the same caution. Lost on
+  // refresh, on purpose: {provider, key} | null.
+  selfKey: null,
 };
 
 /* The tier is DERIVED, never stored.
@@ -60,6 +72,35 @@ const isVisitor = () => tier() === 'visitor';
 
 const FOLD_KEY  = 'argus.folded';
 const FOCUS_KEY = 'argus.focus';
+const HIST_KEY  = 'argus.selfKeyHistory';
+// Newest N per ticker — matches store.RESEARCH_HISTORY_LIMIT's intent
+// (bounded growth), kept independently since this cache lives in the
+// browser, not the server.
+const HIST_LIMIT = 20;
+
+/* Client-side research history for the ONE tier that has no session to save
+   against server-side: a self-key (BYOK) visitor. Owner and guest history is
+   server-side (store.research_runs) and fetched via api.getResearchHistory —
+   this is deliberately NOT used for them, so there is exactly one source of
+   truth per tier rather than two caches that can drift apart. localStorage
+   is per-browser, so this never survives a device change or a private
+   window, unlike the server-side path — an accepted, stated trade-off for a
+   tier that by definition has no account to attach permanent history to. */
+function loadLocalHistory(sym) {
+  try {
+    const all = JSON.parse(localStorage.getItem(HIST_KEY) || '{}');
+    return Array.isArray(all[sym]) ? all[sym] : [];
+  } catch { return []; }
+}
+function saveLocalHistory(sym, mode, payload) {
+  try {
+    const all = JSON.parse(localStorage.getItem(HIST_KEY) || '{}');
+    const list = Array.isArray(all[sym]) ? all[sym] : [];
+    list.unshift({ mode, payload, created_at: new Date().toISOString() });
+    all[sym] = list.slice(0, HIST_LIMIT);
+    localStorage.setItem(HIST_KEY, JSON.stringify(all));
+  } catch { /* private mode, or storage full — history is a convenience, not core */ }
+}
 
 /* The watchlist used to live in localStorage. It is server-side now, so an
    add or remove survives a browser wipe and reaches the research prompts. */
@@ -130,9 +171,18 @@ async function bootSequence() {
       : bad(`INFO_ENDPOINT ……… ${infoResult.error?.message || 'failed'}`));
   }
 
-  if (health?.checks?.perplexity_key)      lines.push(ok('PERPLEXITY_API …… CONFIGURED · LIVE WEB'));
-  else if (health?.checks?.groq_key)       lines.push(warn('GROQ_API ………… FALLBACK · NO WEB SEARCH'));
-  else                                     lines.push(warn('AI_PROVIDER ……… NOT CONFIGURED'));
+  // The two degraded/absent states get an actionable sub-line, not just a
+  // status word — a fresh clone with no key should tell the reader what to
+  // do next, not just that something is missing.
+  if (health?.checks?.perplexity_key) {
+    lines.push(ok('PERPLEXITY_API …… CONFIGURED · LIVE WEB'));
+  } else if (health?.checks?.groq_key) {
+    lines.push(warn('GROQ_API ………… FALLBACK · NO WEB SEARCH'));
+    lines.push(dim('  add a PERPLEXITY_API_KEY for live web search · docs/SETUP.md'));
+  } else {
+    lines.push(warn('AI_PROVIDER ……… NOT CONFIGURED'));
+    lines.push(dim('  run  python main.py setup  to connect a free engine · docs/SETUP.md'));
+  }
 
   if (isOwner()) {
     lines.push(ok('SESSION ………… ACTIVE · AI ARMED'));
@@ -158,6 +208,20 @@ async function bootSequence() {
 
 /* ── Painting ────────────────────────────────────────────────────────── */
 
+// Well-known ETF proxies, not raw index symbols: validate_ticker() only
+// accepts [A-Z0-9.-]{1,12}, so Yahoo's caret-prefixed index notation
+// (^GSPC, ^IXIC) would be rejected outright. SPY/QQQ/DIA are how retail
+// platforms represent these benchmarks anyway.
+const MARKET_TICKERS = ['SPY', 'QQQ', 'DIA']; // S&P 500, Nasdaq-100, Dow
+
+/* The tape shows the user's own rows plus the fixed market tickers, but the
+   two are never the same array — see state.marketRows' own comment. */
+function tapeItems() {
+  return [...state.rows, ...state.marketRows]
+    .filter(r => r.last !== null)
+    .map(r => ({ sym: r.sym, price: r.last, chg: r.chg, currency: r.currency }));
+}
+
 function paintAll() {
   ui.renderStatus(state.health, state.provider === 'groq' ? 'GROQ' : 'PERPLEXITY');
   ui.renderKeyState(tier(), api.auth.guest);
@@ -167,9 +231,7 @@ function paintAll() {
   ui.renderBrent(state.brent, state.levels);
   ui.renderGeo(state.info?.geo_transmission, state.info?.portfolio || [], (t) => runCommand(`research ${t}`));
   buildRows();
-  ui.renderTape(state.rows.filter(r => r.last !== null).map(r => ({
-    sym: r.sym, price: r.last, chg: r.chg, currency: r.currency,
-  })));
+  ui.renderTape(tapeItems());
 }
 
 function buildRows() {
@@ -199,6 +261,7 @@ function buildRows() {
   ui.renderWatchFooter(rows, state.totals);
   loadSparklines();
   loadWatchPrices();
+  loadMarketPrices();
 }
 
 /* Sparklines land after the table so rows appear immediately. Failures are
@@ -233,8 +296,35 @@ function loadWatchPrices() {
         row.currency = d.stock.currency;
         ui.renderWatchlist(state.rows, (s) => runCommand(`research ${s}`), (s) => inspect(s));
         ui.renderWatchFooter(state.rows, state.totals);
-        ui.renderTape(state.rows.filter(x => x.last !== null)
-          .map(x => ({ sym: x.sym, price: x.last, chg: x.chg, currency: x.currency })));
+        ui.renderTape(tapeItems());
+      })
+      .catch(() => {});
+  }
+}
+
+/* Broad-market reference tickers (SPY/QQQ/DIA) for the tape — same one-shot
+   free-quant pattern as loadWatchPrices() above, but writing to
+   state.marketRows, never state.rows: these are display-only benchmarks,
+   not the user's own holdings or watchlist, and must never affect the
+   watchlist panel's counts or P&L total. inspect(sym) (wired via
+   ui.wireTapeClicks in wire()) already renders a graceful "not held and
+   not on the watchlist" overview for exactly this case — nothing new
+   needed there. */
+let marketPricesFetched = false;
+function loadMarketPrices() {
+  if (marketPricesFetched) return;
+  marketPricesFetched = true;
+  state.marketRows = MARKET_TICKERS.map(sym => ({ sym, last: null, currency: null, chg: null }));
+  for (const sym of MARKET_TICKERS) {
+    api.getQuant(sym)
+      .then(d => {
+        const price = d?.stock?.price;
+        if (price === null || price === undefined) return;
+        const row = state.marketRows.find(x => x.sym === sym);
+        if (!row) return;
+        row.last = Number(price);
+        row.currency = d.stock.currency;
+        ui.renderTape(tapeItems());
       })
       .catch(() => {});
   }
@@ -597,9 +687,12 @@ async function research(rawSym, { paid = true, question } = {}) {
   $('btn-exec').disabled = true;
   const started = performance.now();
   // "Can this caller run paid AI?" is no longer "do they hold a session" — a
-  // guest holds one and may still have nothing left to spend.
-  const spent  = tier() === 'guest' && api.auth.divesLeft() <= 0;
-  const hasKey = api.auth.has() && !spent;
+  // guest holds one and may still have nothing left to spend. A self-key
+  // visitor holds no session at all and is still a yes: state.selfKey is a
+  // THIRD, independent way to reach this, orthogonal to tier().
+  const spent      = tier() === 'guest' && api.auth.divesLeft() <= 0;
+  const hasSelfKey = !!state.selfKey;
+  const hasKey     = (api.auth.has() && !spent) || hasSelfKey;
 
   openTab(sym);
   ui.clearOut();
@@ -629,6 +722,17 @@ async function research(rawSym, { paid = true, question } = {}) {
       ui.setStatus('QUANT ONLY', 'ok');
       if (spent) for (const [k] of AI_MODULES) ui.pipeline.set(k, 'locked', 'allowance used');
       o.appendChild(aiLockedNote(spent));
+      cacheTab(sym);
+      return;
+    }
+
+    /* A self-key visitor is a completely separate path from here on — one
+       one-shot call (report + bull/bear), not the 4-module + synthesis
+       pipeline the owner/guest path below runs. No session, no allowance,
+       no ticker-binding to check — those all belong to the guest-budget
+       system this caller was never part of. */
+    if (hasSelfKey) {
+      await runSelfKeyResearch(sym, question, o);
       cacheTab(sym);
       return;
     }
@@ -813,6 +917,352 @@ async function research(rawSym, { paid = true, question } = {}) {
   }
 }
 
+/* A visitor's own key, the SAME 4-module + synthesis staged pipeline
+   research() runs for owner/guest below — à-la-carte module selection via
+   ui.showCostModal's owner-style branch, one call per module against
+   /api/byok/{ticker}/{module} instead of the session-gated routes.
+
+   Deliberately its own loop rather than a branch inside the main one:
+   several of that loop's error kinds (budget/bound/stage/expired) are
+   guest-allowance concepts with no meaning for a caller who has no
+   allowance at all — reusing it risks one of those firing for the wrong
+   reason instead of just not existing here. state.run/$('btn-stop') are
+   still wired the same way so Stop and the outer finally in research()
+   (state.busy, the exec button, the "run complete" line) work identically
+   for both paths without needing to know which one ran. */
+async function runSelfKeyResearch(sym, question, o) {
+  const { provider, key } = state.selfKey;
+  const providerLabel = provider.toUpperCase();
+
+  // tier: 'owner' selects showCostModal's à-la-carte UX (per-module
+  // checkboxes, live running total) — it is a UI-mode selector on that
+  // function, not a claim about who this caller is. `provider` here is
+  // THIS visitor's chosen provider, deliberately not state.provider (the
+  // OPERATOR's configured one) — the modal's Groq/Perplexity note must
+  // describe the key actually paying for the run.
+  const sel = await ui.showCostModal(sym, provider, { tier: 'owner' });
+  if (!sel) {
+    for (const [k] of AI_MODULES) ui.pipeline.set(k, 'skipped');
+    ui.pipeline.set('synthesis', 'skipped');
+    ui.setStatus('QUANT ONLY', 'ok');
+    ui.toast('AI stages skipped — quant, chart and P&L are loaded.', 'info');
+    return;
+  }
+  for (const [k] of AI_MODULES) if (!sel[k]) ui.pipeline.set(k, 'skipped');
+  if (!sel.synthesis) ui.pipeline.set('synthesis', 'skipped');
+
+  const controller = new AbortController();
+  state.run = { controller, cancelled: false };
+  $('btn-stop').classList.remove('hidden');
+
+  const texts = {};
+  for (const [modKey, label] of AI_MODULES) {
+    if (!sel[modKey]) continue;
+    if (state.run.cancelled) { ui.pipeline.set(modKey, 'skipped'); continue; }
+
+    ui.pipeline.set(modKey, 'running');
+    const t = performance.now();
+    try {
+      const data = await api.getByokResearchModule(sym, provider, key, modKey, {
+        question: modKey === 'report' ? question : undefined,
+        signal: controller.signal,
+      });
+      texts[modKey] = data.output || '';
+      ui.pipeline.done(modKey, performance.now() - t);
+
+      const head = document.createElement('div');
+      head.className = 'r-head';
+      head.textContent = `${label}  ·  YOUR ${providerLabel} KEY`;
+      o.appendChild(head);
+      await typeBlock(o, data.output || '');
+    } catch (err) {
+      if (err.kind === 'aborted') {
+        ui.pipeline.set(modKey, 'cancelled');
+        state.run.cancelled = true;
+      } else if (err.status === 403) {
+        // ALLOW_BYOK_VISITORS got turned off mid-run, or never was on —
+        // every remaining stage would hit the identical refusal.
+        ui.pipeline.set(modKey, 'failed');
+        state.run.cancelled = true;
+        ui.toast('This ARGUS instance has not turned on self-funded research.', 'warn', 8000);
+        markRemainingLocked(modKey, 'not enabled');
+      } else if (err.status === 400) {
+        // A malformed key (soft_validate catches it before any provider
+        // call) fails identically on every remaining stage — stop rather
+        // than burn four more round trips proving it again.
+        ui.pipeline.set(modKey, 'failed');
+        state.run.cancelled = true;
+        ui.toast(err.message || 'That key was rejected — check you copied it correctly.', 'error', 8000);
+        markRemainingLocked(modKey, 'key rejected');
+      } else if (err.kind === 'provider') {
+        // A 502 provider_unavailable — the key passed soft_validate's format
+        // check and something went wrong only once it reached the provider.
+        // Deliberately NOT worded as "your key was rejected" any more: that
+        // is only one of the things this branch catches, and asserting it
+        // sent a real user through two good keys chasing what was actually a
+        // wrong model id in _GEMINI_MAIN. The server already names the real
+        // cause (_PROVIDER_REASON_TEXT, which says outright when the fault is
+        // this server's rather than the caller's) — show that and nothing on
+        // top of it, per the same rule the quant cards follow: the layer that
+        // knows which branch it took is the only layer allowed to say.
+        ui.pipeline.set(modKey, 'failed');
+        state.run.cancelled = true;
+        ui.toast(err.message || 'The provider call failed.', 'error', 8000);
+        markRemainingLocked(modKey, 'stopped');
+      } else {
+        ui.pipeline.set(modKey, 'failed');
+        ui.toast(`${modKey}: ${err.message}`, 'warn');
+      }
+    }
+  }
+
+  const any = Object.values(texts).some(Boolean);
+  if (sel.synthesis && !state.run.cancelled && any) {
+    ui.pipeline.set('synthesis', 'running');
+    const t = performance.now();
+    try {
+      const res = await api.postByokSynthesis(sym, provider, key, {
+        report: texts.report || '', context: texts.context || '',
+        policy: texts.policy || '', patterns: texts.patterns || '',
+      }, { signal: controller.signal });
+
+      // A self-key run has no session, so nothing saved this server-side —
+      // the owner/guest loop above doesn't need this call because
+      // api_research_synthesis already persists it (store.research_runs).
+      saveLocalHistory(sym, 'synthesis', res);
+
+      ui.renderVerdict(o, res.synthesis);
+      if (res.bull_case || res.bear_case) {
+        o.appendChild(Object.assign(document.createElement('div'),
+          { className: 'r-head', textContent: 'BULL vs BEAR' }));
+        const grid = document.createElement('div');
+        grid.style.cssText = 'display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:8px';
+        for (const [txt, cls, lbl] of [[res.bull_case, 'green', '▲ BULL'], [res.bear_case, 'red', '▼ BEAR']]) {
+          const c = document.createElement('div');
+          c.style.cssText = `border:1px solid var(--border);border-left:2px solid var(--${cls});padding:9px;background:var(--bg-panel)`;
+          c.innerHTML = `<div style="font-size:8px;letter-spacing:.1em;color:var(--${cls});margin-bottom:6px">${lbl}</div>`;
+          const b = document.createElement('div');
+          b.className = 'r-body';
+          b.innerHTML = renderMarkdown(txt || '');
+          c.appendChild(b);
+          grid.appendChild(c);
+        }
+        o.appendChild(grid);
+        if (window.matchMedia('(max-width:820px)').matches) grid.style.gridTemplateColumns = '1fr';
+      }
+      ui.pipeline.done('synthesis', performance.now() - t);
+    } catch (err) {
+      ui.pipeline.set('synthesis', err.kind === 'aborted' ? 'cancelled' : 'failed');
+      if (err.kind !== 'aborted') ui.toast(`synthesis: ${err.message}`, 'warn');
+    }
+  } else if (sel.synthesis) {
+    ui.pipeline.set('synthesis', 'skipped');
+  }
+
+  ui.setStatus(state.run.cancelled ? 'STOPPED' : 'COMPLETE', state.run.cancelled ? 'err' : 'ok');
+}
+
+/* Model Court — Perplexity and Gemini, run in parallel on the caller's own
+   two keys, compared. Gated to a real session (owner or guest) before the
+   key-entry modal even opens — decided explicitly in chat as the interim
+   access boundary; a real paid-membership gate was requested for later,
+   not built here. Neither key this modal collects is ever stored: they
+   live only as local variables for the one request that uses them. */
+async function runModelCourt(sym) {
+  if (state.busy) { ui.toast('A run is already in flight.', 'warn'); return; }
+  if (!isOwner() && tier() !== 'guest') {
+    ui.toast('Model Court needs an unlocked session — the owner\'s key, or a guest key. '
+           + 'Type `request` to ask the owner for access.', 'warn', 7000);
+    return;
+  }
+
+  // Owner-only: which providers are already configured server-side (◈
+  // CONFIG), so showModelCourtKeys can skip asking for a key it can
+  // already fall back to (api_model_court's own owner-only fallback).
+  // Never sent for a guest — state.health.checks is read regardless, but
+  // showModelCourtKeys only consults `configured` when isOwner() is true.
+  const configured = {
+    perplexity: !!state.health?.checks?.perplexity_key,
+    gemini: !!state.health?.checks?.gemini_key,
+  };
+  const keys = await ui.showModelCourtKeys(sym, isOwner(), configured);
+  if (!keys) return;
+
+  state.busy = true;
+  state.ticker = sym;
+  $('btn-exec').disabled = true;
+  const started = performance.now();
+
+  openTab(sym);
+  ui.clearOut();
+  ui.writeTitle(`ARGUS://${sym} · MODEL COURT`);
+  const o = ui.out();
+
+  try {
+    const ok = await loadFree(sym, { withPipeline: false });
+    if (!ok) { cacheTab(sym); return; }
+
+    const mode = keys.providerMode || 'both';
+    const runningLine = mode === 'both' ? 'Running Perplexity + Gemini in parallel…'
+                       : mode === 'perplexity' ? 'Running Perplexity…' : 'Running Gemini…';
+    ui.writeLine(runningLine, 'dim');
+    const res = await api.runModelCourt(sym, keys.perplexityKey, keys.geminiKey,
+                                         { providerMode: mode });
+
+    // Same shape per section: a heading, then either the real output or a
+    // plain failure/unavailable line — never both, never neither. A
+    // provider not requested this run (single-provider mode) gets no
+    // section at all rather than a misleading "failed" line for something
+    // that was never asked to run.
+    const section = (label) => {
+      o.appendChild(Object.assign(document.createElement('div'),
+        { className: 'r-head', textContent: label }));
+    };
+    const failLine = (text, dim) => {
+      const p = document.createElement('p');
+      p.className = dim ? 'r-body dim' : 'r-body';
+      p.textContent = text;
+      o.appendChild(p);
+    };
+
+    // Master analysis leads. It is the thing the reader acts on; the two
+    // briefs underneath are the audit trail for it — worth keeping (you can
+    // always check what each search actually claimed) but not worth reading
+    // first. Single-provider mode never produces one (run_model_court gates
+    // it on provider_mode == 'both'), and its note says so plainly, so a
+    // heading over that note would just repeat itself.
+    if (mode === 'both') {
+      section('MASTER ANALYSIS');
+      if (res.analysis) await typeBlock(o, res.analysis);
+      else failLine(res.analysis_note || 'Master analysis unavailable.', true);
+    }
+
+    if (res.perplexity) {
+      section('PERPLEXITY · SOURCE BRIEF');
+      if (res.perplexity.error) failLine(`Failed: ${res.perplexity.error}`);
+      else await typeBlock(o, res.perplexity.report || '');
+    }
+
+    if (res.gemini) {
+      section('GEMINI · SOURCE BRIEF');
+      if (res.gemini.error) failLine(`Failed: ${res.gemini.error}`);
+      else await typeBlock(o, res.gemini.report || '');
+    }
+
+    const ranOk = mode === 'both' ? !!res.analysis
+                : mode === 'perplexity' ? !res.perplexity?.error
+                : !res.gemini?.error;
+    ui.setStatus(ranOk ? 'COMPLETE' : 'PARTIAL', ranOk ? 'ok' : 'err');
+  } catch (err) {
+    ui.setStatus('FAILED', 'err');
+    ui.toast(err.message || 'Model Court failed.', 'error', 8000);
+  } finally {
+    const secs = ((performance.now() - started) / 1000).toFixed(1);
+    ui.writeLine(`— run complete in ${secs}s —`, 'dim');
+    cacheTab(sym);
+    state.busy = false;
+    $('btn-exec').disabled = false;
+  }
+}
+
+const HIST_MODE_LABEL = { full: 'FULL REPORT', synthesis: 'STAGED VERDICT', model_court: 'MODEL COURT' };
+
+/* Recall list for a ticker's saved research. Owner/guest read the server
+   (store.research_runs, via api.getResearchHistory); a self-key visitor —
+   the only tier that ever has anything to recall with no session — reads
+   its own localStorage cache instead. A plain visitor or guest with no
+   self-key and nothing saved yet just sees the empty state; there is no
+   third source to check. */
+async function showHistory(rawSym) {
+  if (state.busy) { ui.toast('A run is already in flight.', 'warn'); return; }
+  const sym = String(rawSym || '').trim().toUpperCase().replace(/[^A-Z0-9.=-]/g, '');
+  if (!sym) { ui.toast('Usage: history <SYM>', 'warn'); return; }
+
+  openTab(sym);
+  ui.clearOut();
+  ui.writeTitle(`ARGUS://${sym} · HISTORY`);
+  const o = ui.out();
+
+  let runs;
+  if (isOwner() || tier() === 'guest') {
+    try {
+      runs = (await api.getResearchHistory(sym)).runs || [];
+    } catch (err) {
+      ui.toast(err.message || 'Could not load history.', 'error');
+      cacheTab(sym);
+      return;
+    }
+  } else {
+    runs = loadLocalHistory(sym);
+  }
+
+  if (!runs.length) {
+    ui.writeLine(`No saved research for ${sym} yet — run \`research ${sym}\` or `
+               + `\`court ${sym}\` first.`, 'dim');
+    cacheTab(sym);
+    return;
+  }
+
+  const list = document.createElement('div');
+  list.className = 'hist-list';
+  const detail = document.createElement('div');
+  detail.className = 'hist-detail';
+
+  const renderDetail = (run) => {
+    detail.innerHTML = '';
+    const p = run.payload || {};
+    const section = (label) => detail.appendChild(Object.assign(
+      document.createElement('div'), { className: 'r-head', textContent: label }));
+    const body = (text) => {
+      const b = document.createElement('div');
+      b.className = 'r-body';
+      b.innerHTML = renderMarkdown(text || '(not available)');
+      detail.appendChild(b);
+    };
+
+    if (run.mode === 'synthesis') {
+      ui.renderVerdict(detail, p.synthesis || '');
+    } else if (run.mode === 'full') {
+      section('REPORT');
+      body(p.report);
+    } else if (run.mode === 'model_court') {
+      // Older saved runs predate provider_mode and are always 'both' in
+      // effect — default to it so history from before this field existed
+      // still renders both sections, same as it always has.
+      const pmode = p.provider_mode || 'both';
+      // `analysis` replaced `comparison` when the third call stopped being a
+      // document diff and became the investment analysis. Rows saved before
+      // that rename still carry the old keys, so read either — a recall list
+      // that silently blanked older runs would be worse than the rename.
+      const master = p.analysis || p.analysis_note || p.comparison || p.comparison_note;
+      if (pmode === 'both') { section('MASTER ANALYSIS'); body(master); }
+      if (p.perplexity) { section('PERPLEXITY · SOURCE BRIEF'); body(p.perplexity.report); }
+      if (p.gemini)     { section('GEMINI · SOURCE BRIEF');     body(p.gemini.report); }
+    } else {
+      body('');
+    }
+  };
+
+  runs.forEach((run, i) => {
+    const row = document.createElement('button');
+    row.type = 'button';
+    row.className = 'btn-g hist-row';
+    row.style.cssText = 'display:block;width:100%;text-align:left;margin-bottom:4px;padding:8px 10px';
+    const when = new Date(run.created_at).toLocaleString();
+    row.textContent = `${HIST_MODE_LABEL[run.mode] || run.mode} — ${when}`;
+    row.onclick = () => {
+      list.querySelectorAll('.hist-row').forEach(n => n.classList.remove('on'));
+      row.classList.add('on');
+      renderDetail(run);
+    };
+    list.appendChild(row);
+    if (i === 0) { row.classList.add('on'); renderDetail(run); }
+  });
+
+  o.append(list, detail);
+  cacheTab(sym);
+}
+
 /* Typewriter that can be interrupted by Stop. */
 function typeBlock(container, markdown) {
   /* Belt-and-braces: the reveal is decoration on a paid pipeline, so it
@@ -913,8 +1363,29 @@ function brentDetail() {
 async function inspect(sym) {
   ui.openInspector(sym, { }, null);
   try {
+    // api.getQuant() calls the anonymous-safe /api/demo/{ticker} — the exact
+    // route that deliberately strips my_position/watchlist for EVERY caller,
+    // by the same fix that closed the BYOK anonymous book-disclosure bug.
+    // That's correct for that route: it also serves keyless GitHub visitors
+    // with no session at all. It means the inspector, wired to this same
+    // call, could never show the owner their own held position — found live
+    // by clicking a held ticker in the tape and getting "not held" back for
+    // a position the owner plainly holds. The fix is not to loosen /api/demo
+    // (that would reopen the disclosure for every anonymous caller); it's to
+    // merge in data this session is ALREADY entitled to and already holds in
+    // memory: /api/portfolio (session-gated) for a held position, /api/info
+    // for a watchlist entry. Anonymous/guest-without-that-ticker callers get
+    // neither merged in, so they see exactly the same public view as before.
     const d = await api.getQuant(sym);
-    ui.openInspector(sym, d.stock || {}, d.quant || {});
+    const stock = { ...(d.stock || {}) };
+    const pf = state.portfolio.find(p => p.ticker === sym);
+    if (pf?.my_position) {
+      stock.my_position = pf.my_position;
+    } else {
+      const wl = state.info?.watchlist?.[sym];
+      if (wl) stock.watchlist = wl;
+    }
+    ui.openInspector(sym, stock, d.quant || {});
   } catch (err) {
     ui.toast(err.message, 'error');
     ui.closeInspector();
@@ -924,7 +1395,8 @@ async function inspect(sym) {
 /* ── Command parser ──────────────────────────────────────────────────── */
 
 const CMDS = ['research', 'quant', 'chart', 'scan', 'brent', 'pos', 'add', 'rm',
-              'portfolio', 'profile', 'focus', 'clear', 'tour', 'request', 'help'];
+              'portfolio', 'profile', 'focus', 'clear', 'tour', 'request', 'help', 'court',
+              'history'];
 
 /* Refuse a book edit before it reaches the network. The server enforces this
    with a 403 regardless; catching it here means the reader gets a sentence
@@ -1033,6 +1505,14 @@ async function runCommand(raw) {
       if (!arg) { ui.toast('Usage: research <SYM>', 'warn'); return; }
       await research(arg, { question: captureQuestion(rest.slice(1)) }); return;
 
+    case 'court':
+      if (!arg) { ui.toast('Usage: court <SYM>', 'warn'); return; }
+      await runModelCourt(arg); return;
+
+    case 'history':
+      if (!arg) { ui.toast('Usage: history <SYM>', 'warn'); return; }
+      await showHistory(arg); return;
+
     default: {
       // Bare ticker is the most common input — treat it as research.
       const guess = head.toUpperCase().replace(/[^A-Z0-9.=-]/g, '');
@@ -1054,7 +1534,9 @@ function wireHints() {
   let idx = -1;
 
   const HINTS = [
-    ['research', 'full staged brief'], ['quant', 'free metrics only'],
+    ['research', 'full staged brief'], ['court', 'both models, one master analysis'],
+    ['history', 'past research, saved'],
+    ['quant', 'free metrics only'],
     ['chart', 'price + reference lines'], ['scan', 'sweep all holdings'],
     ['brent', 'framework detail'], ['pos', 'open inspector'],
     ['portfolio', 'P&L, XIRR, outlook'], ['profile', 'edit positions & tailoring'],
@@ -1307,10 +1789,15 @@ function applyTailoring(profile) {
 /* ── Config ──────────────────────────────────────────────────────────── */
 
 function openConfig() {
-  /* The key itself is never held in the browser any more — it lives in an
-     HttpOnly session cookie — so this offers the two actions that remain:
-     sign out, or unlock when the session has lapsed. */
-  ui.showConfigModal(api.auth.has(), async (action) => {
+  /* AGENT_SECRET itself is never held in the browser any more — it lives in
+     an HttpOnly session cookie — so the Session field offers only the two
+     actions that remain: sign out, or unlock when the session has lapsed.
+     A Groq/Perplexity key is a different kind of secret (a provider
+     credential the server calls out with, not something this app compares
+     against) and the AI Research field below is owner-only — isOwner gates
+     whether it even renders, matching POST /api/settings/provider-key's own
+     require_owner on the server. */
+  ui.showConfigModal(api.auth.has(), api.auth.isOwner(), state.health?.checks, async (action) => {
     if (action === 'signout') {
       const done = await api.auth.signOut();
       ui.renderKeyState('visitor', null);
@@ -1326,6 +1813,20 @@ function openConfig() {
     });
   }, (key) => {
     if (key === 'accent') paintChart();
+  }, async (provider, key) => {
+    try {
+      const res = await api.setProviderKey(provider, key);
+      // Keep the cached boot-time health snapshot in sync so a second open
+      // of this same modal (or the DATA modal) reflects the change without
+      // needing a full page reload.
+      if (res && res.ok && state.health) {
+        state.health.checks = { ...state.health.checks,
+          [provider === 'perplexity' ? 'perplexity_key' : 'groq_key']: res.configured };
+      }
+      return res;
+    } catch (err) {
+      return { ok: false, message: (err && err.message) || 'Could not reach the server.' };
+    }
   });
 }
 
@@ -1333,11 +1834,27 @@ function openConfig() {
 
 function wire() {
   $('btn-exec').onclick = () => { const v = $('cmd').value; $('cmd').value = ''; runCommand(v); };
+  // Click-only path to Model Court — EXECUTE's own meaning never changes
+  // (a bare ticker there still always means research). Reuses runCommand's
+  // own ticker-normalization regex and the CMDS word list so this works
+  // identically whether the box holds a bare ticker, `research PLTR`, or
+  // `court PLTR` already — the leading command word (if any) is stripped.
+  $('btn-court').onclick = () => {
+    const tokens = $('cmd').value.trim().split(/\s+/).filter(Boolean);
+    const sym = (CMDS.includes((tokens[0] || '').toLowerCase()) ? tokens[1] : tokens[0]) || '';
+    const t = sym.toUpperCase().replace(/[^A-Z0-9.=-]/g, '');
+    if (!t) { ui.toast('Type a ticker first, e.g. PLTR', 'warn'); return; }
+    $('cmd').value = '';
+    runModelCourt(t);
+  };
   $('btn-cfg').onclick  = openConfig;
   $('btn-data').onclick = () => ui.showDataModal(state.health, state.info);
 
-  let paused = false;
-  $('btn-tape').onclick = () => { paused = !paused; ui.setTapePaused(paused); };
+  // Click any tape symbol — the user's own holdings/watchlist or a market
+  // reference ticker (SPY/QQQ/DIA) — to open its free overview. Wired once:
+  // renderTape() only ever replaces #tape's children, so this delegated
+  // listener survives every repaint with nothing to rewire.
+  ui.wireTapeClicks((sym) => inspect(sym));
 
   $('btn-stop').onclick = () => {
     if (state.cancelType) state.cancelType();
@@ -1452,6 +1969,15 @@ document.addEventListener('DOMContentLoaded', async () => {
       await enterOrOnboard();
     },
     onVisitor: () => enter(),   // no session => tier() is already 'visitor'
+    onSelfKey: (provider, key) => {
+      // Still no session — tier() stays 'visitor' exactly as onVisitor
+      // above. selfKey only ever unlocks AI research specifically; it never
+      // touches the owner's book or admin surface.
+      state.selfKey = { provider, key };
+      const label = provider.charAt(0).toUpperCase() + provider.slice(1);
+      ui.toast(`Using your own ${label} key for research.`, 'success', 3200);
+      enter();
+    },
   });
 
   // Expose the landing so in-terminal calls to action can reach it too.

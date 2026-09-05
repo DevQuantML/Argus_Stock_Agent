@@ -16,3 +16,9 @@ uvicorn==0.52.0
 
 # .env file loading (local dev + local Docker runs)
 python-dotenv==1.2.2
+
+# Postgres driver — ONLY used when DATABASE_URL is set (store_postgres.py,
+# the Cloud Run + Cloud SQL deploy path). SQLite (store.py, stdlib sqlite3)
+# stays the default for local dev and every free verification harness; this
+# is purely additive, not a replacement.
+psycopg2-binary==2.9.10

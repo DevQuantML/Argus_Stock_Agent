@@ -3,13 +3,14 @@
 main.py — Entry point for the stock research agent.
 
 Usage:
+  python main.py setup                         # connect a research engine    (free)
   python main.py PLTR                          # research brief + bull/bear   (~$0.05)
   python main.py PLTR "is the thesis intact?"  # specific question            (~$0.05)
   python main.py scan                          # brief for every holding      (~$0.04 each)
   python main.py brent                         # oil framework signal         (free)
 
 Research runs on Perplexity, or Groq when only GROQ_API_KEY is set.
-Everything except `brent` spends API credits.
+Everything except `setup` and `brent` spends API credits.
 """
 
 # Load .env before anything else. Must come after the module docstring —
@@ -108,6 +109,11 @@ def main():
     command = args[0].upper()
 
     # Special commands
+    if command == "SETUP":
+        from tools.setup_wizard import run_wizard
+        run_wizard()
+        return
+
     if command == "SCAN":
         cmd_scan()
         return

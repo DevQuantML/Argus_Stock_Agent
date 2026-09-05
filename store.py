@@ -129,38 +129,40 @@ CREATE TABLE IF NOT EXISTS outlook (
     payload    TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+-- Saved research artifacts — owner and guest only. Anonymous visitor/BYOK
+-- research is deliberately NOT persisted here: there is no session to scope
+-- it to, and it is funded by a stranger's own key, so writing it to the
+-- operator's disk would be a privacy and unbounded-growth liability this
+-- project has avoided everywhere else (that tier gets a localStorage-only
+-- recall on the frontend instead). guest_key_id is NULL for an owner row and
+-- a specific key's id for a guest row — the pair (tier, guest_key_id) is the
+-- scope every read is filtered by, so one guest can never read another
+-- guest's or the owner's saved research by guessing an id.
+CREATE TABLE IF NOT EXISTS research_runs (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker       TEXT NOT NULL,
+    mode         TEXT NOT NULL CHECK (mode IN ('full','synthesis','model_court')),
+    tier         TEXT NOT NULL CHECK (tier IN ('owner','guest')),
+    guest_key_id INTEGER,
+    payload      TEXT NOT NULL,
+    created_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_research_runs_scope
+    ON research_runs (tier, guest_key_id, ticker, created_at);
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
 """
 
+# Newest N runs kept per (tier, guest_key_id, ticker) scope — SQLite on a
+# small mounted volume must not grow unbounded from research history alone.
+# Enforced in save_research_run(), not as a periodic sweep, so the bound
+# holds from the very first write rather than however long until a sweep
+# next runs.
+RESEARCH_HISTORY_LIMIT = 20
+
 _now = lambda: datetime.now(timezone.utc).isoformat()
-
-
-def _migrate(conn: sqlite3.Connection) -> None:
-    """Additive column migrations for tables that already exist.
-
-    CREATE TABLE IF NOT EXISTS is a no-op on a table that is already there, so
-    it cannot add a column to a database created by an earlier version. This
-    inspects the live schema instead of tracking a version counter, which makes
-    running it twice a no-op by construction.
-
-    It lives here rather than in bootstrap() deliberately: bootstrap() returns
-    early once the "seeded" meta flag is set, so a migration placed there would
-    never run on exactly the established databases that need it.
-
-    DEFAULT 'owner' is load-bearing. Every session row predating this column
-    could only have been created by presenting AGENT_SECRET, so backfilling
-    them as owner sessions is correct — and SQLite only accepts ADD COLUMN
-    ... NOT NULL when a non-null default is supplied.
-    """
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(sessions)")}
-    if "tier" not in cols:
-        conn.execute("ALTER TABLE sessions ADD COLUMN tier TEXT NOT NULL DEFAULT 'owner'")
-    if "guest_key_id" not in cols:
-        conn.execute("ALTER TABLE sessions ADD COLUMN guest_key_id INTEGER")
-    conn.commit()
 
 
 def _connect() -> sqlite3.Connection:
@@ -906,6 +908,73 @@ def get_outlook() -> dict | None:
     except ValueError:
         data["age_days"] = None
     return data
+
+
+# ── Research history ─────────────────────────────────────────────────────
+# Owner and guest only — see the research_runs schema comment for why
+# anonymous/BYOK research never reaches this table. mode is one of
+# "full" (legacy one-shot), "synthesis" (the staged pipeline's final
+# verdict), or "model_court" — never the individual module fragments
+# (report/context/policy/patterns) that feed a synthesis, which are
+# building blocks rather than something worth recalling on their own.
+
+def save_research_run(ticker: str, mode: str, tier: str,
+                       guest_key_id: int | None, payload: dict) -> int:
+    """Persist one completed research artifact and enforce the retention cap
+    in the same transaction, so the bound holds from the very first write.
+
+    `guest_key_id IS ?` (not `=`) is deliberate: SQL `=` never matches NULL
+    against NULL, so an owner row (guest_key_id always NULL) would silently
+    fail to scope against itself with `=`. `IS` is the NULL-safe comparison.
+
+    `ORDER BY created_at DESC, id DESC` — found live while building this
+    prune's Postgres sibling (store_postgres.py): `_now()`'s resolution can
+    be coarser than a tight burst of saves lands within, so several rows can
+    share one `created_at` string. `created_at DESC` alone has no tiebreaker
+    then, and this DELETE's own ordering can disagree with
+    list_research_runs()'s separate SELECT on which tied rows count as
+    "newest" — silently pruning a row a caller was just shown as kept. `id`
+    is monotonic by construction (AUTOINCREMENT) and immune to clock
+    resolution, so it is the tiebreaker both this query and
+    list_research_runs()'s use, identically.
+    """
+    with _lock:
+        conn = _connect()
+        cur = conn.execute(
+            "INSERT INTO research_runs (ticker, mode, tier, guest_key_id, payload, created_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (ticker, mode, tier, guest_key_id, json.dumps(payload), _now()),
+        )
+        new_id = cur.lastrowid
+        conn.execute(
+            """DELETE FROM research_runs WHERE id IN (
+                   SELECT id FROM research_runs
+                   WHERE ticker = ? AND tier = ? AND guest_key_id IS ?
+                   ORDER BY created_at DESC, id DESC
+                   LIMIT -1 OFFSET ?
+               )""",
+            (ticker, tier, guest_key_id, RESEARCH_HISTORY_LIMIT),
+        )
+        conn.commit()
+        return new_id
+
+
+def list_research_runs(ticker: str, tier: str, guest_key_id: int | None,
+                        limit: int = RESEARCH_HISTORY_LIMIT) -> list[dict]:
+    """Saved runs for one ticker, newest first, scoped to the caller's own
+    (tier, guest_key_id) — a guest can never see another guest's or the
+    owner's history this way, even by guessing an id."""
+    rows = _rows(
+        "SELECT id, ticker, mode, payload, created_at FROM research_runs "
+        "WHERE ticker = ? AND tier = ? AND guest_key_id IS ? "
+        "ORDER BY created_at DESC, id DESC LIMIT ?",
+        (ticker, tier, guest_key_id, limit),
+    )
+    return [
+        {"id": r["id"], "ticker": r["ticker"], "mode": r["mode"],
+         "created_at": r["created_at"], "payload": _loads(r["payload"], {})}
+        for r in rows
+    ]
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────

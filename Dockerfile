@@ -24,16 +24,22 @@ COPY . .
 # ── Security: run as non-root user ────────────────────────────────────────
 # Running as root inside a container is a significant security risk.
 # If the app is compromised, an attacker gains root inside the container,
-# making container escape much easier.
+# making container escape much easier. The user is created here, but NOT
+# switched to via USER — see docker-entrypoint.sh for why: a platform-
+# mounted volume (Railway's included) is root-owned at container start
+# regardless of what USER this image declares, and chowning it for appuser
+# needs root to do the chowning. USER here would make every process in the
+# container non-root from the first instruction, including the one step
+# that has to run as root to fix that. The entrypoint script drops to
+# appuser itself, immediately, before any application code runs — the
+# actual uvicorn process handling real traffic is still never root.
 RUN addgroup --system appgroup && adduser --system --ingroup appgroup appuser
-USER appuser
+COPY docker-entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
 # The port FastAPI listens on
 EXPOSE 8000
 
-# Start the API server
-# Cloud providers (Railway, Fly.io, Render) inject PORT env var automatically
-#
 # --workers 1        the in-memory rate limiter only works with a single worker
 # --no-proxy-headers NOT optional, and not a performance tweak. uvicorn enables
 #                    --proxy-headers by DEFAULT, and its ProxyHeadersMiddleware
@@ -46,4 +52,7 @@ EXPOSE 8000
 #                    supposed to be unforgeable. Two layers rewriting caller
 #                    identity is how the bypass came back; the app's layer is
 #                    the one that understands hop counts, so uvicorn's is off.
-CMD ["sh", "-c", "uvicorn api:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1 --no-proxy-headers"]
+# Both flags now live inside docker-entrypoint.sh's own uvicorn invocation,
+# not here — the entrypoint needs to run first regardless (root, chown,
+# THEN this command), so it owns building the final command line too.
+ENTRYPOINT ["/entrypoint.sh"]
