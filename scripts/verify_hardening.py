@@ -487,6 +487,16 @@ def main():
     # sent to ANYONE, which would silently gut the owner's own research.
     captured_prompts = []
     pr_mod._call = lambda prompt, *a, **k: (captured_prompts.append(prompt), "stubbed")[1]
+    # The owner-path call below takes no `override`, so it goes through the
+    # REAL _get_provider(None) — unlike every other check in this file, which
+    # only ever stubs _call. On a genuinely clean environment (CI: no .env,
+    # no real key anywhere) _get_provider raises before _call is ever reached,
+    # so `run_perplexity_research` returns its early error dict, the stub
+    # never fires, and this positive control fails not because the book
+    # stopped being sent, but because no prompt was ever built at all. A fake,
+    # never-dialled key makes _get_provider succeed the same way a real one
+    # would; _call is already stubbed, so nothing is ever actually sent to it.
+    prev_pplx = os.getenv("PERPLEXITY_API_KEY")
     try:
         pr_mod._local_cache.clear()
         pr_mod.run_perplexity_research("AAPL", None, override=("groq", "gsk_" + "z" * 40))
@@ -498,6 +508,7 @@ def main():
 
         captured_prompts.clear()
         pr_mod._local_cache.clear()
+        os.environ["PERPLEXITY_API_KEY"] = "pplx-harness-fake-" + "k" * 20
         pr_mod.run_perplexity_research("AAPL", None)  # owner path, no override
         owner_prompts = "\n".join(captured_prompts)
         check("positive control: the owner's OWN run still gets the book",
@@ -507,6 +518,10 @@ def main():
     finally:
         pr_mod._call = real_call
         pr_mod._local_cache.clear()
+        if prev_pplx is None:
+            os.environ.pop("PERPLEXITY_API_KEY", None)
+        else:
+            os.environ["PERPLEXITY_API_KEY"] = prev_pplx
 
     # Clean up the planted position/watch row — later sections assert on a
     # known-empty book, and this one must not leak state into them.
