@@ -219,10 +219,14 @@ js/tour.js            five-step coach-mark orientation (no imports, no network)
 
 - **A fresh clone with no `.env` self-bootstraps `AGENT_SECRET` at server
   startup, before `store.bootstrap()` runs.** `api.py` checks
-  `os.getenv("AGENT_SECRET")` right after `load_dotenv()`; if unset, it calls
+  `os.getenv("AGENT_SECRET")` right after `load_dotenv()`; if unset **or
+  still the literal `.env.example` placeholder**, it calls
   `tools.setup_wizard.ensure_agent_secret()` (which reuses `ensure_env_file()`
-  under the hood — same neutralization, same `chmod 0o600`), sets
-  `os.environ["AGENT_SECRET"]` explicitly on the running process, and
+  under the hood — same neutralization, same permission lockdown, now
+  re-applied by `write_env_key()` after every single write, not just the
+  first — see the CR-injection/placeholder-auth-bypass/Windows-ACL gotcha
+  below for why the placeholder check and the re-lock both had to be added),
+  sets `os.environ["AGENT_SECRET"]` explicitly on the running process, and
   `logger.critical()`s it once, clearly formatted, with the instruction to
   paste it into "I HAVE A KEY". This is what lets a cloner skip the CLI
   wizard entirely — every AI provider key after that is added from the
@@ -234,6 +238,68 @@ js/tour.js            five-step coach-mark orientation (no imports, no network)
   value via `load_dotenv(override=True)`: that reloads every OTHER key in the
   file over whatever the process already has, clobbering a harness's (or a
   container's) deliberately-set values for something unrelated.
+- **Three onboarding vulnerabilities, all found by an automated Claude
+  Security scan whose adversarial verification panel itself twice failed on
+  a session usage limit — meaning none of the three were ever confirmed by
+  a panel vote, only by manual, empirical reproduction against the real
+  code before being fixed.** All three sit in `tools/setup_wizard.py` and
+  `api.py`'s bootstrap block.
+  - **CR injection into `.env` via any provider-key write.**
+    `soft_validate()` rejected `\n`/`\t` but not a bare `\r`. python-dotenv's
+    parser treats a lone `\r` as a value/line terminator
+    (`dotenv/parser.py`'s `_unquoted_value` is `[^\r\n]*`), so a crafted
+    value like `"gsk_...\rAGENT_SECRET=<attacker value>"` passed validation
+    unchanged, was written verbatim by `write_env_key()`
+    (`quote_mode="never"`, no escaping), and parsed back as **two separate
+    `.env` bindings** on the next `load_dotenv()`/`dotenv_values()` — a
+    caller who briefly holds an owner session (e.g. a leaked/short-lived
+    `AGENT_SECRET`) could plant a persistent backdoor that reasserts itself
+    on every restart, defeating "rotate `AGENT_SECRET`" as a remediation.
+    Reproduced live against the installed `python-dotenv` before the fix.
+    Fixed by rejecting any C0 control character (`ord(c) < 0x20`), not just
+    `\n`/`\t`.
+  - **The published `AGENT_SECRET` placeholder silently became the real
+    secret.** The bootstrap gate above used to be bare truthiness
+    (`if not os.getenv("AGENT_SECRET")`). A plain `cp .env.example .env` —
+    still a documented, supported path — leaves `AGENT_SECRET` set to the
+    literal placeholder string, which `load_dotenv()` loads as a non-empty,
+    truthy value, so the placeholder-repair call was skipped entirely and
+    the server ran with a publicly-known string as its real owner
+    credential. Reproduced live: sending
+    `X-Agent-Key: change-me-to-a-strong-random-string` authenticated as
+    owner. Fixed by widening the gate to also fire when the value equals
+    `ENV_PLACEHOLDERS["AGENT_SECRET"]` — see the entry above.
+  - **The Windows `.env` permission lockdown was undone by the very next
+    write — twice.** First shipped as a bare `chmod(0o600)` in a silent
+    `except OSError: pass`, which is a near no-op on Windows (chmod there
+    only toggles the read-only attribute). Fixed once with a real `icacls`
+    ACL restriction in `_lock_down_env_file()` — and that fix **itself**
+    shipped with a second bug, caught only by a follow-up whole-repo review
+    after the first fix was already merged-pending: `ensure_env_file()`
+    called the lockdown once, then immediately ran its placeholder-clearing
+    loop through `set_key()` directly, and python-dotenv's `set_key()`
+    rewrites the file via a temp file + `os.replace()` — on Windows the
+    replacement's ACL comes from the parent directory's inheritance, not
+    from the file it replaces, silently discarding the restriction on the
+    exact write that puts the real `AGENT_SECRET` on disk. `icacls` on the
+    result showed only inherited entries; the two existing test assertions
+    (no `Everyone`/`BUILTIN\Users`, current user present) still passed
+    against this because they never checked for the `(I)`-inherited flag,
+    and the scratch tempdir's own inherited ACL happened to look
+    restrictive already. **The actual, durable fix moved the re-lock into
+    `write_env_key()` itself**, so it re-applies after every write, not
+    just the first — every caller (the CLI wizard, `POST
+    /api/settings/provider-key`, and `ensure_agent_secret()`'s
+    placeholder-repair branch on an *existing* `.env`, newly reachable from
+    server startup by the previous fix and never locked down by anything
+    before this one) goes through that one function. Confirmed independently
+    three ways before trusting it: two review agents reproduced the break
+    live (one by cloning the actual PR branch and running its own
+    `verify_onboarding.py` — 80/80 passed, for the wrong reason), and a
+    third direct reproduction against the real installed `python-dotenv`
+    matched both. `scripts/verify_onboarding.py` now also asserts the
+    absence of the `(I)` flag and that the lock survives a *second*
+    `write_env_key()` call, not just the first.
 - **`/api/byok/*` is the one route family in this file with no auth
   dependency AND no operator credential behind it — a visitor's own
   Groq/Perplexity key, sent as `X-Provider`/`X-Provider-Key` headers, funds
