@@ -93,6 +93,7 @@ from tools.perplexity_research import (
     run_synthesis,
 )
 from tools.setup_wizard import (
+    ENV_PLACEHOLDERS,
     PERSISTENT_PROVIDERS,
     PROVIDER_KEY_NAMES,
     ensure_agent_secret,
@@ -121,11 +122,26 @@ logger = logging.getLogger(__name__)
 # every AI-provider key after that is added from the browser's CONFIG modal
 # (POST /api/settings/provider-key, further down). Never touches
 # PERPLEXITY_API_KEY/GROQ_API_KEY — those stay genuinely absent until the
-# operator adds one, on purpose. Skipped whenever AGENT_SECRET is already
-# set — including by every verification harness, which all set a real value
-# in os.environ before importing this module, so this branch is only ever
-# live on a genuinely fresh clone with no .env at all.
-if not os.getenv("AGENT_SECRET"):
+# operator adds one, on purpose. Skipped whenever AGENT_SECRET already holds
+# a real value — including by every verification harness, which all set a
+# real value in os.environ before importing this module, so this branch is
+# only ever live on a genuinely fresh clone with no real secret yet.
+#
+# The check is deliberately NOT bare truthiness. A plain `cp .env.example
+# .env` (still a documented, supported path alongside `python main.py
+# setup`) leaves AGENT_SECRET set to the literal, publicly-published
+# placeholder string — load_dotenv() loads that into os.environ as a
+# non-empty, truthy value, so `if not os.getenv("AGENT_SECRET")` used to
+# read that as "already set for real" and skip ensure_agent_secret()
+# entirely, even though that function's whole job is to detect and replace
+# exactly this placeholder. The result: the server would silently run with
+# the well-known default as its real owner credential — anyone sending
+# `X-Agent-Key: change-me-to-a-strong-random-string` authenticated as owner.
+# Confirmed live before this fix. ensure_agent_secret() is idempotent and
+# already tells "unset" / "placeholder" / "real" apart internally, so
+# calling it here for both bad cases is safe — a harness or container that
+# set a REAL secret still short-circuits this and touches no file.
+if not os.getenv("AGENT_SECRET") or os.getenv("AGENT_SECRET") == ENV_PLACEHOLDERS["AGENT_SECRET"]:
     try:
         _generated_secret = ensure_agent_secret(_ENV_FILE_PATH, _ENV_EXAMPLE_PATH)
         if _generated_secret:

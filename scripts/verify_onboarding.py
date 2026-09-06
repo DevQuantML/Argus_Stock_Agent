@@ -120,6 +120,19 @@ def main():
     check("a too-short string rejected", soft_validate("short")[0], False)
     check("a plausible key accepted", soft_validate("gsk_" + "a" * 40)[0], True)
 
+    # A bare '\r' used to pass every check above unchanged (no '\n', no '\t',
+    # not the placeholder, long enough) and then survive write_env_key()
+    # untouched: python-dotenv's own parser treats a lone '\r' as a value/
+    # line terminator, so the next dotenv_values()/load_dotenv() parsed the
+    # rest of the string as a SECOND, attacker-chosen key (e.g.
+    # "...\rAGENT_SECRET=<known value>") — confirmed live against the real
+    # installed python-dotenv before this fix. soft_validate() is the only
+    # gate in front of that sink, so closing it here closes the whole path.
+    check("a bare carriage return rejected (the .env CR-injection payload)",
+          soft_validate("gsk_" + "a" * 20 + "\rAGENT_SECRET=PWNED" + "1" * 20)[0], False)
+    check("any other C0 control byte rejected too, not just \\n/\\t/\\r",
+          soft_validate("gsk_" + "a" * 20 + "\x07" + "a" * 20)[0], False)
+
     # ── 3. env_is_git_tracked — both directions, inside a real git repo ────
     # A warning that never fires is worse than no warning, so this proves
     # the detector actually flags a tracked file, not just that it stays
@@ -181,13 +194,25 @@ def main():
     created = ensure_env_file(env_path, example_path)
     check("a missing .env is created", created, True)
 
-    # POSIX only — Windows' chmod only toggles the read-only bit, not real
-    # owner/group/other permission bits, so this assertion is meaningless
-    # there and is skipped rather than made to pass by accident.
+    # POSIX: chmod really does restrict owner/group/other bits, so assert it
+    # landed. Windows: chmod only toggles the read-only attribute and grants
+    # no confidentiality guarantee at all — _lock_down_env_file() uses a real
+    # icacls ACL there instead (CLAUDE-SECURITY finding C3), so the check on
+    # that platform reads the actual ACL back rather than the meaningless
+    # POSIX mode bits.
     if os.name != "nt":
         mode = env_path.stat().st_mode & 0o777
         check("a freshly created .env is not group/other readable or writable",
               mode & 0o077, 0)
+    else:
+        icacls_out = subprocess.run(
+            ["icacls", str(env_path)], capture_output=True, text=True, timeout=5,
+        ).stdout
+        check("icacls restricted the file — no broad group (Everyone/Users) still granted access",
+              ("Everyone" in icacls_out) or ("BUILTIN\\Users" in icacls_out), False)
+        current_user = os.environ.get("USERNAME") or os.environ.get("USER") or ""
+        check("the current user is the one actually granted access",
+              bool(current_user) and current_user in icacls_out, True)
 
     written_text = env_path.read_text(encoding="utf-8")
     for placeholder in ENV_PLACEHOLDERS.values():
@@ -242,8 +267,11 @@ def main():
     # ── 5b. ensure_agent_secret — the auto-bootstrap api.py runs at startup ─
     # This is what lets a fresh clone skip the CLI wizard entirely for the
     # FIRST secret: api.py calls this before anything else can reach owner
-    # routes. Three cases, matching the three branches in api.py's own
-    # startup check (not os.getenv("AGENT_SECRET")).
+    # routes. Three cases, matching the three branches api.py's own startup
+    # gate now distinguishes: `not os.getenv("AGENT_SECRET") or
+    # os.getenv("AGENT_SECRET") == ENV_PLACEHOLDERS["AGENT_SECRET"]` (unset,
+    # placeholder) vs. a real value (skipped, see section 5c below for why
+    # the gate's exact wording matters).
     section("ensure_agent_secret — fresh / already-real / placeholder cases")
     fresh_dir = Path(_tmp) / "agent-secret-fresh"
     fresh_dir.mkdir()
@@ -276,6 +304,49 @@ def main():
           bool(regenerated) and regenerated != ENV_PLACEHOLDERS["AGENT_SECRET"], True)
     check("...and the regenerated value is what's actually in the file",
           dotenv_values(ph_env).get("AGENT_SECRET"), regenerated)
+
+    # ── 5c. api.py's own startup gate — the line that was actually buggy ───
+    # ensure_agent_secret() above was correct in isolation the whole time;
+    # the vulnerability (CLAUDE-SECURITY finding C2) was in api.py's own
+    # gate AROUND it, which used to be bare truthiness
+    # (`if not os.getenv("AGENT_SECRET"):`). A plain `cp .env.example .env`
+    # — still a documented, supported path — leaves AGENT_SECRET set to the
+    # literal, publicly-published placeholder; load_dotenv() loads that as a
+    # non-empty, truthy string, so the old gate read "already set for real"
+    # and skipped this function entirely, leaving the published placeholder
+    # as the live owner credential. Confirmed live before this fix.
+    #
+    # api.py's own bootstrap block runs once, at module import, against the
+    # REAL project .env (_ENV_FILE_PATH is hardcoded relative to api.py
+    # itself, not overridable) — re-importing it here to exercise that block
+    # live would mean either touching this repo's real .env or forking a
+    # subprocess pointed at a scratch project layout, either of which is a
+    # bigger risk than this harness's Cost safety guarantee is worth trading
+    # for. Instead — matching this project's own established pattern for
+    # exactly this class of bug (see CLAUDE.md's Dockerfile-refactor
+    # gotcha: "a check that only greps for the old code silently stops
+    # meaning anything" — the fix there was reading the real launch command
+    # directly) — this reads api.py's actual source and asserts the
+    # placeholder-aware condition is really the line in the file, so a
+    # regression back to bare truthiness fails this harness immediately.
+    section("api.py's startup gate — reads the real source, not a re-implementation")
+    api_source = (ROOT / "api.py").read_text(encoding="utf-8")
+    # Scoped to the bootstrap block specifically — api.py's later _auth_ctx()
+    # legitimately contains the exact same bare `if not os.getenv(
+    # "AGENT_SECRET"):` text for an unrelated, correct purpose (fail-closed
+    # when the secret is unset at request time), so a whole-file substring
+    # search would false-fail this check against that line, not the real
+    # bootstrap gate this is actually about.
+    bootstrap_block = api_source[
+        api_source.index("# First-run bootstrap:"):api_source.index("store.bootstrap()")
+    ]
+    check("the bootstrap gate checks the placeholder, not just bare truthiness",
+          'os.getenv("AGENT_SECRET") == ENV_PLACEHOLDERS["AGENT_SECRET"]' in bootstrap_block, True)
+    check("the old bare-truthiness-only bootstrap gate is gone",
+          'if not os.getenv("AGENT_SECRET"):' in bootstrap_block, False)
+    check("ENV_PLACEHOLDERS is actually imported from tools.setup_wizard",
+          "ENV_PLACEHOLDERS" in api_source.split("from tools.setup_wizard import", 1)[1].split(")", 1)[0]
+          if "from tools.setup_wizard import" in api_source else False, True)
 
     # ── 6. /health — the exact signal the boot sequence consumes ───────────
     # Keys are set on os.environ directly (not via the wizard) because
