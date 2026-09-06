@@ -254,14 +254,19 @@ def ensure_env_file(env_path: Path, example_path: Path) -> bool:
     # shutil.copyfile does not carry over permission bits — the new file
     # gets the process umask's default, commonly world-readable (644) on
     # common Linux/macOS defaults. .env is about to hold real API keys and
-    # AGENT_SECRET, so lock it to the current user only.
+    # AGENT_SECRET, so lock it to the current user only. write_env_key()
+    # below re-applies this after every write it makes too (see its own
+    # docstring for why that's load-bearing, not redundant) — this call
+    # covers the brief window between copyfile and the first write, and the
+    # edge case where .env.example ever ships with no matching placeholders
+    # below, so the loop writes nothing at all.
     _lock_down_env_file(env_path)
 
     values = dotenv_values(env_path)
     for name, placeholder in ENV_PLACEHOLDERS.items():
         if values.get(name) == placeholder:
             new_value = generate_agent_secret() if name == "AGENT_SECRET" else ""
-            set_key(str(env_path), name, new_value, quote_mode="never")
+            write_env_key(env_path, name, new_value)
     return True
 
 
@@ -269,8 +274,26 @@ def write_env_key(env_path: Path, name: str, value: str) -> None:
     """Write exactly one key into .env, preserving every other line and
     comment. A thin wrapper over python-dotenv's set_key — the same library
     main.py and api.py already use to READ .env, used here to WRITE it, so
-    there is exactly one parser for this file format in the whole project."""
+    there is exactly one parser for this file format in the whole project.
+
+    Re-locks the file's permissions after every write, not just after first
+    creation — this is load-bearing, not defense-in-depth. python-dotenv's
+    set_key() rewrites the file via a temp file + os.replace() (dotenv's own
+    rewrite()), and on Windows the replacement's ACL comes from the PARENT
+    DIRECTORY's inheritance, not from the file it replaces. That means any
+    icacls restriction _lock_down_env_file() applied earlier is silently
+    discarded by the very next write through this function — confirmed live:
+    immediately after ensure_env_file()'s own placeholder-clearing loop
+    called this (before this fix), `icacls` showed only inherited entries;
+    the restriction from moments earlier was already gone, with no
+    exception and no warning. Every caller of this function — the CLI
+    wizard, POST /api/settings/provider-key, and ensure_agent_secret()'s
+    placeholder-repair branch — writes the app's most sensitive values
+    through here, so this is the one place that can make the lockdown
+    actually hold rather than only appearing to on the very first write.
+    """
     set_key(str(env_path), name, value, quote_mode="never")
+    _lock_down_env_file(env_path)
 
 
 def ensure_agent_secret(env_path: Path, example_path: Path) -> str | None:

@@ -213,6 +213,38 @@ def main():
         current_user = os.environ.get("USERNAME") or os.environ.get("USER") or ""
         check("the current user is the one actually granted access",
               bool(current_user) and current_user in icacls_out, True)
+        # The "(I)" flag means an ACE was INHERITED from the parent
+        # directory, not explicitly set by our own icacls call. This is the
+        # exact check the two assertions above were missing, and missing it
+        # is what let a real regression through once already: python-
+        # dotenv's set_key() rewrites the file via a temp file + os.replace,
+        # and on Windows the replacement's ACL comes from the parent
+        # directory's inheritance — silently discarding the icacls
+        # restriction _lock_down_env_file() had just applied, on the very
+        # write that puts the real AGENT_SECRET on disk. The two checks
+        # above still passed against that broken code (the scratch tempdir
+        # here happens to inherit an ACL that excludes Everyone/Users
+        # anyway), which is exactly why "no broad group" and "current user
+        # present" are not enough on their own — inherited-but-narrow still
+        # isn't "we locked this down."
+        check("the grant is NOT inherited — icacls actually reset inheritance here, "
+              "not just left whatever the parent directory already allowed",
+              "(I)" in icacls_out, False)
+
+        # Direct regression test for the bug above: lock, then write again
+        # through the same path every real caller uses (CLI wizard, POST
+        # /api/settings/provider-key, ensure_agent_secret()'s regeneration
+        # branch), and confirm the lock still holds afterward rather than
+        # only appearing to work on the very first write. Uses a throwaway
+        # key name — GROQ_API_KEY/PERPLEXITY_API_KEY/AGENT_SECRET are all
+        # checked for exact values later in this file, and this probe must
+        # not clobber them.
+        write_env_key(env_path, "_LOCKDOWN_REGRESSION_PROBE", "gsk_" + "z" * 40)
+        icacls_after_write = subprocess.run(
+            ["icacls", str(env_path)], capture_output=True, text=True, timeout=5,
+        ).stdout
+        check("the lockdown survives a SUBSEQUENT write_env_key() call, not just the first write",
+              "(I)" in icacls_after_write, False)
 
     written_text = env_path.read_text(encoding="utf-8")
     for placeholder in ENV_PLACEHOLDERS.values():
