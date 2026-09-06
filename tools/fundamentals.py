@@ -32,6 +32,7 @@ Security / robustness:
 
 import logging
 import math
+import re
 import threading
 import time
 
@@ -101,10 +102,21 @@ def _find_row(df, candidates: tuple[str, ...]):
             if low == target:
                 return lab, df.loc[lab]
 
+    # Word-boundary substring, not a bare `in` check: a bare substring match
+    # let the short candidate "EBIT" match inside an unrelated "EBITDA" (or
+    # "Normalized EBITDA") row whenever no filer-specific income-statement
+    # row named exactly "Operating Income"/"EBIT" existed to win the exact
+    # pass above. EBITDA is materially larger than operating income for any
+    # capital-intensive filer (it excludes D&A), so that silently fed an
+    # inflated number into ROIC's nopat calculation with no metric_status
+    # indication a proxy was used. \b...\b still matches "EBIT" inside
+    # "Other Non Operating Income Expenses" (space is a non-word character,
+    # same boundary the multi-word candidates already relied on) — it only
+    # rejects a match butted directly against more letters, like "da".
     for cand in candidates:
-        target = cand.lower()
+        pattern = re.compile(r"\b" + re.escape(cand.lower()) + r"\b")
         for lab, low in zip(labels, lowered):
-            if target in low:
+            if pattern.search(low):
                 return lab, df.loc[lab]
 
     return None, None
