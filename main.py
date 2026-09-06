@@ -111,7 +111,19 @@ def main():
     # Special commands
     if command == "SETUP":
         from tools.setup_wizard import run_wizard
-        run_wizard()
+        # run_wizard() makes several blocking input() calls. Ctrl+C there
+        # raises KeyboardInterrupt; a closed/piped stdin (e.g.
+        # `python main.py setup < /dev/null`) raises EOFError. Neither is
+        # caught inside the wizard itself, so left unhandled here they'd
+        # dump a raw traceback instead of the clean "cancelled" every other
+        # entry point in this project gives (run_perplexity_research,
+        # run_research_module, get_price_and_fundamentals — all documented
+        # "always returns, never raises"). This is that same discipline
+        # reaching the one place it didn't before: the CLI's own top level.
+        try:
+            run_wizard()
+        except (KeyboardInterrupt, EOFError):
+            print("\nSetup cancelled.")
         return
 
     if command == "SCAN":

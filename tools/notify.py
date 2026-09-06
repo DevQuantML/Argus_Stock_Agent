@@ -140,13 +140,29 @@ def start_telegram_reply_listener(handler) -> threading.Event | None:
 
     def _run():
         offset = None
-        try:
-            backlog = _get_updates(token, offset=None, timeout_s=0)
-            if backlog:
-                offset = backlog[-1]["update_id"] + 1
-        except Exception as exc:
-            logger.warning("telegram reply listener: initial getUpdates failed "
-                           "(type=%s): %s", type(exc).__name__, exc)
+        # Retry the discard-priming call until it actually succeeds, rather
+        # than falling through to the main loop on failure. A transient
+        # failure here used to leave `offset` at None, and the main loop's
+        # very next getUpdates call ALSO uses offset=None — which asks
+        # Telegram for the full unconfirmed backlog instead of discarding
+        # it, and that backlog then gets handed to `handler` in the loop
+        # below. That is exactly the "must not replay a reply from days
+        # ago" failure this priming step exists to prevent, just reached by
+        # a failed priming call instead of a skipped one. Bounded by `stop`
+        # so a shutdown requested before Telegram ever becomes reachable
+        # still exits promptly rather than retrying forever.
+        primed = False
+        while not stop.is_set() and not primed:
+            try:
+                backlog = _get_updates(token, offset=None, timeout_s=0)
+                if backlog:
+                    offset = backlog[-1]["update_id"] + 1
+                primed = True
+            except Exception as exc:
+                logger.warning("telegram reply listener: initial getUpdates failed "
+                               "(type=%s) — retrying in %ss before entering the "
+                               "main loop", type(exc).__name__, _RETRY_DELAY_S)
+                stop.wait(_RETRY_DELAY_S)
 
         while not stop.is_set():
             try:
@@ -158,8 +174,22 @@ def start_telegram_reply_listener(handler) -> threading.Event | None:
                 continue
 
             for upd in updates:
-                offset = upd["update_id"] + 1
-                _process_update(upd, want_chat_id, handler)
+                # Wrapped per-update, not just around handler() inside
+                # _process_update: an unexpected shape (e.g. Telegram ever
+                # sending "chat": null) can raise from _process_update
+                # itself, outside its own handler try/except. Uncaught,
+                # that propagates out of this daemon thread and silently
+                # ends it for the rest of the process's life — no restart,
+                # no operator-visible log beyond a stderr traceback easy to
+                # miss in a hosted log stream. One bad update must not kill
+                # the listener for every update after it.
+                try:
+                    offset = upd["update_id"] + 1
+                    _process_update(upd, want_chat_id, handler)
+                except Exception:
+                    logger.exception(
+                        "telegram reply listener: failed to process an update — skipping it"
+                    )
 
     threading.Thread(target=_run, name="telegram-reply-listener", daemon=True).start()
     return stop

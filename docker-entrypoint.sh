@@ -14,12 +14,21 @@
 # EVERY process in the container non-root from the start, including this
 # one, and it could never fix the very permission problem it exists to fix.
 #
-# Root's involvement ends here. This script chowns exactly two things,
-# processes no attacker-reachable input, and immediately execs into the
-# non-root uvicorn process via `su` — the actual application, the one
-# handling real network traffic, still never runs as root. Standard
-# pattern for exactly this class of problem (the official postgres/mysql/
-# redis images all do the same thing for the same reason).
+# Root's involvement ends here. This script chowns exactly one thing — the
+# database's own directory, never the wider /app tree — processes no
+# attacker-reachable input, and immediately execs into the non-root uvicorn
+# process via `su`: the actual application, the one handling real network
+# traffic, still never runs as root and never holds write access it doesn't
+# need. Standard pattern for exactly this class of problem (the official
+# postgres/mysql/redis images all do the same thing for the same reason).
+#
+# Deliberately NOT `chown -R appuser /app` in addition to $db_dir: appuser
+# only needs to WRITE inside the database directory — reading the app's own
+# source and static files needs no ownership change, since COPY's default
+# permissions are already world-readable. Widening this to /app would hand
+# appuser write access to every served static file and Python module too,
+# for no operational reason — least-privilege the same way this project
+# already treats every other credential and permission boundary.
 set -e
 
 db_dir=$(dirname "${ARGUS_DB:-/app/argus.db}")
@@ -29,7 +38,7 @@ mkdir -p "$db_dir"
 # sandboxes — either way, this must never be fatal on its own. If the
 # directory genuinely isn't writable after this, store.bootstrap() will
 # still fail with its own clear error, which is the right failure mode.
-chown -R appuser:appgroup /app "$db_dir" 2>/dev/null || true
+chown -R appuser:appgroup "$db_dir" 2>/dev/null || true
 
 port="${PORT:-8000}"
 exec su -s /bin/sh appuser -c "uvicorn api:app --host 0.0.0.0 --port $port --workers 1 --no-proxy-headers"

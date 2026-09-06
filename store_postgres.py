@@ -308,22 +308,36 @@ def positions() -> dict[str, dict]:
 
 
 def upsert_position(ticker: str, data: dict) -> str:
+    """Partial update — see store.py's identical docstring for why the read
+    and the write must share one transaction rather than two independent
+    positions()/_exec() calls (each takes _txn()/_lock separately, leaving
+    a lost-update window between them). Same fix here, in this file's own
+    idiom: one _txn() block, not a bare-connection BEGIN IMMEDIATE."""
     t = validate_ticker(ticker)
-    existing = positions().get(t, {})
-    merged = {**existing, **data}
-    _exec(
-        """INSERT INTO positions
-             (ticker, shares, avg_cost, buy_date, stop_loss, trim_at, tranches, thesis, sector)
-           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-           ON CONFLICT (ticker) DO UPDATE SET
-             shares=excluded.shares, avg_cost=excluded.avg_cost, buy_date=excluded.buy_date,
-             stop_loss=excluded.stop_loss, trim_at=excluded.trim_at,
-             tranches=excluded.tranches, thesis=excluded.thesis, sector=excluded.sector""",
-        (t, merged.get("shares"), merged.get("avg_cost"), merged.get("buy_date"),
-         merged.get("stop_loss"), merged.get("trim_at"),
-         json.dumps(merged.get("tranches") or []),
-         merged.get("thesis") or "", merged.get("sector") or ""),
-    )
+    with _txn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM positions WHERE ticker = %s", (t,))
+            row = cur.fetchone()
+            existing = {} if row is None else {
+                "shares": row["shares"], "avg_cost": row["avg_cost"], "buy_date": row["buy_date"],
+                "stop_loss": row["stop_loss"], "trim_at": row["trim_at"],
+                "tranches": _loads(row["tranches"], []),
+                "thesis": row["thesis"], "sector": row["sector"],
+            }
+            merged = {**existing, **data}
+            cur.execute(
+                """INSERT INTO positions
+                     (ticker, shares, avg_cost, buy_date, stop_loss, trim_at, tranches, thesis, sector)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                   ON CONFLICT (ticker) DO UPDATE SET
+                     shares=excluded.shares, avg_cost=excluded.avg_cost, buy_date=excluded.buy_date,
+                     stop_loss=excluded.stop_loss, trim_at=excluded.trim_at,
+                     tranches=excluded.tranches, thesis=excluded.thesis, sector=excluded.sector""",
+                (t, merged.get("shares"), merged.get("avg_cost"), merged.get("buy_date"),
+                 merged.get("stop_loss"), merged.get("trim_at"),
+                 json.dumps(merged.get("tranches") or []),
+                 merged.get("thesis") or "", merged.get("sector") or ""),
+            )
     return t
 
 
@@ -754,6 +768,7 @@ def save_research_run(ticker: str, mode: str, tier: str,
     itself does not translate; `IS NOT DISTINCT FROM` is the standard-SQL
     operator built for exactly this.
     """
+    ticker = validate_ticker(ticker)
     with _txn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -777,6 +792,7 @@ def save_research_run(ticker: str, mode: str, tier: str,
 
 def list_research_runs(ticker: str, tier: str, guest_key_id: int | None,
                         limit: int = RESEARCH_HISTORY_LIMIT) -> list[dict]:
+    ticker = validate_ticker(ticker)
     rows = _rows(
         "SELECT id, ticker, mode, payload, created_at FROM research_runs "
         "WHERE ticker = %s AND tier = %s AND guest_key_id IS NOT DISTINCT FROM %s "
