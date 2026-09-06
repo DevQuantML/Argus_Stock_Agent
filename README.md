@@ -208,6 +208,27 @@ costs money.**
 
 ---
 
+## More than one way in
+
+The loop above is what you get out of the box. A few things built on top of it,
+each optional:
+
+- **Guest access.** Don't want to hand out your own key? Anyone can request
+  access from the terminal itself — you approve it in one click, or just by
+  replying to the Telegram notification — and they get a 24-hour link:
+  read-only on your book, plus exactly one AI deep-dive on one ticker.
+- **Model Court.** Ask one question, get two answers. Runs the same research
+  through Perplexity and Gemini side by side, using your own keys, so you can
+  see where two different AIs agree — and where they don't.
+- **Bring your own key (BYOK).** Lets a visitor fund their own research with
+  their own Groq / Perplexity / Gemini key. Off by default, opt-in per
+  deployment, and it never touches your account or your bill.
+- **History.** Every research run — yours or a guest's — is saved and stays
+  browsable per ticker, so you're not paying twice to see what the AI already
+  told you.
+
+---
+
 ## Cost
 
 **A full 5-module research run costs roughly $0.21.** That is real money leaving
@@ -288,6 +309,12 @@ docker build -t argus .
 docker run -p 8000:8000 --env-file .env argus
 ```
 
+By default everything — positions, sessions, guest keys, research history —
+lives in one local SQLite file. Nothing to configure. For a stateless cloud
+deploy (Cloud Run, Railway, etc.), set `DATABASE_URL` to a Postgres connection
+string instead and Argus switches storage backends automatically — same
+routes, same behaviour.
+
 ### The keys — don't confuse them
 
 | Key | Lives in | What it's for |
@@ -296,6 +323,10 @@ docker run -p 8000:8000 --env-file .env argus
 | `PERPLEXITY_API_KEY` | `.env` only | Provider credential. **Never sent to the browser.** |
 | `GROQ_API_KEY` | `.env` only | Fallback provider. **Never sent to the browser.** |
 | a **guest key** (`gk_…`) | issued from the app, stored **hashed** | A 24-hour key you hand to someone else. Read-only on your book, and worth exactly one AI deep dive on one ticker. You mint it by approving their request in the terminal; the raw key is shown to you once and never stored. |
+
+Gemini is available too, but only as a **bring-your-own-key** option (see
+[More than one way in](#more-than-one-way-in) above) — it's never stored on
+the server, and it's off by default (`ALLOW_BYOK_VISITORS` in `.env`).
 
 Without `AGENT_SECRET` the app is fail-closed: gated routes return 401 and no
 key of any kind can be redeemed. The free market-data routes still work, and a
@@ -362,6 +393,10 @@ the above, cost nothing, and make no network calls.
 A Bloomberg-style terminal — boot sequence, ticker tape, command line, three-column
 grid, inspector drawer. Command-driven, with a click fallback on every action.
 
+Click any symbol in the scrolling ticker tape — your holdings, your watchlist,
+or the S&P 500 / Nasdaq / Dow benchmarks — to inspect it, even if you don't
+own it. First time here? A five-step tour points out where everything lives.
+
 **No build step, no npm, no CDN, no external requests.** Plain ES modules served
 same-origin under a `script-src 'self'` CSP. Clone it and it runs; there is
 nothing to compile.
@@ -377,13 +412,17 @@ so it cannot reintroduce markup.
 Every check below is free — no API spend, no network calls to paid services:
 
 ```bash
-python scripts/verify_quant.py            # 121 assertions over the quant engine
-python scripts/verify_metric_status.py    # 396 assertions over metric provenance
-python scripts/verify_ticker_validation.py
-python scripts/verify_proxy_trust.py      # 17 assertions — proxy trust boundary
-python scripts/verify_hardening.py        # 48 assertions — rate limiter + prompt fences
-python scripts/verify_consistency.py      # 12 assertions — one quantity, one value
-python scripts/verify_docs.py             # architecture table matches the actual file tree
+python scripts/verify_quant.py            # the maths — DCF, ROIC, FCF yield, PEG, Sharpe, Beta
+python scripts/verify_metric_status.py    # every "can't compute this" reason is honest
+python scripts/verify_ticker_validation.py  # every ticker write is validated first
+python scripts/verify_proxy_trust.py      # the reverse-proxy trust boundary
+python scripts/verify_hardening.py        # rate limits, prompt fencing, launch flags
+python scripts/verify_consistency.py      # one quantity has exactly one value, everywhere
+python scripts/verify_docs.py             # this file's architecture table matches the tree
+python scripts/verify_access.py           # owner vs. guest, the one-dive budget, request flow
+python scripts/verify_onboarding.py       # the setup wizard, and what /health is allowed to leak
+python scripts/verify_byok_visitor.py     # anonymous BYOK research + Model Court, both hardened
+python scripts/verify_postgres_store.py   # only if you're running the Postgres backend
 ```
 
 These live in the repo deliberately. A verification you cannot re-run is a rumour.
@@ -411,21 +450,26 @@ Stated plainly, because a README that only lists strengths isn't worth reading.
 ## Architecture
 
 ```
-api.py                        FastAPI app — routes, auth, rate limit, CSP
+api.py                        FastAPI app — routes, tiered auth, rate limit, CSP
 config.py                     Brent levels, portfolio, watchlist, geo map
 main.py                       CLI entry point
-store.py                      SQLite — positions, watchlist, sessions, profile
+store.py                      SQLite — positions, watchlist, sessions, guest
+                               keys, research history (the default backend)
+store_postgres.py             Same storage, for a cloud deploy — see DATABASE_URL above
 tools/
   oil_price.py                Brent futures → macro gate signal
   quant.py                    DCF, ROIC, FCF yield, PEG, Sharpe, Beta
   fundamentals.py             Statement reader with cache + provenance
   fx.py                       Currency conversion for foreign-listed names
-  perplexity_research.py      The only AI path
+  perplexity_research.py      Research, synthesis, and Model Court
+  gemini_native.py            Gemini's native endpoint (live web grounding)
   stock_data.py               yfinance prices + fundamentals
   validator.py                Ticker validation, output guarding
+  notify.py                   Telegram push for access requests
   xirr.py                     Time-weighted portfolio returns
 static/                       Frontend — no build step, ES modules
 scripts/verify_*.py           Free verification harnesses
+Dockerfile, docker-entrypoint.sh   Container build + non-root startup
 ```
 
 Deeper design notes, decisions and open items: [`docs/HANDOFF.md`](docs/HANDOFF.md).
