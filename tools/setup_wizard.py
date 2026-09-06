@@ -26,12 +26,17 @@ Security invariants this file exists to hold:
 
 from __future__ import annotations
 
+import logging
+import os
 import secrets
 import shutil
+import stat
 import subprocess
 from pathlib import Path
 
 from dotenv import dotenv_values, set_key
+
+logger = logging.getLogger(__name__)
 
 # Placeholders shipped in .env.example — copied verbatim, these would be
 # treated as real values by the app. Every entry here MUST match that file
@@ -113,8 +118,19 @@ def soft_validate(value: str) -> tuple[bool, str]:
     """
     if not value:
         return False, "nothing entered"
-    if value.strip() != value or "\n" in value or "\t" in value:
-        return False, "contains leading/trailing whitespace or a stray newline — check your paste"
+    # Reject every C0 control character, not just '\n'/'\t'. A bare '\r' used
+    # to slip through here: python-dotenv's own parser treats a lone '\r' as
+    # a value/line terminator just like '\n' (dotenv/parser.py's
+    # _unquoted_value is `[^\r\n]*`), so `"<key>\rAGENT_SECRET=<attacker
+    # value>"` passed this check unchanged, and write_env_key() (quote_mode=
+    # "never", no escaping) wrote it straight through — the next
+    # dotenv_values()/load_dotenv() then parsed it back as TWO bindings,
+    # letting the caller plant an arbitrary new .env line (AGENT_SECRET,
+    # DATABASE_URL, ALLOW_BYOK_VISITORS, ...). Confirmed live against the
+    # installed python-dotenv before this fix. `ord(c) < 0x20` closes the
+    # whole class, not just this one byte.
+    if value.strip() != value or any(ord(c) < 0x20 for c in value):
+        return False, "contains leading/trailing whitespace or a control character (stray newline/return/tab) — check your paste"
     if value in ENV_PLACEHOLDERS.values():
         return False, "that's the placeholder from .env.example, not a real key"
     if len(value) < 20:
@@ -158,6 +174,64 @@ def gitignore_covers_env(root: Path) -> bool:
     return bool(lines & {".env", ".env.*", ".env*"})
 
 
+def _lock_down_env_file(env_path: Path) -> None:
+    """Best-effort restrict a freshly created .env to the current user only,
+    and say so — loudly — when that didn't actually happen, rather than
+    trusting a non-exception as proof.
+
+    Path.chmod() is a real POSIX permission change on Linux/macOS. On
+    Windows it is a near no-op: chmod there only toggles the read-only
+    attribute, which blocks accidental overwrites but grants no
+    confidentiality guarantee at all — every other local account can still
+    read the file. This used to fail silently (bare `except OSError: pass`
+    with no verification), so a Windows install had no permission
+    protection on AGENT_SECRET and any saved provider key, and nothing ever
+    said so. Two separate protections now, matched to the platform:
+
+      - Windows: an explicit ACL via `icacls`, replacing inherited
+        permissions with grant-only-to-the-current-user. This is a real
+        access restriction, unlike chmod there.
+      - POSIX: chmod(0o600) as before, but now re-`stat`ed afterwards to
+        confirm the mode actually landed — some filesystems and network
+        mounts silently ignore POSIX mode bits.
+
+    Either branch is best-effort: a failure here must never block setup
+    over a permission cosmetic, but it must not stay silent either.
+    """
+    if os.name == "nt":
+        user = os.environ.get("USERNAME") or os.environ.get("USER")
+        if not user:
+            logger.warning(
+                "ensure_env_file: could not determine the current Windows user to "
+                "restrict %s — leaving default permissions in place. Other local "
+                "accounts on this machine may be able to read it.", env_path,
+            )
+            return
+        try:
+            subprocess.run(
+                ["icacls", str(env_path), "/inheritance:r", "/grant:r", f"{user}:F"],
+                capture_output=True, timeout=5, check=True,
+            )
+        except Exception as exc:  # noqa: BLE001 — must never block setup
+            logger.warning(
+                "ensure_env_file: could not restrict %s to %s via icacls (%s) — "
+                "other local accounts on this machine may be able to read it.",
+                env_path, user, exc,
+            )
+        return
+
+    try:
+        env_path.chmod(0o600)
+        if stat.S_IMODE(env_path.stat().st_mode) != 0o600:
+            raise OSError("chmod reported success but the mode did not change")
+    except OSError as exc:
+        logger.warning(
+            "ensure_env_file: could not lock %s to owner-only permissions (%s) — "
+            "this filesystem may not support POSIX mode bits. Other local "
+            "accounts on this machine may be able to read it.", env_path, exc,
+        )
+
+
 def ensure_env_file(env_path: Path, example_path: Path) -> bool:
     """Create .env from .env.example if missing, with its placeholders
     neutralized. Returns True if a new file was created, False if .env
@@ -177,23 +251,22 @@ def ensure_env_file(env_path: Path, example_path: Path) -> bool:
         raise FileNotFoundError(f"{example_path} not found — cannot bootstrap .env")
 
     shutil.copyfile(example_path, env_path)
-    try:
-        # shutil.copyfile does not carry over permission bits — the new file
-        # gets the process umask's default, commonly world-readable (644) on
-        # common Linux/macOS defaults. .env is about to hold real API keys
-        # and AGENT_SECRET, so lock it to the owner only. Best-effort: some
-        # filesystems (certain Windows configurations, some network mounts)
-        # don't honor POSIX mode bits, and a failure here must never block
-        # setup over a permission cosmetic.
-        env_path.chmod(0o600)
-    except OSError:
-        pass
+    # shutil.copyfile does not carry over permission bits — the new file
+    # gets the process umask's default, commonly world-readable (644) on
+    # common Linux/macOS defaults. .env is about to hold real API keys and
+    # AGENT_SECRET, so lock it to the current user only. write_env_key()
+    # below re-applies this after every write it makes too (see its own
+    # docstring for why that's load-bearing, not redundant) — this call
+    # covers the brief window between copyfile and the first write, and the
+    # edge case where .env.example ever ships with no matching placeholders
+    # below, so the loop writes nothing at all.
+    _lock_down_env_file(env_path)
 
     values = dotenv_values(env_path)
     for name, placeholder in ENV_PLACEHOLDERS.items():
         if values.get(name) == placeholder:
             new_value = generate_agent_secret() if name == "AGENT_SECRET" else ""
-            set_key(str(env_path), name, new_value, quote_mode="never")
+            write_env_key(env_path, name, new_value)
     return True
 
 
@@ -201,8 +274,26 @@ def write_env_key(env_path: Path, name: str, value: str) -> None:
     """Write exactly one key into .env, preserving every other line and
     comment. A thin wrapper over python-dotenv's set_key — the same library
     main.py and api.py already use to READ .env, used here to WRITE it, so
-    there is exactly one parser for this file format in the whole project."""
+    there is exactly one parser for this file format in the whole project.
+
+    Re-locks the file's permissions after every write, not just after first
+    creation — this is load-bearing, not defense-in-depth. python-dotenv's
+    set_key() rewrites the file via a temp file + os.replace() (dotenv's own
+    rewrite()), and on Windows the replacement's ACL comes from the PARENT
+    DIRECTORY's inheritance, not from the file it replaces. That means any
+    icacls restriction _lock_down_env_file() applied earlier is silently
+    discarded by the very next write through this function — confirmed live:
+    immediately after ensure_env_file()'s own placeholder-clearing loop
+    called this (before this fix), `icacls` showed only inherited entries;
+    the restriction from moments earlier was already gone, with no
+    exception and no warning. Every caller of this function — the CLI
+    wizard, POST /api/settings/provider-key, and ensure_agent_secret()'s
+    placeholder-repair branch — writes the app's most sensitive values
+    through here, so this is the one place that can make the lockdown
+    actually hold rather than only appearing to on the very first write.
+    """
     set_key(str(env_path), name, value, quote_mode="never")
+    _lock_down_env_file(env_path)
 
 
 def ensure_agent_secret(env_path: Path, example_path: Path) -> str | None:
