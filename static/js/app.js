@@ -1807,6 +1807,11 @@ function openConfig() {
       return;
     }
     views.showUnlock(async () => {
+      // Same reason as the landing gate's onUnlocked: a real session must
+      // take priority over a previously-pasted BYOK key, or research()
+      // keeps routing through it forever — see that comment for the full
+      // failure mode.
+      state.selfKey = null;
       await api.auth.refresh();
       ui.renderKeyState(tier(), api.auth.guest);
       ui.toast('Unlocked — AI research armed.', 'success', 3200);
@@ -1965,6 +1970,15 @@ document.addEventListener('DOMContentLoaded', async () => {
   const landing = (mode) => views.showLanding({
     mode,
     onUnlocked: async () => {
+      // A real session now exists and takes priority. Without this,
+      // state.selfKey (once set) shadows it forever: research() checks
+      // hasSelfKey before any tier/session check, so a visitor who used
+      // BYOK and then unlocked as owner/guest would keep silently billing
+      // their own pasted key through /api/byok/* instead of the now-active
+      // session — a guest's "exactly one dive" allowance would never be
+      // touched, and an owner would keep spending their own key instead of
+      // the operator-configured provider.
+      state.selfKey = null;
       await api.auth.refresh();
       await enterOrOnboard();
     },

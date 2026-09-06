@@ -13,6 +13,14 @@ argus.db
 argus.db-wal
 argus.db-shm
 
+# config.py's own local-override mechanism (see its `from config_local import
+# ...` fallback). .gitignore already excludes this because it can hold real
+# share counts, cost basis and private thesis text — the exact same leak
+# argus.db above exists to prevent, and just as reachable: `docker build`
+# is documented to run from the same directory a local `python main.py`
+# session already populated config_local.py in.
+config_local.py
+
 # Agent tooling. .claude/worktrees/ holds a full second checkout of this repo.
 .claude
 

@@ -28,7 +28,19 @@ def _npv(rate: float, flows: list[tuple[date, float]], t0: date) -> float:
         base = 1.0 + rate
         if base <= 0:
             return float("inf")
-        total += amount / (base ** years)
+        try:
+            total += amount / (base ** years)
+        except OverflowError:
+            # Same domain-violation signal as base <= 0 above. Newton's own
+            # iterate (xirr()'s `nxt = rate - step`) is unbounded on the
+            # upside — only _LOW bounds the downside — so `rate` can wander
+            # far enough that base ** years exceeds float range. Confirmed
+            # live: base ** years already overflows well within a plausible
+            # iteration path, and Python's float ** raises rather than
+            # returning inf, which breaks this function's own "never raises"
+            # contract unless caught here. inf is handled identically by
+            # every caller's existing _finite() check either way.
+            return float("inf")
     return total
 
 
@@ -39,7 +51,10 @@ def _dnpv(rate: float, flows: list[tuple[date, float]], t0: date) -> float:
         base = 1.0 + rate
         if base <= 0:
             return float("inf")
-        total -= years * amount / (base ** (years + 1.0))
+        try:
+            total -= years * amount / (base ** (years + 1.0))
+        except OverflowError:
+            return float("inf")
     return total
 
 

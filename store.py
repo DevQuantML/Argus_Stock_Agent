@@ -326,23 +326,49 @@ def upsert_position(ticker: str, data: dict) -> str:
 
     Callers pass model_dump(exclude_unset=True) — an omitted key keeps its
     stored value rather than being overwritten with a default.
+
+    The read (existing row) and the write (merged INSERT/UPDATE) run inside
+    ONE held transaction, not two independent positions()/_exec() calls —
+    each of those takes and releases _lock separately, which left a window
+    for a lost update: two nearly-simultaneous partial updates (e.g. two
+    browser tabs, or a double-submit) could both read the same pre-update
+    row before either writes, and whichever commits second silently reverts
+    the other's field back to what IT read, even though it never touched
+    that field — exclude_unset=True's per-field-patch semantics are exactly
+    what makes a full-row overwrite masquerade as a safe partial one.
+    consume_guest_unit() below already holds one BEGIN IMMEDIATE transaction
+    for the identical reason; this does the same.
     """
     t = validate_ticker(ticker)
-    existing = positions().get(t, {})
-    merged = {**existing, **data}
-    _exec(
-        """INSERT INTO positions
-             (ticker, shares, avg_cost, buy_date, stop_loss, trim_at, tranches, thesis, sector)
-           VALUES (?,?,?,?,?,?,?,?,?)
-           ON CONFLICT(ticker) DO UPDATE SET
-             shares=excluded.shares, avg_cost=excluded.avg_cost, buy_date=excluded.buy_date,
-             stop_loss=excluded.stop_loss, trim_at=excluded.trim_at,
-             tranches=excluded.tranches, thesis=excluded.thesis, sector=excluded.sector""",
-        (t, merged.get("shares"), merged.get("avg_cost"), merged.get("buy_date"),
-         merged.get("stop_loss"), merged.get("trim_at"),
-         json.dumps(merged.get("tranches") or []),
-         merged.get("thesis") or "", merged.get("sector") or ""),
-    )
+    with _lock:
+        c = _connect()
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            row = c.execute("SELECT * FROM positions WHERE ticker = ?", (t,)).fetchone()
+            existing = {} if row is None else {
+                "shares": row["shares"], "avg_cost": row["avg_cost"], "buy_date": row["buy_date"],
+                "stop_loss": row["stop_loss"], "trim_at": row["trim_at"],
+                "tranches": _loads(row["tranches"], []),
+                "thesis": row["thesis"], "sector": row["sector"],
+            }
+            merged = {**existing, **data}
+            c.execute(
+                """INSERT INTO positions
+                     (ticker, shares, avg_cost, buy_date, stop_loss, trim_at, tranches, thesis, sector)
+                   VALUES (?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(ticker) DO UPDATE SET
+                     shares=excluded.shares, avg_cost=excluded.avg_cost, buy_date=excluded.buy_date,
+                     stop_loss=excluded.stop_loss, trim_at=excluded.trim_at,
+                     tranches=excluded.tranches, thesis=excluded.thesis, sector=excluded.sector""",
+                (t, merged.get("shares"), merged.get("avg_cost"), merged.get("buy_date"),
+                 merged.get("stop_loss"), merged.get("trim_at"),
+                 json.dumps(merged.get("tranches") or []),
+                 merged.get("thesis") or "", merged.get("sector") or ""),
+            )
+        except Exception:
+            c.rollback()
+            raise
+        c.commit()
     return t
 
 
@@ -938,6 +964,7 @@ def save_research_run(ticker: str, mode: str, tier: str,
     resolution, so it is the tiebreaker both this query and
     list_research_runs()'s use, identically.
     """
+    ticker = validate_ticker(ticker)
     with _lock:
         conn = _connect()
         cur = conn.execute(
@@ -964,6 +991,7 @@ def list_research_runs(ticker: str, tier: str, guest_key_id: int | None,
     """Saved runs for one ticker, newest first, scoped to the caller's own
     (tier, guest_key_id) — a guest can never see another guest's or the
     owner's history this way, even by guessing an id."""
+    ticker = validate_ticker(ticker)
     rows = _rows(
         "SELECT id, ticker, mode, payload, created_at FROM research_runs "
         "WHERE ticker = ? AND tier = ? AND guest_key_id IS ? "

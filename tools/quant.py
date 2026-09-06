@@ -252,7 +252,19 @@ def _intrinsic(fcf: float, growth: float, wacc: float,
 def _compute_dcf(fcf: float, growth_rate: float, wacc: float,
                  net_debt: float, shares: float) -> dict | None:
     """5-year DCF → intrinsic value per share, with every assumption recorded."""
-    g = min(max(growth_rate, 0.0), _MAX_GROWTH_RATE)
+    # Capped BOTH directions at _MAX_GROWTH_RATE — no longer floored at 0.0.
+    # A real, negative trailing FCF growth rate is a legitimate scenario to
+    # price, not a reason to pretend the business is flat: flooring it here
+    # silently overstated intrinsic value (by 2x+ in a real case) for a name
+    # whose trailing FCF genuinely declined while staying positive — a
+    # different, previously-unguarded case from the FCF-crosses-zero
+    # scenario already declined above at `growth is None`. _sensitivity()'s
+    # own docstring already states this exact philosophy ("a negative
+    # growth point is legitimate too — a business whose cash flow shrinks is
+    # a scenario worth pricing"), and _implied_growth's reverse-DCF bisection
+    # already searches down to -50% as a normal input — this brings the
+    # forward direction in line with both instead of contradicting them.
+    g = max(min(growth_rate, _MAX_GROWTH_RATE), -_MAX_GROWTH_RATE)
     value = _intrinsic(fcf, g, wacc, net_debt, shares)
     if value is None:
         return None
@@ -262,7 +274,10 @@ def _compute_dcf(fcf: float, growth_rate: float, wacc: float,
         "assumptions": {
             "fcf_used":         round(fcf),
             "growth_rate_used": round(g, 4),
-            "growth_capped":    growth_rate > _MAX_GROWTH_RATE,
+            # Both directions now, not just the upper one — a growth rate
+            # clamped for being too NEGATIVE deserves the same disclosure as
+            # one clamped for being too high.
+            "growth_capped":    abs(growth_rate) > _MAX_GROWTH_RATE,
             "growth_uncapped":  round(growth_rate, 4),
             "discount_rate":    round(wacc, 4),
             "terminal_growth":  _TERMINAL_GROWTH,
@@ -451,8 +466,16 @@ def get_quant_metrics(ticker: str) -> dict:
         rev_growth     = _safe_float(info.get("revenueGrowth"))
         forward_pe     = _safe_float(info.get("forwardPE"))
         raw_eps_growth = _safe_float(info.get("earningsGrowth"))
-        eps_growth     = raw_eps_growth if raw_eps_growth else rev_growth
-        growth_field   = "earnings growth" if raw_eps_growth else "revenue growth"
+        # `is not None`, not bare truthiness: _safe_float(None) already
+        # returns None, so a bare 0.0 here means Yahoo genuinely reported
+        # flat (0%) earnings growth — a real, meaningful reading, not a
+        # missing field. Bare truthiness silently discarded that real 0.0
+        # and substituted revenue growth (or None) instead, which could
+        # then report "no growth rate to report" for a name that in fact
+        # had one, routing past the `eps_growth <= 0` STRUCTURAL branch
+        # below with the wrong stated reason.
+        eps_growth     = raw_eps_growth if raw_eps_growth is not None else rev_growth
+        growth_field   = "earnings growth" if raw_eps_growth is not None else "revenue growth"
         beta           = _safe_float(info.get("beta"))
 
         quote_type = str(info.get("quoteType") or "").upper()
@@ -908,12 +931,6 @@ def get_quant_metrics(ticker: str) -> dict:
                      fin_resolves,
                      sector=sector,
                      industry=industry or None)
-        elif ccy_mismatch and fx_rate is None:
-            gaps.gap("dcf", TRANSIENT,
-                     f"Cash flow and net debt are in {fin_ccy} while the shares trade in "
-                     f"{market_ccy}, and the {fin_ccy}/{market_ccy} rate did not load, so a "
-                     f"per-share value cannot be stated in the currency of the price.",
-                     "Clears as soon as the FX quote returns; every other DCF input is present.")
         elif fcf is None:
             gaps.gap("dcf", TRANSIENT if not cashflow_loaded else STRUCTURAL,
                      "No free-cash-flow figure could be read, so there is nothing to discount.",
@@ -939,11 +956,25 @@ def get_quant_metrics(ticker: str) -> dict:
                      "reported as a fallback.",
                      "Returns once three consecutive years of positive free cash flow are on "
                      "file, or Yahoo publishes a revenue growth rate.")
+        elif ccy_mismatch and fx_rate is None:
+            # Moved after every existence check above (fcf, shares, growth) —
+            # it used to run first, so "every other DCF input is present" in
+            # its own resolves text was false whenever an FX failure
+            # coincided with one of those also being missing. fcf_yield's
+            # equivalent branch a little above already orders it this way;
+            # this now matches, and the claim is actually true by the time
+            # it's made.
+            gaps.gap("dcf", TRANSIENT,
+                     f"Cash flow and net debt are in {fin_ccy} while the shares trade in "
+                     f"{market_ccy}, and the {fin_ccy}/{market_ccy} rate did not load, so a "
+                     f"per-share value cannot be stated in the currency of the price.",
+                     "Clears as soon as the FX quote returns; every other DCF input is present.")
         else:
             # Clamp once and reuse, so the sensitivity grid's centre cell is
             # built from the identical float as the headline value rather than
-            # a rounded copy of it.
-            g_applied = min(max(growth, 0.0), _MAX_GROWTH_RATE)
+            # a rounded copy of it. Mirrors _compute_dcf()'s own clamp exactly
+            # — capped both directions at _MAX_GROWTH_RATE, not floored at 0.
+            g_applied = max(min(growth, _MAX_GROWTH_RATE), -_MAX_GROWTH_RATE)
             dcf_result = _compute_dcf(fcf_market, growth, wacc, net_debt_market, shares)
             if dcf_result:
                 intrinsic = dcf_result["intrinsic_value"]

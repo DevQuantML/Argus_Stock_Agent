@@ -50,10 +50,23 @@ _TICKER_PATTERN = r"^[A-Z0-9.-]{1,12}$"
 _TICKER_RE = re.compile(_TICKER_PATTERN)
 
 # Regex: anything shaped like one of sanitize_prompt_text's fence delimiters.
-# Deliberately broader than the exact tokens emitted — it matches any
-# <<<WORD:WORD>>> form, so an attacker cannot close a block by guessing at a
-# label ("<<<END:SECTOR>>>") that the current caller does not happen to use.
-_FENCE_RE = re.compile(r"<<<\s*/?[A-Za-z_]*\s*:?\s*[A-Za-z_]*\s*>>>")
+# Deliberately broader than the exact tokens emitted — it matches ANY
+# <<<...>>> form regardless of what's between the delimiters, so an attacker
+# cannot close a block by guessing at a label ("<<<END:SECTOR>>>") the
+# current caller doesn't happen to use.
+#
+# A prior version whitelisted the label body to [A-Za-z_]*, which quietly
+# broke that exact guarantee: a near-miss forgery containing a digit or a
+# second colon (e.g. "<<<END:THESIS_2>>>", "<<<A:B:C>>>") didn't match the
+# whitelist and passed through unredacted, even though it's exactly the
+# kind of guessed/malformed label the whitelist was written to catch. The
+# system prompt in tools/perplexity_research.py independently tells the
+# model that nothing inside the real markers can end the fenced block, so
+# this was defense-in-depth, not a demonstrated way to break out — but the
+# regex's own comment claimed a guarantee the character class didn't keep.
+# [^<>]* closes the gap completely: it matches any run of characters that
+# doesn't itself contain a fence delimiter, so no label shape can dodge it.
+_FENCE_RE = re.compile(r"<<<[^<>]*>>>")
 
 # Limits
 _MAX_QUESTION_LEN = 300
