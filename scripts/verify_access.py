@@ -531,8 +531,10 @@ def main():
     check("...with none of it used yet", body["guest"]["modules_used"], 0)
 
     s = rc.get("/api/session").json()
-    check("GET /api/session returns the same frozen contract keys",
-          sorted(s.keys()), ["authenticated", "guest", "tier"])
+    check("GET /api/session returns the same frozen contract keys, plus 'hr'",
+          sorted(s.keys()), ["authenticated", "guest", "hr", "tier"])
+    check("...and a real guest's own 'hr' key is null",
+          s["hr"], None)
     check("...and the guest block's keys are exactly the contract",
           sorted(s["guest"].keys()),
           ["dive_ticker", "exhausted", "expires_at", "modules_total", "modules_used", "revoked"])
@@ -738,28 +740,29 @@ def main():
     keep_key = store.create_guest_key("keep@example.com")[1]
     keep_id = store.guest_key_for(keep_key)["id"]
     store.consume_guest_unit(keep_id, "PLTR", "context")
-    api._refund_if_free(api.AuthCtx("guest", keep_id), "context",
+    api._refund_if_free(api.AuthCtx("guest", keep_id), "PLTR", "context",
                         {"error": "upstream timeout after 30s", "ticker": "PLTR"})
     check("a timeout does not hand the stage back",
           store.guest_usage(keep_id)["modules_used"], 1)
 
     # ── An unrecognised tier must DENY, not proceed ────────────────────────
-    # _guest_gate used to short-circuit on `not ctx.is_guest`, which reads the
-    # same for owner and guest but differs for anything else — a third tier
-    # would have sailed past the budget onto a paid route, unmetered.
-    # require_owner already tested positively, so the two dependencies
-    # disagreed and the permissive one guarded the money.
+    # _budget_gate (formerly _guest_gate) used to short-circuit on
+    # `not ctx.is_guest`, which reads the same for owner and guest but
+    # differs for anything else — a third tier would have sailed past the
+    # budget onto a paid route, unmetered. require_owner already tested
+    # positively, so the two dependencies disagreed and the permissive one
+    # guarded the money.
     section("an unrecognised session tier fails closed")
     calls.clear()
     bogus = api.AuthCtx("poltergeist")
-    gate = api._guest_gate(bogus, "PLTR", "report")
-    check("an unknown tier is refused by the guest gate", gate is not None, True)
+    gate = api._budget_gate(bogus, "PLTR", "report")
+    check("an unknown tier is refused by the budget gate", gate is not None, True)
     check("...with a 403", getattr(gate, "status_code", None), 403)
     check("...and the provider was never entered", calls, [])
 
     # The two tiers that DO exist must still behave as before.
     check("an owner still passes the gate untouched",
-          api._guest_gate(api.AuthCtx("owner"), "PLTR", "report"), None)
+          api._budget_gate(api.AuthCtx("owner"), "PLTR", "report"), None)
 
     # The schema now constrains the column the same way access_requests.status is.
     section("the sessions.tier column is constrained")
@@ -929,12 +932,12 @@ def main():
     section("a possibly-billed failure keeps the stage")
     t_id = store.create_guest_key("timeout@example.com")[0]
     store.consume_guest_unit(t_id, "PLTR", "report")
-    api._refund_if_free(api.AuthCtx("guest", t_id), "report",
+    api._refund_if_free(api.AuthCtx("guest", t_id), "PLTR", "report",
                         {"error": "provider unavailable", "reason": "timeout",
                          "cost_incurred": True, "ticker": "PLTR"})
     check("a timeout does not hand the stage back",
           store.guest_usage(t_id)["modules_used"], 1)
-    api._refund_if_free(api.AuthCtx("guest", t_id), "report",
+    api._refund_if_free(api.AuthCtx("guest", t_id), "PLTR", "report",
                         {"error": "provider unavailable", "reason": "auth",
                          "cost_incurred": False, "ticker": "PLTR"})
     check("an auth rejection does hand it back",
@@ -1116,6 +1119,233 @@ def main():
           oc.get("/api/research/NOSUCHHIST/history").status_code, 200)
     check("...specifically an empty list",
           oc.get("/api/research/NOSUCHHIST/history").json()["runs"], [])
+
+    # ── HR preview key ───────────────────────────────────────────────────────
+    # Same class of credential-boundary bug this whole file exists to guard
+    # against, for a fourth role riding the same 'guest' storage tier: it
+    # must never be usable as X-Agent-Key, its budget must be a hard 5-RUN
+    # ceiling (not 5 stages of one dive), and — the one bug this section
+    # actually caught live while building it — a stale row from a rotated
+    # AGENT_SECRET must never be resurrectable through the ordinary
+    # guest-key lookup.
+    from tools.hr_key import derive_hr_key, hr_key_ok
+
+    section("HR preview key — derivation")
+    hr_secret = "harness-only-secret"          # == AGENT_SECRET, set at the top of this file
+    hr_key = derive_hr_key(hr_secret)
+    check("derivation is deterministic", derive_hr_key(hr_secret), hr_key)
+    check("the derived key is never the secret itself", hr_key == hr_secret, False)
+    check("a different secret derives a different key",
+          derive_hr_key("a-different-secret") == hr_key, False)
+    check("hr_key_ok accepts the correctly-derived key", hr_key_ok(hr_key, hr_secret), True)
+    check("hr_key_ok rejects a near-miss (last char flipped)",
+          hr_key_ok(hr_key[:-1] + ("A" if hr_key[-1] != "A" else "B"), hr_secret), False)
+
+    section("HR preview key — X-Agent-Key must never accept it")
+    calls.clear()
+    check("the HR key as X-Agent-Key resolves to no credential at all",
+          api._auth_ctx(_req_with(api, {}), hr_key), None)
+    check("...and a route gated on it is refused 401, not treated as owner",
+          client.get("/api/positions", headers={"X-Agent-Key": hr_key}).status_code, 401)
+    check("...and the provider was never entered", calls, [])
+
+    section("HR preview key — session redemption")
+    hrc = TestClient(api.app)
+    r = hrc.post("/api/session", json={"key": hr_key})
+    check("redeeming the HR key succeeds", r.status_code, 200)
+    check("...reporting the EFFECTIVE tier 'hr', not the storage tier 'guest'",
+          r.json().get("tier"), "hr")
+    check("...with a fresh 5-run allowance", (r.json().get("hr") or {}).get("runs_left"), 5)
+    check("...and no 'guest' block alongside it", r.json().get("guest"), None)
+
+    s = hrc.get("/api/session").json()
+    check("GET /api/session agrees on tier", s.get("tier"), "hr")
+    check("...and its stored role is 'guest' underneath (AuthCtx.tier, not role)",
+          store.session_info(hrc.cookies.get(api.SESSION_COOKIE))["tier"], "guest")
+    hr_id = store.find_or_create_derived_key(hr_key)["id"]
+
+    section("HR preview key — full read, zero write")
+    for path in ["/api/positions", "/api/watchlist", "/api/profile",
+                 "/api/portfolio", "/api/portfolio/analytics", "/api/info"]:
+        check(f"HR GET {path} is allowed", hrc.get(path).status_code, 200)
+
+    for label, method, path, body in [
+        ("POST /api/profile",           hrc.post,   "/api/profile",          {"name": "intruder"}),
+        ("POST /api/positions",         hrc.post,   "/api/positions",        {"ticker": "AAPL", "shares": 999}),
+        ("DELETE /api/positions/AAPL",  hrc.delete, "/api/positions/AAPL",   None),
+        ("POST /api/watchlist",         hrc.post,   "/api/watchlist",        {"ticker": "TSLA"}),
+        ("DELETE /api/watchlist/GOOGL", hrc.delete, "/api/watchlist/GOOGL",  None),
+        ("POST /api/settings/provider-key", hrc.post, "/api/settings/provider-key",
+         {"provider": "perplexity", "key": "x" * 30}),
+    ]:
+        r = method(path, json=body) if body is not None else method(path)
+        check(f"HR {label} is refused 403", r.status_code, 403)
+
+    calls.clear()
+    r = hrc.post("/api/portfolio/outlook")
+    check("HR POST /api/portfolio/outlook (unbudgeted paid route) is refused 403", r.status_code, 403)
+    r = hrc.get("/api/research/AAPL")
+    check("HR GET /api/research/{t} (legacy one-shot) is refused 403", r.status_code, 403)
+    check("...and the provider was never entered", calls, [])
+
+    section("HR admin routes are owner-only")
+    check("keyless GET /api/admin/hr-key is 401", anon.get("/api/admin/hr-key").status_code, 401)
+    check("a real guest is refused 403", gc.get("/api/admin/hr-key").status_code, 403)
+    check("the HR key ITSELF is refused 403 on its own admin route",
+          hrc.get("/api/admin/hr-key").status_code, 403)
+    check("HR cannot reset its own budget via the admin route",
+          hrc.post("/api/admin/hr-key/reset").status_code, 403)
+    r = oc.get("/api/admin/hr-key")
+    check("the owner CAN read the admin card", r.status_code, 200)
+    check("...and it matches the derived key", r.json().get("key"), hr_key)
+    check("...with the live usage attached", r.json().get("usage", {}).get("runs_left"), 5)
+
+    section("HR run budget — a run is (ticker, mode), not a module stage")
+    check("run 1: AAPL/staged first stage claims fine",
+          store.consume_run_unit(hr_id, "AAPL", "staged", "report"), "ok")
+    check("run 2: MSFT/staged", store.consume_run_unit(hr_id, "MSFT", "staged", "report"), "ok")
+    check("run 3: GOOG/staged", store.consume_run_unit(hr_id, "GOOG", "staged", "report"), "ok")
+    check("run 4: AMZN/staged", store.consume_run_unit(hr_id, "AMZN", "staged", "report"), "ok")
+    check("4 runs consumed so far, not stages", store.hr_usage(hr_id)["runs_used"], 4)
+    check("...and not yet exhausted", store.hr_usage(hr_id)["exhausted"], False)
+
+    # A second stage of an ALREADY-STARTED run must reach the provider (the
+    # route, not the store function directly this time) without costing a
+    # new run slot — this is the guarantee the cost-modal strip promises
+    # ("however many modules you pick, this counts as ONE run").
+    calls.clear()
+    r = hrc.get("/api/research/AAPL/context")
+    check("a second stage of an already-started run reaches the (stubbed) provider",
+          calls, ["module"])
+    check("...and does not consume a new run slot", store.hr_usage(hr_id)["runs_used"], 4)
+    calls.clear()
+
+    # The FIRST stage of that same run, re-requested, must be refused as
+    # 'used' — not 'exhausted' — and never reach the provider.
+    r = hrc.get("/api/research/AAPL/report")
+    check("re-requesting an already-claimed stage is refused 402", r.status_code, 402)
+    check("...as 'used', not 'exhausted' (4 of 5 runs remain)",
+          r.json().get("code"), "hr_stage_used")
+    check("...and the provider was never entered", calls, [])
+
+    section("HR run budget — Model Court consumes exactly one run")
+    saved_mc = api.run_model_court
+    mc_calls = []
+
+    def fake_mc(ticker, question, pk, gk, provider_mode="both"):
+        mc_calls.append(ticker)
+        return {"ticker": ticker, "mode": "model_court", "provider_mode": provider_mode,
+                "perplexity": {"report": "p"}, "gemini": {"report": "g"},
+                "analysis": "stub analysis", "analysis_note": None}
+    api.run_model_court = fake_mc
+    try:
+        r = hrc.post("/api/model-court/TSLA", headers={
+            "X-Perplexity-Key": "pplx-" + "p" * 40, "X-Gemini-Key": "AIza" + "g" * 35})
+        check("HR's 5th run (Model Court, a new ticker) succeeds", r.status_code, 200)
+        check("...and actually reached the (stubbed) provider layer", mc_calls, ["TSLA"])
+        usage = store.hr_usage(hr_id)
+        check("...consuming exactly one run, now 5 of 5", usage["runs_used"], 5)
+        check("...and NOW exhausted", usage["exhausted"], True)
+
+        mc_calls.clear()
+        r2 = hrc.post("/api/model-court/TSLA", headers={
+            "X-Perplexity-Key": "pplx-" + "p" * 40, "X-Gemini-Key": "AIza" + "g" * 35})
+        check("re-running Model Court on the SAME ticker reads 'used'",
+              r2.status_code, 402)
+        check("...specifically hr_stage_used, not hr_budget_exhausted "
+              "(TSLA/court itself already ran)", r2.json().get("code"), "hr_stage_used")
+        check("...and the provider was never entered", mc_calls, [])
+
+        calls.clear()
+        r3 = hrc.get("/api/research/NFLX/report")
+        check("a brand-new 6th run (different ticker) is refused 402", r3.status_code, 402)
+        check("...as hr_budget_exhausted, not hr_stage_used",
+              r3.json().get("code"), "hr_budget_exhausted")
+        check("...and the provider was never entered", calls, [])
+    finally:
+        api.run_model_court = saved_mc
+
+    section("HR run budget — an exhausted key cannot redeem a NEW session")
+    check("GET /api/session reflects the exhaustion",
+          hrc.get("/api/session").json().get("hr", {}).get("exhausted"), True)
+    fresh_attempt = TestClient(api.app)
+    r = fresh_attempt.post("/api/session", json={"key": hr_key})
+    check("a spent HR key is refused a fresh redemption", r.status_code, 401)
+    check("...with the hr_spent code", r.json().get("code"), "hr_spent")
+    api._auth_fail_store.clear()
+
+    section("HR run budget — atomicity under concurrency")
+    # A separate, synthetic row — store.find_or_create_derived_key() only
+    # ever hashes whatever raw string it is given, so this needs no real
+    # AGENT_SECRET derivation to exercise the same claim-or-lose race
+    # consume_guest_unit's own concurrency test proves for guests.
+    race_id = store.find_or_create_derived_key("hr_synthetic_race_key")["id"]
+    results_hr, lock_hr = [], threading.Lock()
+
+    def claim_hr():
+        out = store.consume_run_unit(race_id, "NVDA", "staged", "report")
+        with lock_hr:
+            results_hr.append(out)
+
+    threads_hr = [threading.Thread(target=claim_hr) for _ in range(8)]
+    for t in threads_hr:
+        t.start()
+    for t in threads_hr:
+        t.join()
+    check("exactly one of 8 concurrent claims on one HR run wins",
+          results_hr.count("ok"), 1)
+    check("...and the other 7 are all refused as already used",
+          results_hr.count("used"), 7)
+
+    section("HR preview key — admin RESET restores a full 5")
+    r = oc.post("/api/admin/hr-key/reset")
+    check("owner reset succeeds", r.status_code, 200)
+    check("...reporting reset:true (the key HAD been redeemed)", r.json().get("reset"), True)
+    check("usage is back to 0 of 5", store.hr_usage(hr_id)["runs_used"], 0)
+
+    calls.clear()
+    r = hrc.get("/api/research/NFLX/report")
+    check("the SAME live session can spend again immediately after reset "
+          "(no re-redemption needed)", calls, ["module"])
+    calls.clear()
+
+    never_redeemed_secret = "never-redeemed-for-reset-test"
+    never_redeemed_key = derive_hr_key(never_redeemed_secret)
+    r = oc.get(f"/api/admin/hr-key")  # still reads the REAL AGENT_SECRET's key
+    check("(control) the admin route still reads the real, redeemed key",
+          r.json().get("key"), hr_key)
+    check("a key that was never redeemed has no row to reset",
+          store.hr_key_row(never_redeemed_key), None)
+
+    section("HR preview key — list_guest_keys never leaks the HR row")
+    prefixes = [k["key_prefix"] for k in store.list_guest_keys()]
+    check("no HR-role key's prefix ever appears in the ordinary guest-key admin list",
+          any(p == hr_key[:6] for p in prefixes), False)
+
+    section("HR preview key — a rotated AGENT_SECRET kills the OLD key outright")
+    # Reproduced live once while building this feature: after AGENT_SECRET
+    # rotates, the derived string from the OLD secret must be refused
+    # outright — and, critically, must NOT fall through and get treated as
+    # an ordinary redeemable guest key by a role-blind hash lookup. That was
+    # a real bug (guest_key_for() had no role filter); this is its
+    # regression test. AGENT_SECRET is restored immediately after, in a
+    # try/finally, since this env var affects every subsequent auth check
+    # in the process.
+    old_secret = os.environ["AGENT_SECRET"]
+    try:
+        rotate_key_old = derive_hr_key(old_secret)
+        os.environ["AGENT_SECRET"] = "rotated-to-a-new-secret"
+        rc_rot = TestClient(api.app)
+        r = rc_rot.post("/api/session", json={"key": rotate_key_old})
+        check("the OLD hr_ key is refused outright after rotation", r.status_code, 401)
+        check("...as a plain 'unauthorized' — never resurrected as a guest key",
+              r.json().get("error"), "unauthorized")
+        check("...specifically NOT a tier at all", "tier" in r.json(), False)
+        check("guest_key_for() itself refuses to find an hr-role row by hash",
+              store.guest_key_for(rotate_key_old), None)
+        api._auth_fail_store.clear()
+    finally:
+        os.environ["AGENT_SECRET"] = old_secret
 
     # ── Final cost assertion ───────────────────────────────────────────────
     section("cost — no unintended provider call remains outstanding")

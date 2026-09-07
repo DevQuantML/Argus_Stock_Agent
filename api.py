@@ -81,6 +81,7 @@ if os.getenv("DATABASE_URL"):
 
 import store
 from config import BRENT_LEVELS, GEO_EVENT_LIBRARY, GEO_TRANSMISSION
+from tools.hr_key import derive_hr_key, hr_key_ok
 from tools.notify import notify_telegram, start_telegram_reply_listener
 from tools.oil_price import get_brent_price, get_brent_signal
 from tools.perplexity_research import (
@@ -566,13 +567,35 @@ class AuthCtx:
     credential exists (a guest key), its holder is indistinguishable from the
     operator and inherits routes that spend real money with no budget attached.
     Carrying the tier means each route can decide for itself.
+
+    `role` is a second, narrower axis added for the HR preview key
+    (tools/hr_key.py) and is deliberately NOT a new `tier` value. Storage
+    keeps `tier` meaning exactly what it always has — 'owner' or 'guest', the
+    two values sessions.tier and research_runs.tier CHECK against on a live
+    database — while `role` (from guest_keys.role) says which KIND of guest
+    this is: an ordinary guest key ('guest') or the owner's own
+    AGENT_SECRET-derived preview key ('hr'). `is_guest` is scoped to
+    role == 'guest' specifically so every existing guest-only branch in this
+    file (the one-dive-one-ticker budget, the guest-read-only 403 wording)
+    keeps applying to real guests only, unchanged — an HR caller gets its own
+    `is_hr` branch wherever the two need to diverge, and falls through to
+    identical behaviour everywhere they don't (require_owner denies both the
+    same way; require_session admits both the same way).
     """
 
-    __slots__ = ("tier", "guest_key_id")
+    __slots__ = ("tier", "guest_key_id", "role")
 
-    def __init__(self, tier: str, guest_key_id: int | None = None):
-        self.tier = tier                      # "owner" | "guest"
+    def __init__(self, tier: str, guest_key_id: int | None = None, role: str | None = None):
+        self.tier = tier                      # "owner" | "guest" — storage meaning, unchanged
         self.guest_key_id = guest_key_id
+        # role defaults from tier when not given, rather than to a fixed
+        # constant, so every pre-existing AuthCtx("guest", some_id) call site
+        # in this codebase and its test harnesses — written before role
+        # existed — keeps meaning exactly what it always did (is_guest True)
+        # without needing to be found and updated one by one. A caller that
+        # actually wants an HR context must say so explicitly; everything
+        # else falls back to the tier's own natural role.
+        self.role = role if role is not None else ("guest" if tier == "guest" else "owner")
 
     @property
     def is_owner(self) -> bool:
@@ -580,7 +603,11 @@ class AuthCtx:
 
     @property
     def is_guest(self) -> bool:
-        return self.tier == "guest"
+        return self.tier == "guest" and self.role == "guest"
+
+    @property
+    def is_hr(self) -> bool:
+        return self.tier == "guest" and self.role == "hr"
 
 
 def _auth_ctx(request: Request, x_agent_key: str | None) -> AuthCtx | None:
@@ -602,7 +629,7 @@ def _auth_ctx(request: Request, x_agent_key: str | None) -> AuthCtx | None:
     if token:
         info = store.session_info(token)
         if info:
-            return AuthCtx(info["tier"], info["guest_key_id"])
+            return AuthCtx(info["tier"], info["guest_key_id"], info.get("role", "guest"))
 
     if _agent_key_ok(x_agent_key):
         return AuthCtx("owner")
@@ -1249,29 +1276,74 @@ def _validated_ticker(ticker: str):
         return None, JSONResponse(status_code=400, content={"error": str(exc)})
 
 
-def _guest_gate(ctx: AuthCtx, ticker: str, module: str):
-    """Claim one stage of a guest's dive, or explain why not. None means proceed.
+def _hr_gate_response(key_id: int, outcome: str, unit_label: str):
+    """Translate an HR consume_run_unit() outcome into a refusal, or None to
+    proceed. Split out of _budget_gate because api_model_court also needs it
+    for the one-off 'court' unit, which never runs through the staged-module
+    dispatch _budget_gate exists for.
+    """
+    if outcome == "ok":
+        return None
 
-    Runs BEFORE the provider is touched, so a refused guest never costs money.
+    usage = store.hr_usage(key_id)
+
+    if outcome == "exhausted":
+        return JSONResponse(
+            status_code=402,
+            content={"error": "your five preview research runs are used — "
+                               "everything free stays open",
+                     "code": "hr_budget_exhausted", "detail": usage},
+        )
+    if outcome == "used":
+        # Same distinction consume_guest_unit's own 'used' carries: THIS
+        # exact stage was already claimed, which — unless all 5 runs are
+        # gone — leaves the rest of this run, and every other run, perfectly
+        # claimable. Collapsing this into "budget exhausted" would strand a
+        # caller whose first attempt at a stage was cancelled or hit a
+        # transient failure.
+        return JSONResponse(
+            status_code=402,
+            content={"error": f"the {unit_label} stage of this run already ran",
+                     "code": "hr_stage_used", "detail": usage},
+        )
+    # missing / revoked / expired
+    return JSONResponse(
+        status_code=401,
+        content={"error": "your preview key is no longer valid", "code": "hr_expired"},
+    )
+
+
+def _budget_gate(ctx: AuthCtx, ticker: str, module: str):
+    """Claim one stage of a non-owner caller's staged-research budget, or
+    explain why not. None means proceed.
+
+    Runs BEFORE the provider is touched, so a refused caller never costs
+    money. Dispatches on ctx.role: an ordinary guest's one dive on one
+    ticker (store.consume_guest_unit), or the HR preview key's 5 runs across
+    any ticker/mode (store.consume_run_unit, mode='staged' — the one-off
+    Model Court 'court' unit is gated separately in api_model_court itself,
+    since it never goes through this staged-module dispatch). See AuthCtx's
+    own docstring for why these are two roles under one 'guest' storage tier.
 
     Each refusal carries a machine-readable `code` beside the human string. The
     frontend needs it: a spent allowance and a wrong-ticker claim are different
     conversations, and neither should be reported as a generic failure that the
     staged loop then retries four more times.
     """
-    # Tested positively, so an unrecognised tier DENIES rather than proceeds.
+    # Tested positively, so an unrecognised role DENIES rather than proceeds.
     # `if not ctx.is_guest: return None` reads the same for owner and guest but
-    # differs for anything else: a tier that is neither would have sailed
+    # differs for anything else: a role that is neither would have sailed
     # straight past the budget onto a paid route, unmetered. require_owner
     # already tests positively (`ctx.is_owner`), so the two dependencies
-    # disagreed — and the permissive one guarded the money. Not reachable today
-    # (create_session validates the tier and both SQL defaults are 'owner'), but
-    # the whole point of the AuthCtx rewrite was that a credential check must
-    # not fail open.
+    # disagreed — and the permissive one guarded the money. The whole point
+    # of the AuthCtx rewrite was that a credential check must not fail open.
     if ctx.is_owner:
         return None
+    if ctx.is_hr:
+        outcome = store.consume_run_unit(ctx.guest_key_id, ticker, "staged", module)
+        return _hr_gate_response(ctx.guest_key_id, outcome, module)
     if not ctx.is_guest:
-        logger.warning("_guest_gate: refusing unrecognised session tier %r", ctx.tier)
+        logger.warning("_budget_gate: refusing unrecognised session role %r", ctx.role)
         return JSONResponse(
             status_code=403,
             content={"error": "this action belongs to the terminal's owner",
@@ -1323,7 +1395,7 @@ def _module_response(ticker: str, module: str, question: str = None,
     if bad is not None:
         return bad
 
-    gate = _guest_gate(ctx, sym, module) if ctx else None
+    gate = _budget_gate(ctx, sym, module) if ctx else None
     if gate is not None:
         return gate
 
@@ -1334,7 +1406,7 @@ def _module_response(ticker: str, module: str, question: str = None,
         # result skipped the one case the refund was written for and charged a
         # guest a stage for a call that never left the process.
         if "error" in result:
-            _refund_if_free(ctx, module, result)
+            _refund_if_free(ctx, sym, module, result)
             # 502, not 200-with-an-error-body. The caller ticked the stage green
             # and stored an apology as the report when this returned success.
             # `code` lets the staged loop stop rather than fire four more
@@ -1346,20 +1418,25 @@ def _module_response(ticker: str, module: str, question: str = None,
         return result
     except Exception as exc:
         logger.debug("api_research_%s: error (type=%s): %s", module, type(exc).__name__, exc)
-        _refund_if_free(ctx, module, None)
+        _refund_if_free(ctx, sym, module, None)
         return JSONResponse(status_code=500, content={"error": "internal server error"})
 
 
-def _refund_if_free(ctx: AuthCtx | None, module: str, result: dict | None) -> None:
-    """Return a guest's stage only when the failure provably cost nothing.
+def _refund_if_free(ctx: AuthCtx | None, ticker: str, module: str, result: dict | None) -> None:
+    """Return a non-owner caller's stage only when the failure provably cost
+    nothing.
 
     _get_provider() raises before any network call when no provider key is
     configured, so that specific failure spent $0 and charging a stage for it
     would be taking an allowance for nothing. Every other failure keeps the
     stage: the call may already have been billed upstream, and refunding on a
     mid-flight timeout would hand out unlimited retries of a paid operation.
+
+    `ticker` is only needed for the HR path — an HR run-unit is keyed on
+    (ticker, mode, unit), unlike a guest stage, which is keyed on module alone
+    within its one already-bound ticker.
     """
-    if ctx is None or not ctx.is_guest:
+    if ctx is None or ctx.is_owner:
         return
 
     # Structured flag, not a substring match on English prose. The old test
@@ -1369,9 +1446,12 @@ def _refund_if_free(ctx: AuthCtx | None, module: str, result: dict | None) -> No
     # a guest reclaim a stage by requesting /api/research/API_KEY/report.
     # The layer that made (or did not make) the network call now says so.
     if (result or {}).get("cost_incurred") is False:
-        logger.info("refunding guest stage %s (reason=%s, nothing was billed)",
-                    module, (result or {}).get("reason"))
-        store.refund_guest_unit(ctx.guest_key_id, module)
+        logger.info("refunding %s stage %s (reason=%s, nothing was billed)",
+                    ctx.role, module, (result or {}).get("reason"))
+        if ctx.is_hr:
+            store.refund_run_unit(ctx.guest_key_id, ticker, "staged", module)
+        elif ctx.is_guest:
+            store.refund_guest_unit(ctx.guest_key_id, module)
 
 
 @app.get("/api/research/{ticker}/report")
@@ -1407,7 +1487,7 @@ def api_research_synthesis(ticker: str, body: SynthesisBody,
     if bad is not None:
         return bad
 
-    gate = _guest_gate(ctx, sym, "synthesis")
+    gate = _budget_gate(ctx, sym, "synthesis")
     if gate is not None:
         return gate
 
@@ -1432,7 +1512,7 @@ def api_research_synthesis(ticker: str, body: SynthesisBody,
     try:
         result = run_synthesis(ticker.upper(), fenced)
         if "error" in result:
-            _refund_if_free(ctx, "synthesis", result)
+            _refund_if_free(ctx, sym, "synthesis", result)
             return JSONResponse(
                 status_code=502,
                 content={"error": result["error"], "code": "provider_unavailable"},
@@ -1446,7 +1526,7 @@ def api_research_synthesis(ticker: str, body: SynthesisBody,
         return result
     except Exception as exc:
         logger.debug("api_research_synthesis: error (type=%s): %s", type(exc).__name__, exc)
-        _refund_if_free(ctx, "synthesis", None)
+        _refund_if_free(ctx, sym, "synthesis", None)
         return JSONResponse(status_code=500, content={"error": "internal server error"})
 
 
@@ -1725,12 +1805,16 @@ def api_model_court(
     below is mode-aware for the same reason — it only demands the key(s)
     the selected mode actually needs.
 
-    Requires a session (owner or guest) — see the module comment above for
-    why that's the gate rather than anonymity. Neither the owner's nor a
-    guest's existing entitlements extend here: both keys are the caller's
-    own, this never touches the guest dive budget, and neither key is ever
-    written to os.environ, persisted to .env, or logged — same guarantee
-    every BYOK path in this file already holds, extended to two keys.
+    Requires a session (owner, guest, or the HR preview key) — see the module
+    comment above for why that's the gate rather than anonymity. Neither the
+    owner's nor a real guest's entitlements extend here: both keys are the
+    caller's own, this never touches the guest dive budget, and neither key
+    is ever written to os.environ, persisted to .env, or logged — same
+    guarantee every BYOK path in this file already holds, extended to two
+    keys. The HR preview key is the one exception, and a narrow one: it
+    consumes one of its 5 run slots for this call (mode='court'), the same
+    way a staged dive consumes one for its own ticker+mode — see the budget
+    check right below the key-fallback block.
 
     Named headers (X-Perplexity-Key / X-Gemini-Key) rather than the generic
     X-Provider/X-Provider-Key pair /api/byok/* uses — this route always
@@ -1742,30 +1826,37 @@ def api_model_court(
     the right owner/guest identity, and now also to decide the Gemini-key
     fallback below.
 
-    Owner-only convenience: if the caller is the OWNER and omits either
-    header, fall back to that provider's server-configured key —
-    PERPLEXITY_API_KEY (the operator's own regular research-engine
-    credential, already used for every normal /api/research/* call) or
-    GEMINI_API_KEY (settable via CONFIG once "gemini" was added to
-    PERSISTENT_PROVIDERS — see tools/setup_wizard.py). Both fall back the
-    same way now — the asymmetry this docstring used to describe (Perplexity
-    always required, only Gemini optional) was the CONFIG-modal support for
-    persisting a Gemini key arriving one commit later than Model Court's own
-    owner fallback; there was never a reason to treat them differently once
-    both keys can be configured server-side. A guest — or anyone without a
-    session, though require_session already excludes that case — gets NO
-    such fallback for either key and must always supply their own, same as
-    today. This is a deliberate, narrow exception to "both keys are always
-    the caller's own": it saves the operator re-pasting keys they already
-    own on every call, without ever exposing a stored server credential to
-    a caller who isn't the operator.
+    Owner-and-HR convenience: if the caller is the OWNER or the HR preview
+    key and omits either header, fall back to that provider's
+    server-configured key — PERPLEXITY_API_KEY (the operator's own regular
+    research-engine credential, already used for every normal
+    /api/research/* call) or GEMINI_API_KEY (settable via CONFIG once
+    "gemini" was added to PERSISTENT_PROVIDERS — see tools/setup_wizard.py).
+    Both fall back the same way now — the asymmetry this docstring used to
+    describe (Perplexity always required, only Gemini optional) was the
+    CONFIG-modal support for persisting a Gemini key arriving one commit
+    later than Model Court's own owner fallback; there was never a reason to
+    treat them differently once both keys can be configured server-side.
+    Extending this fallback to the HR role is deliberate: an HR reviewer has
+    no Perplexity or Gemini account of their own, so without it Model Court
+    would be unreachable through the preview key even though the plan calls
+    for it to work. A real guest gets NO such fallback for either key and
+    must always supply their own, unchanged. This is a deliberate, narrow
+    exception to "both keys are always the caller's own": it saves the
+    operator re-pasting keys they already own on every call, without ever
+    exposing a stored server credential to a caller who isn't the operator
+    or the operator's own preview key.
     """
     if provider_mode not in ("both", "perplexity", "gemini"):
         return JSONResponse(status_code=400, content={
             "error": "provider_mode must be one of: both, perplexity, gemini"})
 
+    sym, bad = _validated_ticker(ticker)
+    if bad is not None:
+        return bad
+
     ctx = _auth_ctx(request, x_agent_key)
-    if ctx is not None and ctx.tier == "owner":
+    if ctx is not None and (ctx.is_owner or ctx.is_hr):
         if not x_perplexity_key and provider_mode in ("both", "perplexity"):
             x_perplexity_key = os.getenv("PERPLEXITY_API_KEY") or x_perplexity_key
         if not x_gemini_key and provider_mode in ("both", "gemini"):
@@ -1784,6 +1875,17 @@ def api_model_court(
         if not ok:
             return JSONResponse(status_code=400,
                                  content={"error": f"{key_label}: {reason}"})
+
+    # HR-only budget check, after validation so a malformed ticker or a
+    # missing key never costs a run slot, and before run_model_court so a
+    # refused caller never reaches a provider. Owner and real-guest callers
+    # are unmetered here exactly as before — a real guest supplies (and
+    # spends) their own keys, outside this project's own budget entirely.
+    if ctx is not None and ctx.is_hr:
+        outcome = store.consume_run_unit(ctx.guest_key_id, sym, "court", "court")
+        gate = _hr_gate_response(ctx.guest_key_id, outcome, "Model Court")
+        if gate is not None:
+            return gate
 
     try:
         result = run_model_court(ticker, question, x_perplexity_key, x_gemini_key,
@@ -1837,14 +1939,45 @@ def api_session_create(request: Request, body: SessionBody, response: Response):
     if not _check_rate_limit(client_ip):
         return JSONResponse(status_code=429, content={"error": "rate limit exceeded"})
 
-    # The operator's secret is tried first and in constant time. A guest key is
-    # only consulted once that fails, so the common path is unchanged.
+    # The operator's secret is tried first and in constant time. The HR
+    # preview key is checked next (also constant-time, also before anything
+    # database-backed) — it is a derived credential, not a stored one, so
+    # there is nothing to look up until we already know it is genuinely the
+    # current AGENT_SECRET's derivation. A guest key is only consulted once
+    # both of those fail, so the common (owner) path is unchanged.
+    agent_secret = os.getenv("AGENT_SECRET") or ""
     if _agent_key_ok(body.key):
         store.purge_expired_sessions()
         token, expires = store.create_session("owner")
         max_age = store.SESSION_DAYS * 86400
         payload = {"ok": True, "tier": "owner", "expires_at": expires.isoformat(),
-                   "guest": None}
+                   "guest": None, "hr": None}
+    elif hr_key_ok(body.key, agent_secret):
+        store.purge_expired_sessions()
+        row = store.find_or_create_derived_key(body.key)
+        usage = store.hr_usage(row["id"])
+        # An HR key that has already burned all 5 runs, or that the owner
+        # revoked from the admin panel, must not mint a fresh session — the
+        # farewell at run 5 is supposed to be the end of the visit, not a
+        # speed bump a page refresh clears. Same 401 code either way,
+        # deliberately: the caller already holds the key, so naming which of
+        # the two it hit costs nothing (unlike the guest branch's "expired
+        # vs unauthorized" distinction, which protects against a guesser who
+        # does NOT yet hold a key).
+        if usage["revoked"] or usage["exhausted"]:
+            _record_auth_failure(socket_ip)
+            logger.warning("api_session_create: rejected spent/revoked HR key from IP %s",
+                           client_ip)
+            return JSONResponse(
+                status_code=401,
+                content={"error": "your five preview research runs are used — thank you "
+                                   "for taking a look", "code": "hr_spent", "detail": usage},
+            )
+        key_expires = datetime.fromisoformat(row["expires_at"])
+        token, expires = store.create_session("guest", row["id"], expires_at=key_expires)
+        max_age = store.SESSION_DAYS * 86400  # HR_KEY_LIFETIME_DAYS comfortably exceeds this
+        payload = {"ok": True, "tier": "hr", "expires_at": expires.isoformat(),
+                   "guest": None, "hr": usage}
     else:
         gk = store.guest_key_for(body.key)
         if gk is None or gk["dead"]:
@@ -1873,7 +2006,7 @@ def api_session_create(request: Request, body: SessionBody, response: Response):
         remaining = (key_expires - datetime.now(key_expires.tzinfo)).total_seconds()
         max_age = max(1, int(remaining))
         payload = {"ok": True, "tier": "guest", "expires_at": expires.isoformat(),
-                   "guest": store.guest_usage(gk["id"])}
+                   "guest": store.guest_usage(gk["id"]), "hr": None}
 
     response.set_cookie(
         key=SESSION_COOKIE,
@@ -1905,20 +2038,29 @@ def api_session_status(request: Request):
     element from — the key chip, the cost modal's guest strip, the boot log —
     so GET and POST /api/session deliberately return the same shape:
 
-        {authenticated, tier: "owner"|"guest"|null, guest: {...}|null}
+        {authenticated, tier: "owner"|"guest"|"hr"|null, guest: {...}|null, hr: {...}|null}
 
-    `guest.modules_used` is a COUNT, not a flag. The allowance is five
-    separately consumable stages; collapsing it to a boolean tells a guest one
-    stage in that their whole dive is spent.
+    `tier` here is the EFFECTIVE tier shown to the browser, not the storage
+    value — an HR preview-key session is stored as tier='guest' (see
+    AuthCtx's docstring in this file for why), but is reported as "hr" so the
+    frontend never has to special-case role on top of tier itself.
+
+    `guest.modules_used` and `hr.runs_used` are COUNTS, not flags. Both
+    allowances are separately consumable units; collapsing either to a
+    boolean tells a caller partway through that their whole allowance is
+    spent when most of it remains.
     """
     token = request.cookies.get(SESSION_COOKIE)
     info = store.session_info(token) if token else None
     if not info:
-        return {"authenticated": False, "tier": None, "guest": None}
+        return {"authenticated": False, "tier": None, "guest": None, "hr": None}
+    is_hr = info["tier"] == "guest" and info.get("role") == "hr"
+    is_real_guest = info["tier"] == "guest" and not is_hr
     return {
         "authenticated": True,
-        "tier": info["tier"],
-        "guest": store.guest_usage(info["guest_key_id"]) if info["tier"] == "guest" else None,
+        "tier": "hr" if is_hr else info["tier"],
+        "guest": store.guest_usage(info["guest_key_id"]) if is_real_guest else None,
+        "hr": store.hr_usage(info["guest_key_id"]) if is_hr else None,
     }
 
 
@@ -2142,6 +2284,60 @@ def api_admin_revoke(key_id: int):
         return {"ok": True}
     except Exception as exc:
         logger.debug("api_admin_revoke: error (type=%s): %s", type(exc).__name__, exc)
+        return JSONResponse(status_code=500, content={"error": "internal server error"})
+
+
+@app.get("/api/admin/hr-key", dependencies=[Depends(require_owner)])
+def api_admin_hr_key():
+    """The derived HR preview key, plus its current usage, for the admin
+    panel's copy-and-hand-to-a-reviewer card.
+
+    Never minted or stored ahead of time — derive_hr_key() recomputes the
+    same string on every call from the CURRENT AGENT_SECRET, so this always
+    reflects reality even seconds after a password rotation. hr_key_row()
+    (not find_or_create_derived_key()) is used deliberately: this route must
+    be able to show a pristine "0 of 5 used" state for a key nobody has ever
+    redeemed yet, without creating a database row just because the owner
+    opened the admin panel.
+    """
+    try:
+        secret = os.getenv("AGENT_SECRET") or ""
+        key = derive_hr_key(secret)
+        if not key:
+            return JSONResponse(status_code=500,
+                                content={"error": "AGENT_SECRET is not configured"})
+        row = store.hr_key_row(key)
+        usage = (store.hr_usage(row["id"]) if row is not None
+                 else {"runs_total": store.HR_RUN_BUDGET, "runs_used": 0,
+                       "runs_left": store.HR_RUN_BUDGET, "exhausted": False,
+                       "revoked": False, "slots": []})
+        return {"key": key, "usage": usage}
+    except Exception as exc:
+        logger.debug("api_admin_hr_key: error (type=%s): %s", type(exc).__name__, exc)
+        return JSONResponse(status_code=500, content={"error": "internal server error"})
+
+
+@app.post("/api/admin/hr-key/reset", dependencies=[Depends(require_owner)])
+def api_admin_hr_key_reset():
+    """Restore a full 5 runs — the operator's 'give them more' button,
+    alongside rotating AGENT_SECRET itself (which mints an entirely
+    different key with its own fresh budget). A no-op (not a 404) when the
+    key has never been redeemed: there is nothing to reset, but that is not
+    an error the owner needs to see.
+    """
+    try:
+        secret = os.getenv("AGENT_SECRET") or ""
+        key = derive_hr_key(secret)
+        if not key:
+            return JSONResponse(status_code=500,
+                                content={"error": "AGENT_SECRET is not configured"})
+        row = store.hr_key_row(key)
+        if row is None:
+            return {"ok": True, "reset": False}
+        store.reset_hr_budget(row["id"])
+        return {"ok": True, "reset": True, "usage": store.hr_usage(row["id"])}
+    except Exception as exc:
+        logger.debug("api_admin_hr_key_reset: error (type=%s): %s", type(exc).__name__, exc)
         return JSONResponse(status_code=500, content={"error": "internal server error"})
 
 

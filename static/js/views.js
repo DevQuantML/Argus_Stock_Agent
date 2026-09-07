@@ -4,11 +4,11 @@
    portfolio overview, profile. Kept out of ui.js so that file stays about the
    terminal chrome. */
 
-import * as api from './api.js?v=42';
-import { renderMarkdown, escapeHtml } from './md.js?v=42';
-import * as ui from './ui.js?v=42';
-import * as prefs from './theme.js?v=42';
-import { DISCLAIMER, PRIVACY_NOTE, FRESHNESS_NOTE, guestAllowanceLine } from './copy.js?v=42';
+import * as api from './api.js?v=43';
+import { renderMarkdown, escapeHtml } from './md.js?v=43';
+import * as ui from './ui.js?v=43';
+import * as prefs from './theme.js?v=43';
+import { DISCLAIMER, PRIVACY_NOTE, FRESHNESS_NOTE, guestAllowanceLine } from './copy.js?v=43';
 
 const $ = ui.$;
 const el = ui.el;
@@ -428,6 +428,11 @@ export function showLanding({ mode = 'landing', onUnlocked, onVisitor, onSelfKey
         err.textContent = 'Cannot reach the server. Is it still running?';
       } else if (res.code === 'guest_expired') {
         err.textContent = res.message || 'That guest key has expired. Ask the owner for a new one.';
+      } else if (res.code === 'hr_spent') {
+        err.textContent = res.message
+          || 'Your five preview research runs are used — thank you for taking a look.';
+      } else if (res.code === 'hr_expired') {
+        err.textContent = res.message || 'That preview key is no longer valid.';
       } else {
         err.textContent = 'Rejected.';
       }
@@ -1037,6 +1042,11 @@ async function renderAdmin(host) {
   keyBox.id = 'adm-keys';
   host.appendChild(keyBox);
 
+  host.appendChild(el('div', 'r-head', 'ACCESS://HR PREVIEW KEY'));
+  const hrBox = el('div');
+  hrBox.id = 'adm-hr';
+  host.appendChild(hrBox);
+
   const panic = el('button', 'btn-danger', 'REVOKE ALL GUEST ACCESS');
   panic.type = 'button';
   panic.style.marginTop = '10px';
@@ -1060,6 +1070,97 @@ async function renderAdmin(host) {
 
   await paintRequests(reqBox);
   await paintKeys(keyBox);
+  await paintHrKey(hrBox);
+}
+
+/* The HR preview key card. Unlike a guest key (minted once, revealed once,
+   then only ever a hash), this key is DERIVED — GET /api/admin/hr-key
+   returns the same live string every time, recomputed from the current
+   AGENT_SECRET, so re-painting this box after a reset or on a fresh admin
+   view is always safe and never a second "reveal" of anything secret; the
+   key is exactly as visible to the owner as their own password already is.
+   `key` itself is a base64url string this app generated (tools/hr_key.py) —
+   not third-party or user-supplied text — but it still goes in via
+   .value/textContent, never innerHTML, matching this file's blanket rule
+   for every value painted into the admin view. */
+async function paintHrKey(box) {
+  if (!box) return;
+  box.innerHTML = '';
+  let data;
+  try { data = await api.adminHrKey(); }
+  catch (err) { box.appendChild(el('div', 'adm-empty', err.message)); return; }
+
+  const usage = data.usage || {};
+  const row = el('div', 'ed-row');
+  row.style.cssText = 'gap:8px;align-items:center';
+
+  const keyInput = document.createElement('input');
+  keyInput.type = 'text';
+  keyInput.readOnly = true;
+  keyInput.value = data.key || '';             // .value — immune to markup injection
+  keyInput.className = 'inp';
+  keyInput.style.cssText = 'flex:1;min-width:0';
+  keyInput.onclick = () => keyInput.select();
+  row.appendChild(keyInput);
+
+  const copyBtn = el('button', 'btn-g', 'COPY KEY');
+  copyBtn.type = 'button';
+  copyBtn.onclick = async () => {
+    // Same verify-before-claiming discipline as showKeyReveal's copy button
+    // (ui.js) — navigator.clipboard is undefined on plain HTTP, which this
+    // app explicitly supports, and the execCommand fallback returns false
+    // on failure rather than throwing.
+    let ok = false;
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(data.key || '');
+        ok = true;
+      }
+    } catch { ok = false; }
+    if (!ok) {
+      keyInput.select();
+      try { ok = document.execCommand('copy'); } catch { ok = false; }
+    }
+    copyBtn.textContent = ok ? 'COPIED ✓' : 'COPY FAILED — PRESS CTRL+C';
+    copyBtn.classList.toggle('btn-danger', !ok);
+    if (!ok) keyInput.select();
+    setTimeout(() => {
+      copyBtn.textContent = 'COPY KEY';
+      copyBtn.classList.remove('btn-danger');
+    }, ok ? 1500 : 6000);
+  };
+  row.appendChild(copyBtn);
+  box.appendChild(row);
+
+  const usageLine = el('div', 'hint', usage.revoked
+    ? 'Revoked — rotate AGENT_SECRET or use RESET below to issue runs again.'
+    : `${usage.runs_used ?? 0} of ${usage.runs_total ?? 5} preview research runs used `
+    + `— ${usage.runs_left ?? (usage.runs_total ?? 5)} left.`);
+  usageLine.style.cssText = 'margin-top:8px';
+  box.appendChild(usageLine);
+
+  const resetBtn = el('button', 'btn-g', 'RESET TO 5 RUNS');
+  resetBtn.type = 'button';
+  resetBtn.style.cssText = 'margin-top:10px';
+  resetBtn.onclick = async () => {
+    try {
+      const r = await api.adminHrKeyReset();
+      ui.toast(r.reset
+        ? 'HR preview key reset — 5 fresh runs.'
+        : 'Nothing to reset yet — this key has never been redeemed.',
+        'success', 3600);
+      await paintHrKey(box);
+    } catch (err) { ui.toast(err.message, 'error'); }
+  };
+  box.appendChild(resetBtn);
+
+  const note = el('p', 'hint',
+    'Give this key to a reviewer for owner-level READ access with no write access '
+    + '— 5 research runs total, on any ticker, in either mode (staged or Model '
+    + "Court). Rotating AGENT_SECRET invalidates it and mints a different one; "
+    + "this key can't be deleted independently of that.");
+  note.style.cssText = 'margin-top:10px;line-height:1.7';
+  box.appendChild(note);
 }
 
 /* Approve and reveal, shared by the pending row's ✓ and the approved row's +KEY.

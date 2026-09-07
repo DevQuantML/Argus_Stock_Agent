@@ -117,7 +117,14 @@ CREATE TABLE IF NOT EXISTS guest_keys (
     created_at  TEXT NOT NULL,
     expires_at  TEXT NOT NULL,
     revoked_at  TEXT,
-    dive_ticker TEXT
+    dive_ticker TEXT,
+    -- 'guest' | 'hr' — see the identical comment in store.py's schema for
+    -- why this is its own column rather than a third sessions.tier/
+    -- research_runs.tier value. This file ships fresh (no _migrate()), but
+    -- the column is still added defensively via ALTER TABLE IF NOT EXISTS
+    -- in _connect() below for any Cloud SQL database that was created
+    -- before this column existed.
+    role        TEXT NOT NULL DEFAULT 'guest' CHECK (role IN ('guest','hr'))
 );
 -- One row per consumed stage of a guest's single included deep dive. The
 -- PRIMARY KEY is the budget: an INSERT that violates it is a stage already
@@ -128,6 +135,17 @@ CREATE TABLE IF NOT EXISTS guest_key_uses (
     module  TEXT NOT NULL,
     used_at TEXT NOT NULL,
     PRIMARY KEY (key_id, module)
+);
+-- Run-unit ledger for role='hr' keys — see the identical comment in
+-- store.py's schema for the full "why a separate table" reasoning. A run is
+-- a (ticker, mode) pair; `unit` is the specific stage claimed within it.
+CREATE TABLE IF NOT EXISTS key_run_units (
+    key_id  INTEGER NOT NULL,
+    ticker  TEXT NOT NULL,
+    mode    TEXT NOT NULL,
+    unit    TEXT NOT NULL,
+    used_at TEXT NOT NULL,
+    PRIMARY KEY (key_id, ticker, mode, unit)
 );
 -- Access requests from people who want a key. Deliberately no IP column —
 -- see store.py's identical comment; the reasoning is unchanged here.
@@ -189,6 +207,29 @@ def _connect():
         conn.autocommit = False
         with conn.cursor() as cur:
             cur.execute(_SCHEMA)
+            # This file has no _migrate() — CREATE TABLE IF NOT EXISTS ships
+            # every table in its final shape on a fresh database, per this
+            # module's own docstring. But guest_keys.role is a column added
+            # to a table that may already exist on a live Cloud SQL instance
+            # from before this change, and IF NOT EXISTS on CREATE TABLE is a
+            # no-op against an existing table — the one gap that comment
+            # doesn't cover. ADD COLUMN IF NOT EXISTS is native Postgres
+            # syntax (no try/except needed, unlike SQLite's ALTER TABLE),
+            # but the CHECK constraint that binds a value set has to be
+            # added separately and IS NOT idempotent, so it is wrapped in a
+            # SAVEPOINT and any "already exists" failure is swallowed —
+            # exactly the store.py migration's own "duplicate column name
+            # only ever means it's already there" reasoning, one guard
+            # later in the DDL.
+            cur.execute("ALTER TABLE guest_keys ADD COLUMN IF NOT EXISTS "
+                        "role TEXT NOT NULL DEFAULT 'guest'")
+            cur.execute("SAVEPOINT add_role_check")
+            try:
+                cur.execute("ALTER TABLE guest_keys ADD CONSTRAINT "
+                            "guest_keys_role_check CHECK (role IN ('guest','hr'))")
+                cur.execute("RELEASE SAVEPOINT add_role_check")
+            except psycopg2.Error:
+                cur.execute("ROLLBACK TO SAVEPOINT add_role_check")
         conn.commit()
         _conn = conn
     return _conn
@@ -448,7 +489,7 @@ def session_info(token: str) -> dict | None:
     if not token:
         return None
     rows = _rows(
-        """SELECT s.expires_at, s.tier, s.guest_key_id,
+        """SELECT s.expires_at, s.tier, s.guest_key_id, g.role AS key_role,
                   g.revoked_at AS key_revoked, g.expires_at AS key_expires
              FROM sessions s
              LEFT JOIN guest_keys g ON g.id = s.guest_key_id
@@ -481,8 +522,11 @@ def session_info(token: str) -> dict | None:
         except ValueError:
             return None
 
+    # See store.py's identical comment: role distinguishes an ordinary guest
+    # key from the HR preview key within the same tier='guest' storage row.
+    role = r["key_role"] if r["tier"] == "guest" else "owner"
     return {"tier": r["tier"], "guest_key_id": r["guest_key_id"],
-            "expires_at": r["expires_at"]}
+            "expires_at": r["expires_at"], "role": role}
 
 
 def destroy_session(token: str) -> None:
@@ -524,9 +568,13 @@ def create_guest_key(label: str = "", hours: int = GUEST_HOURS) -> tuple[int, st
 
 
 def guest_key_for(raw_key: str) -> dict | None:
+    """See store.py's identical function for why this is scoped to
+    role='guest' — a stale HR row from a rotated AGENT_SECRET must never be
+    redeemable through this fallthrough lookup as an ordinary guest key."""
     if not raw_key:
         return None
-    rows = _rows("SELECT * FROM guest_keys WHERE key_hash = %s", (_hash_token(raw_key),))
+    rows = _rows("SELECT * FROM guest_keys WHERE key_hash = %s AND role = 'guest'",
+                 (_hash_token(raw_key),))
     if not rows:
         return None
     r = dict(rows[0])
@@ -557,8 +605,11 @@ def guest_usage(key_id: int) -> dict:
 
 
 def list_guest_keys() -> list[dict]:
+    """Admin listing of ordinary guest keys. Scoped to role='guest' — see the
+    identical comment in store.py for why the HR preview key gets its own
+    admin-panel surface rather than a row here."""
     out = []
-    for r in _rows("SELECT * FROM guest_keys ORDER BY created_at DESC"):
+    for r in _rows("SELECT * FROM guest_keys WHERE role = 'guest' ORDER BY created_at DESC"):
         usage = guest_usage(r["id"])
         expired = _expired(r["expires_at"])
         out.append({
@@ -660,6 +711,154 @@ def consume_guest_unit(key_id: int, ticker: str, module: str) -> str:
 
 def refund_guest_unit(key_id: int, module: str) -> None:
     _exec("DELETE FROM guest_key_uses WHERE key_id = %s AND module = %s", (key_id, module))
+
+
+# ── HR preview key ────────────────────────────────────────────────────────
+# Same feature, same semantics as store.py's identical section — see that
+# file for the full design rationale. Only the SQL dialect and the
+# SAVEPOINT-around-the-racing-INSERT (Postgres aborts the whole transaction
+# on a failed statement; SQLite does not) differ.
+
+HR_RUN_BUDGET = 5
+HR_KEY_LABEL = "HR preview key"
+HR_KEY_LIFETIME_DAYS = 365
+
+
+def find_or_create_derived_key(raw_key: str) -> dict:
+    """Look up the HR row by the raw key, creating it on first redemption.
+    See store.py's identical function for the full docstring — behaviour
+    here is the same, only the dialect (RETURNING id, %s placeholders, an
+    explicit SAVEPOINT rather than a bare sqlite3.IntegrityError catch)
+    differs."""
+    key_hash = _hash_token(raw_key)
+    with _txn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM guest_keys WHERE key_hash = %s AND role = 'hr'",
+                        (key_hash,))
+            row = cur.fetchone()
+            if row is not None:
+                return dict(row)
+
+            expires = datetime.now(timezone.utc) + timedelta(days=HR_KEY_LIFETIME_DAYS)
+            cur.execute("SAVEPOINT create_hr_key")
+            try:
+                cur.execute(
+                    "INSERT INTO guest_keys (key_hash, key_prefix, label, created_at, "
+                    "expires_at, role) VALUES (%s,%s,%s,%s,%s,'hr') RETURNING id",
+                    (key_hash, raw_key[:6], HR_KEY_LABEL, _now(), expires.isoformat()),
+                )
+                new_id = cur.fetchone()["id"]
+                cur.execute("RELEASE SAVEPOINT create_hr_key")
+            except psycopg2.IntegrityError:
+                # Lost the race to a concurrent first redemption of the same
+                # key — without the SAVEPOINT, this exception would abort the
+                # whole surrounding transaction and the SELECT below would
+                # fail too.
+                cur.execute("ROLLBACK TO SAVEPOINT create_hr_key")
+                cur.execute("SELECT * FROM guest_keys WHERE key_hash = %s", (key_hash,))
+                return dict(cur.fetchone())
+
+            cur.execute("SELECT * FROM guest_keys WHERE id = %s", (new_id,))
+            return dict(cur.fetchone())
+
+
+def hr_key_row(raw_key: str) -> dict | None:
+    """Look up the HR row by the raw key WITHOUT creating it — see store.py's
+    identical function; used by the admin panel to show 'no runs yet'
+    pre-redemption."""
+    rows = _rows("SELECT * FROM guest_keys WHERE key_hash = %s AND role = 'hr'",
+                 (_hash_token(raw_key),))
+    return dict(rows[0]) if rows else None
+
+
+def hr_usage(key_id: int) -> dict:
+    """See store.py's identical function for the full docstring."""
+    rows = _rows("SELECT revoked_at, expires_at FROM guest_keys WHERE id = %s AND role = 'hr'",
+                 (key_id,))
+    if not rows:
+        return {"runs_total": HR_RUN_BUDGET, "runs_used": 0, "runs_left": 0,
+                "exhausted": True, "revoked": True, "slots": []}
+    r = rows[0]
+    slots = _rows("SELECT DISTINCT ticker, mode FROM key_run_units WHERE key_id = %s", (key_id,))
+    used = len(slots)
+    return {
+        "runs_total": HR_RUN_BUDGET,
+        "runs_used": used,
+        "runs_left": max(0, HR_RUN_BUDGET - used),
+        "exhausted": used >= HR_RUN_BUDGET,
+        "revoked": bool(r["revoked_at"]),
+        "slots": [{"ticker": s["ticker"], "mode": s["mode"]} for s in slots],
+    }
+
+
+def consume_run_unit(key_id: int, ticker: str, mode: str, unit: str) -> str:
+    """Claim one stage of an HR key's run budget. See store.py's identical
+    function for the full docstring — the budget rule (5 distinct
+    (ticker, mode) runs; every stage within an already-started run stays
+    claimable) is unchanged here. Only the racing INSERT needs a SAVEPOINT,
+    for the same Postgres-abort reason consume_guest_unit() documents above.
+    """
+    t = validate_ticker(ticker)
+    if mode not in ("staged", "court"):
+        raise ValueError(f"unknown run mode: {mode!r}")
+
+    with _txn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM guest_keys WHERE id = %s AND role = 'hr'", (key_id,))
+            row = cur.fetchone()
+            if row is None:
+                return "missing"
+            if row["revoked_at"]:
+                return "revoked"
+            if _expired(row["expires_at"]):
+                return "expired"
+
+            cur.execute(
+                "SELECT 1 FROM key_run_units WHERE key_id = %s AND ticker = %s "
+                "AND mode = %s LIMIT 1",
+                (key_id, t, mode),
+            )
+            already = cur.fetchone()
+            cur.execute(
+                "SELECT COUNT(*) AS n FROM "
+                "(SELECT DISTINCT ticker, mode FROM key_run_units WHERE key_id = %s) s",
+                (key_id,),
+            )
+            n_slots = cur.fetchone()["n"]
+            if already is None and n_slots >= HR_RUN_BUDGET:
+                return "exhausted"
+
+            cur.execute("SAVEPOINT claim_run_unit")
+            try:
+                cur.execute(
+                    "INSERT INTO key_run_units (key_id, ticker, mode, unit, used_at) "
+                    "VALUES (%s,%s,%s,%s,%s)",
+                    (key_id, t, mode, unit, _now()),
+                )
+                cur.execute("RELEASE SAVEPOINT claim_run_unit")
+                return "ok"
+            except psycopg2.IntegrityError:
+                cur.execute("ROLLBACK TO SAVEPOINT claim_run_unit")
+                return "used"
+
+
+def refund_run_unit(key_id: int, ticker: str, mode: str, unit: str) -> None:
+    """See store.py's identical function."""
+    t = validate_ticker(ticker)
+    _exec("DELETE FROM key_run_units WHERE key_id = %s AND ticker = %s AND mode = %s "
+          "AND unit = %s", (key_id, t, mode, unit))
+
+
+def reset_hr_budget(key_id: int) -> bool:
+    """Admin action: wipe an HR key's run ledger. See store.py's identical
+    function for the role='hr' scoping rationale."""
+    with _txn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM guest_keys WHERE id = %s AND role = 'hr'", (key_id,))
+            if cur.fetchone() is None:
+                return False
+            cur.execute("DELETE FROM key_run_units WHERE key_id = %s", (key_id,))
+        return True
 
 
 # ── Access requests ───────────────────────────────────────────────────────

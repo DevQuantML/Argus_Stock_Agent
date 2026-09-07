@@ -61,6 +61,7 @@ tools/oil_price.py            Brent futures → macro gate signal
 tools/validator.py            validate_ticker, guard_tool_output, sanitize_question
 tools/xirr.py                 money-weighted return for the portfolio analytics route
 tools/notify.py               best-effort Telegram push (access-request alerts)
+tools/hr_key.py               derives the HR preview key from AGENT_SECRET (no storage)
 tools/setup_wizard.py         guided .env key setup — python main.py setup
 static/                       frontend — index.html, style.css, js/*.js (ES modules)
 scripts/verify_*.py           free harnesses — run before any PR
@@ -131,6 +132,7 @@ that attribute out of provider messages before logging them.
 | `PERPLEXITY_API_KEY` | `.env`, settable from the browser's **◈ CONFIG** (owner-only, write-only) | Provider credential. `POST /api/settings/provider-key` lets an already-unlocked owner set or clear it live, no restart — the value is never sent back to any browser once saved, matching `AGENT_SECRET`'s own write-only pattern. |
 | `GROQ_API_KEY` | Same as above | Fallback provider credential. Same route, same write-only guarantee. |
 | a **guest key** (`gk_…`) | issued by the owner, stored **hashed** in `guest_keys` | A 24-hour credential handed to one other person. Redeemed at `POST /api/session` like `AGENT_SECRET`, but yields a `tier='guest'` session: read-only on the book, and worth exactly **one** 5-stage research dive on **one** ticker. The raw key exists only in the approve response — the database holds SHA-256 and a 6-char display prefix. |
+| the **HR preview key** (`hr_…`) | **derived** from `AGENT_SECRET`, never stored on its own | An `hmac(AGENT_SECRET, "argus-hr-access-v1")` string — see `tools/hr_key.py` — read off with `python main.py hrkey` or `GET /api/admin/hr-key`, never generated ahead of time. Redeemed the same way as a guest key, and stored the same way (a lazily-created `guest_keys` row, `role='hr'`), but the entitlement is different: owner-level **read** on everything, no write anywhere, and **5 research runs** (not stages) spendable across any ticker in either mode. Rotating `AGENT_SECRET` changes the derived string, which instantly makes the old key unredeemable and mints a different one with a fresh 5 — that rotation is the revoke lever; there is no separate "delete this key" action for it, only `POST /api/admin/hr-key/reset`, which restores 5 runs on the *current* derived key without changing which string that is. |
 
 ## Cost
 
@@ -143,12 +145,17 @@ modal before any paid stage; do not add a code path that bypasses it.
 
 ## Access tiers
 
-Three of them, and every gate keys off the tier rather than "has a session":
+Four of them. The server-side gates (`require_owner`/`require_session`) still
+only ever check TWO storage values — `tier` ('owner'/'guest') — because the
+fourth tier below is not a new tier at all: it is a `role` column on top of
+the existing `tier='guest'` row. See `AuthCtx` in `api.py` and the "HR
+preview key, storage" gotcha further down for why.
 
 | Tier | How they arrive | What they get |
 |---|---|---|
 | **visitor** | "Continue without a key" on the landing — no session at all | Quant, charts, history, news, earnings, the Brent gate. Frontend-only tier; the server never issues it. |
 | **guest** | A 24-hour `gk_…` key the owner issued | Visitor features, plus **read-only** sight of the owner's book, plus exactly one 5-stage dive on one ticker. |
+| **hr** | The `hr_…` preview key, derived from `AGENT_SECRET` (`tools/hr_key.py`) | Everything a guest gets, PLUS full owner-level **read** access to the whole book (positions, cost basis, thesis, P&L, analytics, history, geo) — still **zero write** access anywhere, and still denied the admin view and the two unbudgeted paid routes. Spends from a pool of **5 research runs**, not 5 stages of one dive — any ticker, either mode (a staged dive or Model Court), Model Court funded by the owner's own server-configured provider keys. Stored as an ordinary `tier='guest'` session; `/api/session` reports it to the browser as `tier: "hr"`. |
 | **owner** | `AGENT_SECRET` | Everything, plus the admin view. |
 
 `app.js` **derives** the tier — `const tier = () => api.auth.effectiveTier()` —
@@ -734,6 +741,88 @@ js/tour.js            five-step coach-mark orientation (no imports, no network)
   a plain non-reentrant `threading.Lock` and `_rows`/`_exec` both acquire it, so
   calling either from inside the lock deadlocks on the first guest research call.
   The surrounding file's idiom is the opposite.
+- **The HR preview key is a `role`, not a `tier`, and that split is the whole
+  design.** `sessions.tier` and `research_runs.tier` both carry
+  `CHECK (tier IN ('owner','guest'))` in **both** store backends — widening
+  that CHECK on a live Cloud SQL database for a fourth-tier feature was
+  rejected up front as not worth the migration risk. Instead `guest_keys`
+  gained a `role TEXT CHECK (role IN ('guest','hr'))` column (`ADD COLUMN` in
+  `store.py`'s `_migrate()`; `ADD COLUMN IF NOT EXISTS` + a SAVEPOINT-guarded
+  `ADD CONSTRAINT` in `store_postgres.py`'s `_connect()`, since that file has
+  no `_migrate()` of its own), and an HR session is stored as an entirely
+  ordinary `tier='guest'` row. `session_info()`'s existing `LEFT JOIN` to
+  `guest_keys` already reaches this column for free — it just also selects
+  `g.role` now and returns it — so every guarantee a guest session already
+  had (revocation and expiry biting on the very next request) applies to the
+  HR key with no new logic. `AuthCtx.tier` keeps meaning exactly what it
+  always did; `AuthCtx.role` is the new, narrower axis, and
+  `AuthCtx.is_guest` is now `tier == 'guest' and role == 'guest'` specifically
+  so every pre-existing guest-only branch (the one-dive-one-ticker budget,
+  the "belongs to the terminal's owner" 403 wording) keeps applying to real
+  guests only. `AuthCtx.__init__`'s `role` parameter defaults from `tier`
+  when omitted (`'guest' if tier == 'guest' else 'owner'`) rather than to a
+  fixed constant — a fixed default would have silently broken every
+  pre-existing `AuthCtx("guest", some_id)` construction in `scripts/
+  verify_access.py`'s own test harness, written before `role` existed, which
+  all rely on `is_guest` reading True from the tier alone.
+- **A stale HR row is still a real, hash-lookupable row — `guest_key_for()`
+  had to be scoped to `role='guest'` explicitly, and this was found live, not
+  by review.** The HR key is derived, not stored ahead of time, but the row
+  backing an *already-redeemed* HR session persists in `guest_keys` exactly
+  like a guest key's row does. `POST /api/session` tries `hr_key_ok()` before
+  falling through to the ordinary guest-key branch — but after an
+  `AGENT_SECRET` rotation, the OLD `hr_…` string correctly fails `hr_key_ok()`
+  against the new secret, and the code fell through to
+  `store.guest_key_for(body.key)`, which searched `guest_keys` by hash with
+  no role filter and found the old `role='hr'` row anyway — handing back a
+  genuine, ordinary `tier='guest'` session on a credential the operator
+  believed they had just killed by changing their password. Reproduced with a
+  real rotation against a real database, not reasoned about. Fixed by scoping
+  `guest_key_for()` (both backends) to `role='guest'`, mirroring
+  `find_or_create_derived_key()`/`hr_key_row()`'s own `role='hr'` scoping from
+  the other side — the two credential spaces must never be able to answer for
+  each other's lookups. **Any future function that queries `guest_keys` by
+  `key_hash` alone must ask which role it means to match**, the same way
+  `list_guest_keys()` already had to be scoped to `role='guest'` so the HR row
+  does not appear in the ordinary guest-key admin list.
+- **A "run" is a `(ticker, mode)` pair, tracked in its own table, not an
+  overloaded reuse of `guest_key_uses`.** The HR budget's actual rule — 5
+  whole runs across ANY ticker, in EITHER mode — is a different shape from a
+  guest's "5 stages of ONE dive on ONE ticker", not a variant of it, so it
+  gets its own ledger: `key_run_units (key_id, ticker, mode, unit)`, PRIMARY
+  KEY on all four columns. `mode` is `'staged'` (the four module GETs plus
+  synthesis, `unit` = the module name) or `'court'` (`api_model_court`'s
+  one-off charge, `unit` = `'court'` always). `consume_run_unit()` checks
+  `COUNT(DISTINCT ticker, mode)` against `HR_RUN_BUDGET = 5` only when the
+  specific `(ticker, mode)` slot has never been touched before — an
+  already-started run's remaining stages stay claimable with no additional
+  budget check, matching a guest's own "'used' means this stage, not the
+  whole allowance" semantics. This means `report` and `court` on the SAME
+  ticker consume **two separate slots**, not one — confirmed live: 1 staged
+  stage + 1 Model Court call on `AAPL` read back as `runs_used: 2`, and
+  re-running Model Court on the same ticker afterward correctly reads `used`
+  (`hr_stage_used`, 402) rather than `exhausted`. Postgres needs the same
+  SAVEPOINT-around-the-racing-INSERT treatment `consume_guest_unit()`
+  documents (a failed statement aborts the whole transaction there, unlike
+  SQLite) — `store_postgres.consume_run_unit()` has it.
+- **Model Court's owner-only server-key fallback had to become
+  `is_owner or is_hr`, and the ticker now gets validated before that budget
+  check runs.** Without the fallback extension, an HR caller has no
+  Perplexity/Gemini key of their own and Model Court is simply unreachable —
+  the entire point of extending the preview key to this feature. Without
+  validating the ticker first (`_validated_ticker`, the same helper the
+  staged routes already use), a malformed ticker string would burn a real
+  run slot before `run_model_court()`'s own internal validation ever got a
+  chance to reject it for free — `api_model_court` now validates, then
+  resolves the fallback keys, then runs `soft_validate()` on whatever key
+  ends up in hand, then charges the HR budget, in that order, so a refused
+  caller at any earlier step never loses a run. **Operational precondition,
+  not a code guarantee**: this fallback reads `PERPLEXITY_API_KEY` /
+  `GEMINI_API_KEY` from the process environment at call time. On Cloud Run, a
+  key added through the ◈ CONFIG modal lands in a container-local `.env` and
+  is lost on the next cold start (existing `min-instances=0` gotcha,
+  documented above) — both must be set as real Cloud Run env vars/secrets or
+  Model Court silently 400s for the HR caller on a fresh instance.
 - **Refund only what provably cost nothing.** `_refund_if_free()` keys off a
   structured `cost_incurred: False` set by the layer that made — or did not make
   — the network call, never off the wording of an error string. Three cases

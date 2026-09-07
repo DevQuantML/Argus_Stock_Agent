@@ -9,9 +9,11 @@
      2. Any string that originated from an LLM or from yfinance goes through
         textContent or renderMarkdown — never innerHTML with raw input. */
 
-import { renderMarkdown, escapeHtml } from './md.js?v=42';
-import { sparkline } from './chart.js?v=42';
-import * as prefs from './theme.js?v=42';
+import { renderMarkdown, escapeHtml } from './md.js?v=43';
+import { sparkline } from './chart.js?v=43';
+import * as prefs from './theme.js?v=43';
+import { HR_WELCOME_TITLE, HR_WELCOME_BODY, HR_FAREWELL_TITLE, HR_FAREWELL_BODY,
+         HR_FAREWELL_BUTTON } from './copy.js?v=43';
 
 export const $  = (id)  => document.getElementById(id);
 export const $$ = (sel) => Array.from(document.querySelectorAll(sel));
@@ -144,8 +146,12 @@ export function renderStatus(health, providerLabel) {
 /* Three tiers, and for a guest three distinct states within their tier.
    The allowance is five separately consumable stages, so "used" is a count,
    never a flag: a guest one stage into a dive still has four, and telling them
-   the dive is spent would be false. */
-export function renderKeyState(tier, guest) {
+   the dive is spent would be false.
+
+   `hr` (the fourth possible `tier` value) is handled here too, not as a
+   separate function — one function per header chip, same as owner/guest,
+   even though its data comes from a differently-shaped block. */
+export function renderKeyState(tier, guest, hr) {
   const n = $('key-state');
   if (!n) return;
 
@@ -153,6 +159,25 @@ export function renderKeyState(tier, guest) {
     n.textContent = 'AI ARMED';
     n.className = 'hdr-key on';
     n.title = 'Owner session — AI research unlocked, no allowance limit';
+    return;
+  }
+
+  if (tier === 'hr' && hr) {
+    // Reuses the guest chip's gold/muted colour pair — visually "special
+    // non-owner access" already means the same thing for both, and a third
+    // colour would be a distinction with no difference.
+    const left = Math.max(0, hr.runs_left ?? 0);
+    if (hr.exhausted) {
+      n.textContent = 'PREVIEW · SPENT';
+      n.className = 'hdr-key guest off';
+      n.title = 'Your five preview research runs are used. Everything free — '
+              + 'quant, charts, history, news, the whole portfolio — stays open.';
+    } else {
+      n.textContent = `PREVIEW · ${left}/${hr.runs_total ?? 5} RUNS`;
+      n.className = 'hdr-key guest';
+      n.title = `${left} of ${hr.runs_total ?? 5} research runs left — any ticker, `
+              + 'either mode. Full read access to the book, no write access.';
+    }
     return;
   }
 
@@ -1203,9 +1228,10 @@ function loadSelection() {
   return Object.fromEntries(MODULES.map(m => [m.key, true]));
 }
 
-export function showCostModal(sym, provider, { tier = 'owner', guest = null } = {}) {
+export function showCostModal(sym, provider, { tier = 'owner', guest = null, hr = null } = {}) {
   return new Promise((resolve) => {
     const isGuest = tier === 'guest';
+    const isHr = tier === 'hr';
 
     /* A guest's dive is indivisible.
        The owner picks modules à la carte because they pay per call and can run
@@ -1259,6 +1285,21 @@ export function showCostModal(sym, provider, { tier = 'owner', guest = null } = 
         unlimited either way.</span>
       </div>` : '';
 
+    // HR reuses the OWNER branch above (à-la-carte selection, real cost
+    // estimates — informative, not a charge to the HR caller) and adds this
+    // strip on top, rather than forcing the selection like a guest's. The
+    // key distinction to communicate: however many modules get checked, this
+    // whole run counts as exactly ONE of the 5 — the budget is per (ticker,
+    // mode), not per module (see key_run_units in store.py).
+    const hrStrip = isHr ? `
+      <div class="gk-note">
+        <span class="gk-c">PREVIEW KEY</span>
+        <span class="gk-t">This whole run on <b>${escapeHtml(sym)}</b> — however many
+        modules you pick — counts as <b>one</b> of your ${hr?.runs_total ?? 5} research
+        runs. You have <b>${Math.max(0, hr?.runs_left ?? 0)}</b> left. Quant, charts,
+        history and news stay free and unlimited either way.</span>
+      </div>` : '';
+
     // Only Perplexity has a real running total to compute live as checkboxes
     // change (#cf-total below). Groq's is a fixed $0.00 with nothing to
     // recalculate; Gemini has no fixed figure at all, per costLabel() above.
@@ -1274,6 +1315,7 @@ export function showCostModal(sym, provider, { tier = 'owner', guest = null } = 
       <div class="mdl-hd"><span>ARGUS://CONFIRM · ${escapeHtml(sym)}</span><button data-close type="button">✕</button></div>
       <div class="mdl-b">
         ${guestStrip}
+        ${hrStrip}
         <p class="hint" style="margin:0 0 12px">${isGuest
           ? 'Your included dive runs every stage. Quant, chart and P&amp;L are already loaded and always free.'
           : provider === 'groq'
@@ -1800,6 +1842,75 @@ export function showModelCourtKeys(sym, isOwner, configured) {
     const firstInput = [box.querySelector('#mc-pplx'), box.querySelector('#mc-gemini')]
       .find(el => el && !el.hidden && !el.closest('.fld').hidden);
     firstInput?.focus();
+  });
+}
+
+/* ── HR preview key: welcome + farewell ──────────────────────────────────
+   Shown by app.js: welcome once, right after a fresh HR sign-in (the
+   onUnlocked callback — never re-shown on a reload of an already-live
+   session, since that path skips the landing entirely); farewell once, the
+   moment the 5th run completes, immediately followed by an automatic
+   sign-out — the visit is meant to end here, not the app itself. Text lives
+   in copy.js so it can be edited without touching this render code.
+
+   Both attach their OWN dismiss listeners (click-outside, Escape, the OK
+   button) alongside modal()'s built-in ones, rather than only wiring
+   data-close the way showCostModal does — modal()'s own Escape/backdrop
+   handlers call its `close` directly and never touch a caller's `resolve`,
+   which is fine for a modal whose caller does not need to await a real
+   answer but would leave `await ui.showHrFarewell()` hanging indefinitely
+   (and the auto-sign-out after it never firing) if the caller dismissed via
+   Escape instead of the button. Both handlers guard on `done` so a click
+   AND modal()'s own listener both firing on the same event resolves once. */
+
+function paragraphs(text) {
+  return text.split('\n\n').map(p => `<p style="margin:0 0 12px">${escapeHtml(p)}</p>`).join('');
+}
+
+export function showHrWelcome() {
+  return new Promise((resolve) => {
+    const { ov, box } = modal(`
+      <div class="mdl-hd"><span>${escapeHtml(HR_WELCOME_TITLE)}</span><button data-close type="button">✕</button></div>
+      <div class="mdl-b">${paragraphs(HR_WELCOME_BODY)}</div>
+      <div class="mdl-f">
+        <button class="btn" data-ok type="button">LET'S GO ▸</button>
+      </div>`, { wide: false });
+    let done = false;
+    const finish = () => { if (done) return; done = true; resolve(); };
+    box.querySelector('[data-ok]').onclick = finish;
+    box.querySelector('[data-close]').onclick = finish;
+    ov.addEventListener('click', (e) => { if (e.target === ov) finish(); });
+    document.addEventListener('keydown', function onKey(e) {
+      if (e.key !== 'Escape') return;
+      document.removeEventListener('keydown', onKey, true);
+      finish();
+    }, true);
+    box.querySelector('[data-ok]').focus();
+  });
+}
+
+export function showHrFarewell() {
+  return new Promise((resolve) => {
+    // No data-close — this is the one modal in the app that deliberately
+    // offers no quiet dismiss button. Escape and a backdrop click still
+    // work (see the function comment above for why they must), but there
+    // is no X to casually click past without reading it.
+    const { ov, box } = modal(`
+      <div class="mdl-hd"><span>${escapeHtml(HR_FAREWELL_TITLE)}</span></div>
+      <div class="mdl-b">${paragraphs(HR_FAREWELL_BODY)}</div>
+      <div class="mdl-f">
+        <button class="btn" data-ok type="button">${escapeHtml(HR_FAREWELL_BUTTON)}</button>
+      </div>`, { wide: false });
+    let done = false;
+    const finish = () => { if (done) return; done = true; resolve(); };
+    box.querySelector('[data-ok]').onclick = finish;
+    ov.addEventListener('click', (e) => { if (e.target === ov) finish(); });
+    document.addEventListener('keydown', function onKey(e) {
+      if (e.key !== 'Escape') return;
+      document.removeEventListener('keydown', onKey, true);
+      finish();
+    }, true);
+    box.querySelector('[data-ok]').focus();
   });
 }
 

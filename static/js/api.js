@@ -12,12 +12,14 @@
 export const auth = {
   authenticated: false,
   stale: false,        // true when the last refresh could not reach the server
-  tier: null,          // 'owner' | 'guest' | null — null means no session at all
+  tier: null,          // 'owner' | 'guest' | 'hr' | null — null means no session at all
   guest: null,         // {expires_at, dive_ticker, modules_total, modules_used, exhausted}
+  hr: null,            // {runs_total, runs_used, runs_left, exhausted, slots} — the HR preview key
 
   has()     { return auth.authenticated; },
   isOwner() { return auth.tier === 'owner'; },
   isGuest() { return auth.tier === 'guest'; },
+  isHr()    { return auth.tier === 'hr'; },
 
   /* 'visitor' is a frontend-only tier: someone browsing with no session at all.
      The server never issues it, so it is derived here rather than read. */
@@ -33,8 +35,17 @@ export const auth = {
     return Math.max(0, (g.modules_total || 0) - (g.modules_used || 0));
   },
 
+  /* Whole research runs left on the HR preview key. Same "count, not a flag"
+     reasoning as divesLeft() — the server already computes runs_left, this
+     just guards against a null hr block (owner/guest/visitor). */
+  runsLeft() {
+    return auth.hr ? Math.max(0, auth.hr.runs_left || 0) : 0;
+  },
+
   /* Hours until a guest key dies, from the SERVER's expires_at. Never assume
-     the two clocks agree — this is display only, and the server re-checks. */
+     the two clocks agree — this is display only, and the server re-checks.
+     The HR key has no equivalent — see AuthCtx/CLAUDE.md: exhaustion (5
+     runs), not a clock, is its wall, so there is no hoursLeftHr(). */
   hoursLeft() {
     if (!auth.guest?.expires_at) return null;
     const ms = Date.parse(auth.guest.expires_at) - Date.now();
@@ -45,6 +56,7 @@ export const auth = {
     auth.authenticated = Boolean(d && d.authenticated);
     auth.tier  = (d && d.tier) || null;
     auth.guest = (d && d.guest) || null;
+    auth.hr    = (d && d.hr) || null;
   },
 
   async refresh() {
@@ -84,8 +96,8 @@ export const auth = {
       const d = await request('/api/session', { method: 'POST', body: { key: String(key || '') } });
       // POST returns the same shape as GET, so the tier and allowance are known
       // immediately — no second round trip before painting the key chip.
-      auth._apply({ authenticated: true, tier: d.tier, guest: d.guest });
-      return { ok: true, tier: d.tier, guest: d.guest };
+      auth._apply({ authenticated: true, tier: d.tier, guest: d.guest, hr: d.hr });
+      return { ok: true, tier: d.tier, guest: d.guest, hr: d.hr };
     } catch (err) {
       auth._apply(null);
       return {
@@ -148,9 +160,12 @@ function describe(status, body) {
   if (status === 402) {
     // 'stage' is recoverable and 'budget' is terminal. Collapsing them halted
     // the whole run over a single already-claimed stage, stranding the rest of
-    // the guest's allowance.
+    // the guest's (or the HR key's) allowance. hr_stage_used/hr_budget_exhausted
+    // are the HR-key twins of guest_stage_used/guest_budget_exhausted — same
+    // two-way split, same reason.
+    const stage = code === 'guest_stage_used' || code === 'hr_stage_used';
     return new ApiError(server || 'Your included deep dive is already used.',
-                        { status, kind: code === 'guest_stage_used' ? 'stage' : 'budget',
+                        { status, kind: stage ? 'stage' : 'budget',
                           code, detail: extra });
   }
   if (status === 409 && code === 'guest_ticker_bound') {
@@ -165,11 +180,15 @@ function describe(status, body) {
                         { status, kind: 'forbidden', code });
   }
   if (status === 401) {
-    // A guest whose key died must NOT be sent to the unlock screen to enter an
-    // operator secret they were never given.
-    if (code === 'guest_expired' || code === 'session_expired') {
+    // A guest (or HR) whose key died must NOT be sent to the unlock screen to
+    // enter an operator secret they were never given. hr_spent is POST
+    // /api/session's own refusal for a key that has already burned all 5
+    // runs — same 'expired' kind as guest_expired: the browser must show the
+    // farewell/explain-why state, never the unlock dialog.
+    if (code === 'guest_expired' || code === 'session_expired' || code === 'hr_expired'
+        || code === 'hr_spent') {
       return new ApiError(server || 'Your session has expired.',
-                          { status, kind: 'expired', code });
+                          { status, kind: 'expired', code, detail: extra });
     }
     return new ApiError('Not authorised — unlock with your key.', { status, kind: 'unauthorized', code });
   }
@@ -390,6 +409,8 @@ export const adminReopen   = (id)  => request(`/api/admin/requests/${id}/reopen`
 export const adminGuestKeys= ()    => request('/api/admin/guest-keys');
 export const adminRevoke   = (id)  => request(`/api/admin/guest-keys/${id}/revoke`, { method: 'POST' });
 export const adminRevokeAll= ()    => request('/api/admin/sessions/revoke-all', { method: 'POST' });
+export const adminHrKey    = ()    => request('/api/admin/hr-key');
+export const adminHrKeyReset = ()  => request('/api/admin/hr-key/reset', { method: 'POST' });
 export const runOutlook   = ({ signal } = {}) =>
   request('/api/portfolio/outlook', { method: 'POST', signal }).then(d => {
     if (d && d.error) throwIfErrorField(d);

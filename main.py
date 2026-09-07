@@ -8,6 +8,7 @@ Usage:
   python main.py PLTR "is the thesis intact?"  # specific question            (~$0.05)
   python main.py scan                          # brief for every holding      (~$0.04 each)
   python main.py brent                         # oil framework signal         (free)
+  python main.py hrkey                         # print the HR preview key     (free)
 
 Research runs on Perplexity, or Groq when only GROQ_API_KEY is set.
 Everything except `setup` and `brent` spends API credits.
@@ -35,6 +36,7 @@ if sys.stderr.encoding and sys.stderr.encoding.lower() not in ("utf-8", "utf-8-s
 
 from tools.perplexity_research import run_perplexity_research, run_research_module
 from tools.oil_price import get_brent_signal
+from tools.hr_key import derive_hr_key
 from config import MY_PORTFOLIO, WATCHLIST
 
 
@@ -82,6 +84,31 @@ def cmd_scan():
             question="One paragraph: is my thesis intact? Any new risks?",
         )
         print(result.get("output") or f"Error: {result.get('error', 'research failed')}")
+
+
+def cmd_hrkey():
+    """Print the current HR preview key, derived from AGENT_SECRET.
+
+    Offline — no server, no network call, no database. This is the CLI twin
+    of GET /api/admin/hr-key (require_owner): both call derive_hr_key() on
+    whatever AGENT_SECRET this process's .env resolves to, so the two agree
+    by construction. The key is never generated ahead of time or written
+    anywhere — it exists only as this deterministic function of the current
+    password, which is also why rotating the password produces a different
+    key with no migration step.
+    """
+    import os
+    secret = os.getenv("AGENT_SECRET") or ""
+    if not secret:
+        print("AGENT_SECRET is not set — run `python main.py setup` first, "
+              "or check your .env file.")
+        return
+    print_separator("HR PREVIEW KEY")
+    print(f"\n  {derive_hr_key(secret)}\n")
+    print("  Give this to a reviewer to sign in with. It carries owner-level")
+    print("  READ access (your book, charts, history) and NO write access,")
+    print("  and is good for 5 research runs total, in either mode, on any")
+    print("  ticker. Rotating AGENT_SECRET invalidates it and mints a new one.")
 
 
 def cmd_brent():
@@ -132,6 +159,10 @@ def main():
 
     if command == "BRENT":
         cmd_brent()
+        return
+
+    if command == "HRKEY":
+        cmd_hrkey()
         return
 
     # Otherwise treat first arg as a ticker

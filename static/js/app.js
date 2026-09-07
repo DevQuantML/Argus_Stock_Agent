@@ -5,14 +5,15 @@
    Version query on each import so a redeploy can never pair a fresh app.js
    with a stale cached sub-module. Bump together with the ?v= in index.html. */
 
-import * as api from './api.js?v=42';
-import { drawChart, makeResponsive } from './chart.js?v=42';
-import { renderMarkdown, escapeHtml } from './md.js?v=42';
-import * as prefs from './theme.js?v=42';
-import * as ui from './ui.js?v=42';
-import * as views from './views.js?v=42';
-import * as tour from './tour.js?v=42';
-import { DISCLAIMER, FRESHNESS_NOTE, guestAllowanceLine } from './copy.js?v=42';
+import * as api from './api.js?v=43';
+import { drawChart, makeResponsive } from './chart.js?v=43';
+import { renderMarkdown, escapeHtml } from './md.js?v=43';
+import * as prefs from './theme.js?v=43';
+import * as ui from './ui.js?v=43';
+import * as views from './views.js?v=43';
+import * as tour from './tour.js?v=43';
+import { DISCLAIMER, FRESHNESS_NOTE, guestAllowanceLine, hrAllowanceLine,
+         hrRunToast } from './copy.js?v=43';
 
 const $  = ui.$;
 const $$ = ui.$$;
@@ -224,7 +225,7 @@ function tapeItems() {
 
 function paintAll() {
   ui.renderStatus(state.health, state.provider === 'groq' ? 'GROQ' : 'PERPLEXITY');
-  ui.renderKeyState(tier(), api.auth.guest);
+  ui.renderKeyState(tier(), api.auth.guest, api.auth.hr);
   // Adding to the watchlist is an owner action; the server refuses it for
   // anyone else, so do not offer the control.
   $('btn-add')?.classList.toggle('hidden', !isOwner());
@@ -393,6 +394,11 @@ function welcome() {
     const g = el('p', 'dim');
     g.textContent = guestAllowanceLine(api.auth.guest);
     if (g.textContent) o.appendChild(g);
+  }
+  if (tier() === 'hr') {
+    const h = el('p', 'dim');
+    h.textContent = hrAllowanceLine(api.auth.hr);
+    if (h.textContent) o.appendChild(h);
   }
   if (!isOwner()) {
     const f = el('p', 'ld-disc');
@@ -625,21 +631,24 @@ const AI_MODULES = [
 /* The note shown where the AI stages would have run. Two different situations,
    two different sentences — "add a key" is wrong advice for a guest who has one
    and has already used it. */
-function aiLockedNote(spent) {
+function aiLockedNote(spent, spentHr) {
   const n = document.createElement('div');
   n.className = 'r-body';
   n.style.marginTop = '14px';
 
   const p = document.createElement('p');
   p.className = 'dim';
-  p.textContent = spent
+  p.textContent = spentHr
+    ? 'Your five preview research runs are used. Quant, charts, history, news '
+      + 'and the whole portfolio stay free and unlimited.'
+    : spent
     ? 'Your included deep dive is complete. Quant, charts, history and news stay '
       + 'free and unlimited until your key expires.'
     : 'AI research is locked. Live web research, politician-trade disclosure, '
       + 'cross-source patterns and the final verdict need a key.';
   n.appendChild(p);
 
-  if (!spent && !isOwner()) {
+  if (!spent && !spentHr && !isOwner()) {
     const row = document.createElement('div');
     row.className = 'ld-actions';
     row.style.cssText = 'max-width:320px;margin-top:12px';
@@ -668,12 +677,49 @@ function markRemainingLocked(failedKey, why) {
 }
 
 /* Re-read the allowance from the server and repaint the chip. The server is
-   authoritative about what has been spent; the cached copy is only for display. */
+   authoritative about what has been spent; the cached copy is only for display.
+
+   Also the single place that notices an HR run has just completed and
+   reacts — every code path that could have consumed an HR run-unit already
+   calls this (the error branches below, and the staged pipeline's own
+   `finally`), so wiring the announcement in here means no call site has to
+   remember to check separately. `prevUsed` is captured from the CACHED
+   count before the network round trip, which is what makes two refreshTier()
+   calls in quick succession self-correcting rather than double-announcing:
+   the first call's refresh already advances the cache, so a second call's
+   `prevUsed` already reflects it and sees no further change. */
 async function refreshTier() {
+  const prevHrUsed = tier() === 'hr' ? (api.auth.hr?.runs_used ?? 0) : null;
   try {
     await api.auth.refresh();
-    ui.renderKeyState(tier(), api.auth.guest);
+    ui.renderKeyState(tier(), api.auth.guest, api.auth.hr);
+    if (prevHrUsed !== null && tier() === 'hr') {
+      await announceHrRunIfNew(prevHrUsed, api.auth.hr);
+    }
   } catch { /* display only — a failure here changes no entitlement */ }
+}
+
+/* used <= prevUsed covers both "nothing new" (a failed/skipped stage, or a
+   duplicate refreshTier() call — see above) and "a refund put it back below
+   where it was" (an already-billed run's mid-flight failure never refunds,
+   so this only ever fires for the free-failure case, same as a guest's
+   equivalent). Neither is a completed run, so neither announces anything. */
+async function announceHrRunIfNew(prevUsed, hr) {
+  if (!hr) return;
+  const used = hr.runs_used ?? prevUsed;
+  if (used <= prevUsed) return;
+
+  if (hr.exhausted || used >= (hr.runs_total || 5)) {
+    await ui.showHrFarewell();
+    const done = await api.auth.signOut();
+    ui.renderKeyState('visitor', null);
+    ui.toast(done ? 'Signed out — thanks again for taking a look.'
+                  : 'Could not confirm sign-out — the server did not respond. Close this browser to be safe.',
+             done ? 'success' : 'warn', done ? 4000 : 9000);
+    return;
+  }
+  const msg = hrRunToast(used);
+  if (msg) ui.toast(msg, 'info', 7000);
 }
 
 async function research(rawSym, { paid = true, question } = {}) {
@@ -687,12 +733,14 @@ async function research(rawSym, { paid = true, question } = {}) {
   $('btn-exec').disabled = true;
   const started = performance.now();
   // "Can this caller run paid AI?" is no longer "do they hold a session" — a
-  // guest holds one and may still have nothing left to spend. A self-key
-  // visitor holds no session at all and is still a yes: state.selfKey is a
-  // THIRD, independent way to reach this, orthogonal to tier().
+  // guest holds one and may still have nothing left to spend, and neither
+  // does the HR preview key once its 5 runs are gone. A self-key visitor
+  // holds no session at all and is still a yes: state.selfKey is a FOURTH,
+  // independent way to reach this, orthogonal to tier().
   const spent      = tier() === 'guest' && api.auth.divesLeft() <= 0;
+  const spentHr    = tier() === 'hr' && api.auth.runsLeft() <= 0;
   const hasSelfKey = !!state.selfKey;
-  const hasKey     = (api.auth.has() && !spent) || hasSelfKey;
+  const hasKey     = (api.auth.has() && !spent && !spentHr) || hasSelfKey;
 
   openTab(sym);
   ui.clearOut();
@@ -720,8 +768,8 @@ async function research(rawSym, { paid = true, question } = {}) {
 
     if (!hasKey) {
       ui.setStatus('QUANT ONLY', 'ok');
-      if (spent) for (const [k] of AI_MODULES) ui.pipeline.set(k, 'locked', 'allowance used');
-      o.appendChild(aiLockedNote(spent));
+      if (spent || spentHr) for (const [k] of AI_MODULES) ui.pipeline.set(k, 'locked', 'allowance used');
+      o.appendChild(aiLockedNote(spent, spentHr));
       cacheTab(sym);
       return;
     }
@@ -756,6 +804,7 @@ async function research(rawSym, { paid = true, question } = {}) {
     const sel = await ui.showCostModal(sym, state.provider, {
       tier: tier(),
       guest: api.auth.guest,
+      hr: api.auth.hr,
     });
     if (!sel) {
       for (const [k] of AI_MODULES) ui.pipeline.set(k, 'skipped');
@@ -905,8 +954,10 @@ async function research(rawSym, { paid = true, question } = {}) {
     // branches, so after a COMPLETED dive the cached allowance still read 0/5:
     // the chip kept saying "1 DIVE", and the next `research` passed the spent
     // check and showed the full confirmation modal for a dive that then 409'd
-    // on every stage. The client had the data to prevent that.
-    if (tier() === 'guest') refreshTier();
+    // on every stage. The client had the data to prevent that. Same for 'hr' —
+    // refreshTier() is also what notices a newly-completed run and fires the
+    // counter toast / farewell, see its own comment.
+    if (tier() === 'guest' || tier() === 'hr') await refreshTier();
     $('btn-stop').classList.add('hidden');
     const secs = ((performance.now() - started) / 1000).toFixed(1);
     ui.writeLine(`— run complete in ${secs}s —`, 'dim');
@@ -1070,22 +1121,32 @@ async function runSelfKeyResearch(sym, question, o) {
    live only as local variables for the one request that uses them. */
 async function runModelCourt(sym) {
   if (state.busy) { ui.toast('A run is already in flight.', 'warn'); return; }
-  if (!isOwner() && tier() !== 'guest') {
+  if (!isOwner() && tier() !== 'guest' && tier() !== 'hr') {
     ui.toast('Model Court needs an unlocked session — the owner\'s key, or a guest key. '
            + 'Type `request` to ask the owner for access.', 'warn', 7000);
     return;
   }
+  // The HR budget (unlike a guest's, which never touches Model Court at all)
+  // does gate this — check before the key modal even opens, same reasoning
+  // as the guest 45-min-left check in research(): a doomed call should never
+  // reach the point of asking for confirmation.
+  if (tier() === 'hr' && api.auth.runsLeft() <= 0) {
+    ui.toast('Your five preview research runs are used — everything free stays open.',
+             'warn', 7000);
+    return;
+  }
 
-  // Owner-only: which providers are already configured server-side (◈
-  // CONFIG), so showModelCourtKeys can skip asking for a key it can
-  // already fall back to (api_model_court's own owner-only fallback).
-  // Never sent for a guest — state.health.checks is read regardless, but
-  // showModelCourtKeys only consults `configured` when isOwner() is true.
+  // Owner-and-HR: which providers are already configured server-side (◈
+  // CONFIG), so showModelCourtKeys can skip asking for a key it can already
+  // fall back to (api_model_court's own owner-and-HR fallback — see
+  // api.py). Never sent for a real guest — state.health.checks is read
+  // regardless, but showModelCourtKeys only consults `configured` when its
+  // second argument is true, and a real guest never sets it.
   const configured = {
     perplexity: !!state.health?.checks?.perplexity_key,
     gemini: !!state.health?.checks?.gemini_key,
   };
-  const keys = await ui.showModelCourtKeys(sym, isOwner(), configured);
+  const keys = await ui.showModelCourtKeys(sym, isOwner() || tier() === 'hr', configured);
   if (!keys) return;
 
   state.busy = true;
@@ -1157,6 +1218,11 @@ async function runModelCourt(sym) {
     ui.setStatus('FAILED', 'err');
     ui.toast(err.message || 'Model Court failed.', 'error', 8000);
   } finally {
+    // Same reason as research()'s own finally: an HR call here can have
+    // consumed a run unit (api_model_court's 'court' budget check) even on
+    // a partial or failed result, so the allowance is re-read and the
+    // counter/farewell announced unconditionally, not only on success.
+    if (tier() === 'hr') await refreshTier();
     const secs = ((performance.now() - started) / 1000).toFixed(1);
     ui.writeLine(`— run complete in ${secs}s —`, 'dim');
     cacheTab(sym);
@@ -1184,7 +1250,7 @@ async function showHistory(rawSym) {
   const o = ui.out();
 
   let runs;
-  if (isOwner() || tier() === 'guest') {
+  if (isOwner() || tier() === 'guest' || tier() === 'hr') {
     try {
       runs = (await api.getResearchHistory(sym)).runs || [];
     } catch (err) {
@@ -1813,7 +1879,7 @@ function openConfig() {
       // failure mode.
       state.selfKey = null;
       await api.auth.refresh();
-      ui.renderKeyState(tier(), api.auth.guest);
+      ui.renderKeyState(tier(), api.auth.guest, api.auth.hr);
       ui.toast('Unlocked — AI research armed.', 'success', 3200);
     });
   }, (key) => {
@@ -1981,6 +2047,10 @@ document.addEventListener('DOMContentLoaded', async () => {
       state.selfKey = null;
       await api.auth.refresh();
       await enterOrOnboard();
+      // Once, right after a fresh HR redemption — never on a reload of an
+      // already-live session, since that path never reaches showLanding or
+      // this callback at all (see the `if (!api.auth.has())` guard below).
+      if (tier() === 'hr') await ui.showHrWelcome();
     },
     onVisitor: () => enter(),   // no session => tier() is already 'visitor'
     onSelfKey: (provider, key) => {

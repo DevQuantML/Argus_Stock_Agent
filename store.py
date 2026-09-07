@@ -99,7 +99,36 @@ CREATE TABLE IF NOT EXISTS guest_keys (
     created_at  TEXT NOT NULL,
     expires_at  TEXT NOT NULL,
     revoked_at  TEXT,
-    dive_ticker TEXT
+    dive_ticker TEXT,
+    -- 'guest' (the 24h/5-stage/one-ticker key an operator hands to one
+    -- person) or 'hr' (the AGENT_SECRET-derived preview key — see
+    -- tools/hr_key.py). Deliberately NOT a new value in sessions.tier /
+    -- research_runs.tier's own CHECK: those two columns are load-bearing
+    -- CHECK constraints on a live database, and this project does not widen
+    -- a CHECK on an existing table without a real migration story. An HR
+    -- session is stored as an ordinary tier='guest' row; this column is what
+    -- api.py's AuthCtx.role reads to tell the two apart.
+    role        TEXT NOT NULL DEFAULT 'guest' CHECK (role IN ('guest','hr'))
+);
+-- Run-unit ledger for role='hr' keys. Shape differs from guest_key_uses
+-- (PRIMARY KEY (key_id, module), one ticker only) because the HR budget is
+-- "5 runs across ANY tickers, in EITHER mode" rather than one dive welded to
+-- one ticker — a materially different rule, not a variant of the guest one,
+-- so it gets its own ledger rather than an overloaded reuse of the guest
+-- table. A "run" is a (ticker, mode) pair; `unit` is the specific stage
+-- claimed within it (report/context/policy/patterns/synthesis for
+-- mode='staged', 'court' for mode='court'). The PRIMARY KEY is the
+-- check-and-set for "this exact stage of this run already happened", the
+-- same pattern guest_key_uses uses for the identical reason: the four
+-- module GETs of one staged run overlap in flight, so there is no room for
+-- a read-then-write window.
+CREATE TABLE IF NOT EXISTS key_run_units (
+    key_id  INTEGER NOT NULL,
+    ticker  TEXT NOT NULL,
+    mode    TEXT NOT NULL,
+    unit    TEXT NOT NULL,
+    used_at TEXT NOT NULL,
+    PRIMARY KEY (key_id, ticker, mode, unit)
 );
 -- One row per consumed stage of a guest's single included deep dive. The
 -- PRIMARY KEY is the budget: an INSERT that violates it is a stage already
@@ -214,6 +243,20 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if "guest_key_id" not in cols:
         try:
             conn.execute("ALTER TABLE sessions ADD COLUMN guest_key_id INTEGER")
+        except sqlite3.OperationalError:
+            pass
+
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(guest_keys)")}
+    if "role" not in cols:
+        try:
+            # SQLite's ADD COLUMN cannot carry a CHECK constraint added after
+            # the fact — the CHECK in _SCHEMA above only binds a table created
+            # fresh by this statement. Every existing row predates the 'hr'
+            # role by construction, so DEFAULT 'guest' is the correct and only
+            # backfill: no ALTER TABLE ... ADD COLUMN ... CHECK (...) syntax
+            # exists in SQLite, and the column would otherwise silently accept
+            # any string on a database that migrated rather than started fresh.
+            conn.execute("ALTER TABLE guest_keys ADD COLUMN role TEXT NOT NULL DEFAULT 'guest'")
         except sqlite3.OperationalError:
             pass
 
@@ -509,7 +552,7 @@ def session_info(token: str) -> dict | None:
     if not token:
         return None
     rows = _rows(
-        """SELECT s.expires_at, s.tier, s.guest_key_id,
+        """SELECT s.expires_at, s.tier, s.guest_key_id, g.role AS key_role,
                   g.revoked_at AS key_revoked, g.expires_at AS key_expires
              FROM sessions s
              LEFT JOIN guest_keys g ON g.id = s.guest_key_id
@@ -544,8 +587,14 @@ def session_info(token: str) -> dict | None:
         except ValueError:
             return None
 
+    # role distinguishes an ordinary guest key from the HR preview key within
+    # the same tier='guest' storage row — see AuthCtx's own docstring in
+    # api.py for why this is a second axis rather than a third tier value.
+    # An owner row has no guest_keys join at all, so key_role is NULL there;
+    # 'owner' is the correct, only sensible role for that case.
+    role = r["key_role"] if r["tier"] == "guest" else "owner"
     return {"tier": r["tier"], "guest_key_id": r["guest_key_id"],
-            "expires_at": r["expires_at"]}
+            "expires_at": r["expires_at"], "role": role}
 
 
 def destroy_session(token: str) -> None:
@@ -617,12 +666,25 @@ def guest_key_for(raw_key: str) -> dict | None:
     stored key: any timing signal from the lookup concerns the digest, not the
     key, and turning that into a key needs a preimage attack.
 
+    Scoped to role='guest' — WITHOUT this, a stale HR row (created by an
+    earlier AGENT_SECRET, before the operator rotated it) stays sitting in
+    this same table forever, and POST /api/session's own fallthrough calls
+    this exact function once hr_key_ok() correctly rejects the now-mismatched
+    key. A role-blind lookup would then find that old row by hash and hand
+    the caller a genuine tier='guest' session off a credential the operator
+    believed they had just killed by rotating their password — reproduced
+    live while verifying this feature, not a hypothetical. role='hr' rows are
+    looked up exclusively through find_or_create_derived_key()/hr_key_row(),
+    both scoped the same way from the other side, so the two credential
+    spaces never cross.
+
     'dead' distinguishes revoked from expired so POST /api/session can say
     something true. That leaks nothing — the caller already holds the key.
     """
     if not raw_key:
         return None
-    rows = _rows("SELECT * FROM guest_keys WHERE key_hash = ?", (_hash_token(raw_key),))
+    rows = _rows("SELECT * FROM guest_keys WHERE key_hash = ? AND role = 'guest'",
+                 (_hash_token(raw_key),))
     if not rows:
         return None
     r = dict(rows[0])
@@ -659,9 +721,16 @@ def guest_usage(key_id: int) -> dict:
 
 
 def list_guest_keys() -> list[dict]:
-    """Admin listing. Never returns key_hash — that is the credential material."""
+    """Admin listing of ordinary guest keys. Never returns key_hash — that is
+    the credential material.
+
+    Scoped to role='guest' deliberately: the HR preview key is a materially
+    different credential (5 runs across any ticker, not one dive on one) and
+    gets its own admin-panel card via hr_key_row()/hr_usage(), not a row in
+    this list that would need a special-cased column layout to explain.
+    """
     out = []
-    for r in _rows("SELECT * FROM guest_keys ORDER BY created_at DESC"):
+    for r in _rows("SELECT * FROM guest_keys WHERE role = 'guest' ORDER BY created_at DESC"):
         usage = guest_usage(r["id"])
         expired = _expired(r["expires_at"])
         out.append({
@@ -814,6 +883,219 @@ def refund_guest_unit(key_id: int, module: str) -> None:
     genuinely died needs a new key, not a second target.
     """
     _exec("DELETE FROM guest_key_uses WHERE key_id = ? AND module = ?", (key_id, module))
+
+
+# ── HR preview key ────────────────────────────────────────────────────────
+# A single AGENT_SECRET-derived credential (tools/hr_key.py) for handing the
+# terminal to someone outside the guest-key flow — a recruiter, a hiring
+# manager — without ever giving them the password itself. Stored as an
+# ordinary guest_keys row with role='hr': it rides every guarantee a guest
+# key already has (session_info()'s LEFT JOIN kills its sessions the instant
+# it is revoked or past expires_at) and adds only what is actually
+# different — a budget of 5 whole RUNS across any ticker and either mode,
+# tracked in key_run_units, rather than one dive welded to one ticker.
+#
+# There is no minting step and the key is never persisted anywhere on its
+# own (see tools/hr_key.py's docstring for why) — the row is created lazily,
+# the first time the derived key is ever redeemed at POST /api/session, by
+# find_or_create_derived_key() below.
+
+HR_RUN_BUDGET = 5
+HR_KEY_LABEL = "HR preview key"
+# expires_at is NOT NULL in the schema (guest_keys predates any credential
+# with a nullable expiry), so this row needs *some* value to satisfy it. It
+# is not the functional wall — HR_RUN_BUDGET is — it exists purely so the
+# column constraint holds; 365 days comfortably outlives a review cycle, and
+# rotating AGENT_SECRET (which changes the derived string itself, and with
+# it which row future redemptions look up) is the real "make the old one
+# stop working" lever.
+HR_KEY_LIFETIME_DAYS = 365
+
+
+def find_or_create_derived_key(raw_key: str) -> dict:
+    """Look up the HR row by the raw key, creating it on first redemption.
+    Hashes internally, same as guest_key_for() — a database read must never
+    be the thing that produces a usable credential.
+
+    Never accepts an arbitrary key on trust: the caller (POST /api/session)
+    must already have proven `raw_key` against tools.hr_key.hr_key_ok()
+    before this is ever reached, so "look up or create" here can only ever
+    describe the ONE row this process's current AGENT_SECRET derives — this
+    is not a general key-minting path.
+
+    Races the INSERT against key_hash's UNIQUE constraint rather than
+    locking out a second concurrent first-redemption: if the same HR link is
+    opened by two people in the same instant, both should get the one real
+    row, not one of them an error.
+    """
+    key_hash = _hash_token(raw_key)
+    with _lock:
+        c = _connect()
+        row = c.execute("SELECT * FROM guest_keys WHERE key_hash = ? AND role = 'hr'",
+                         (key_hash,)).fetchone()
+        if row is not None:
+            return dict(row)
+
+        expires = datetime.now(timezone.utc) + timedelta(days=HR_KEY_LIFETIME_DAYS)
+        try:
+            cur = c.execute(
+                "INSERT INTO guest_keys (key_hash, key_prefix, label, created_at, "
+                "expires_at, role) VALUES (?,?,?,?,?,'hr')",
+                (key_hash, raw_key[:6], HR_KEY_LABEL, _now(), expires.isoformat()),
+            )
+            c.commit()
+            row_id = cur.lastrowid
+        except sqlite3.IntegrityError:
+            # Lost the race to a concurrent first redemption of the same key.
+            # The winner's row is what both callers want — not an error.
+            c.rollback()
+            row = c.execute("SELECT * FROM guest_keys WHERE key_hash = ?",
+                             (key_hash,)).fetchone()
+            return dict(row)
+
+        row = c.execute("SELECT * FROM guest_keys WHERE id = ?", (row_id,)).fetchone()
+        return dict(row)
+
+
+def hr_key_row(raw_key: str) -> dict | None:
+    """Look up the HR row by the raw key WITHOUT creating it — for the admin
+    panel, which must show 'no runs yet' before the key has ever been
+    redeemed. Contrast with find_or_create_derived_key(), which always wants
+    a row to exist because it backs an actual session creation.
+    """
+    rows = _rows("SELECT * FROM guest_keys WHERE key_hash = ? AND role = 'hr'",
+                 (_hash_token(raw_key),))
+    return dict(rows[0]) if rows else None
+
+
+def hr_usage(key_id: int) -> dict:
+    """The HR key's allowance, in the shape _budget_gate and the frontend need.
+
+    Counts RUNS — distinct (ticker, mode) pairs ever claimed — not
+    individual module stages: the HR budget's unit is coarser than a
+    guest's by design (5 whole dives across any tickers, not 5 stages of
+    one). 'not found' reads as exhausted/revoked, matching guest_usage()'s
+    own fail-closed rule for a row that no longer exists.
+    """
+    rows = _rows("SELECT revoked_at, expires_at FROM guest_keys WHERE id = ? AND role = 'hr'",
+                 (key_id,))
+    if not rows:
+        return {"runs_total": HR_RUN_BUDGET, "runs_used": 0, "runs_left": 0,
+                "exhausted": True, "revoked": True, "slots": []}
+    r = rows[0]
+    slots = _rows("SELECT DISTINCT ticker, mode FROM key_run_units WHERE key_id = ?", (key_id,))
+    used = len(slots)
+    return {
+        "runs_total": HR_RUN_BUDGET,
+        "runs_used": used,
+        "runs_left": max(0, HR_RUN_BUDGET - used),
+        "exhausted": used >= HR_RUN_BUDGET,
+        "revoked": bool(r["revoked_at"]),
+        "slots": [{"ticker": s["ticker"], "mode": s["mode"]} for s in slots],
+    }
+
+
+def consume_run_unit(key_id: int, ticker: str, mode: str, unit: str) -> str:
+    """Claim one stage of an HR key's run budget.
+
+    Returns 'ok' | 'used' | 'exhausted' | 'expired' | 'revoked' | 'missing'.
+
+    A "run" is a (ticker, mode) pair. Up to HR_RUN_BUDGET distinct runs may
+    ever be STARTED, but every stage within an already-started run stays
+    claimable regardless of budget — 'used' means THIS exact stage was
+    already claimed, not that the allowance is gone, matching
+    consume_guest_unit()'s own distinction and the plan's intent that
+    deselecting modules in the cost modal must not forfeit the rest of that
+    same run.
+
+    Same transactional shape as consume_guest_unit(), for the same reason:
+    one BEGIN IMMEDIATE, one exit point at the bottom (a bare `finally` here
+    would commit a failed transaction's partial writes — see that function's
+    own comment for the concrete bug that taught this), and the
+    PRIMARY KEY (key_id, ticker, mode, unit) on key_run_units is the
+    check-and-set for "already claimed" so the four module calls of one
+    staged run can overlap with no read-then-write window.
+    """
+    t = validate_ticker(ticker)
+    if mode not in ("staged", "court"):
+        raise ValueError(f"unknown run mode: {mode!r}")
+
+    with _lock:
+        c = _connect()
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            row = c.execute(
+                "SELECT * FROM guest_keys WHERE id = ? AND role = 'hr'", (key_id,)
+            ).fetchone()
+            if row is None:
+                result = "missing"
+            elif row["revoked_at"]:
+                result = "revoked"
+            elif _expired(row["expires_at"]):
+                result = "expired"
+            else:
+                already = c.execute(
+                    "SELECT 1 FROM key_run_units WHERE key_id = ? AND ticker = ? "
+                    "AND mode = ? LIMIT 1",
+                    (key_id, t, mode),
+                ).fetchone()
+                n_slots = c.execute(
+                    "SELECT COUNT(*) AS n FROM "
+                    "(SELECT DISTINCT ticker, mode FROM key_run_units WHERE key_id = ?)",
+                    (key_id,),
+                ).fetchone()["n"]
+                if already is None and n_slots >= HR_RUN_BUDGET:
+                    result = "exhausted"
+                else:
+                    try:
+                        c.execute(
+                            "INSERT INTO key_run_units (key_id, ticker, mode, unit, used_at) "
+                            "VALUES (?,?,?,?,?)",
+                            (key_id, t, mode, unit, _now()),
+                        )
+                        result = "ok"
+                    except sqlite3.IntegrityError:
+                        result = "used"
+        except Exception:
+            c.rollback()
+            logger.error("consume_run_unit failed (key_id=%s ticker=%s mode=%s unit=%s)",
+                         key_id, t, mode, unit, exc_info=True)
+            raise
+
+        c.commit()
+        return result
+
+
+def refund_run_unit(key_id: int, ticker: str, mode: str, unit: str) -> None:
+    """Give an HR stage back when it provably cost nothing.
+
+    Same rule and same caller (_refund_if_free in api.py) as
+    refund_guest_unit(): only reached when the layer that would have made
+    the network call raised before it did, so no money moved.
+    """
+    t = validate_ticker(ticker)
+    _exec("DELETE FROM key_run_units WHERE key_id = ? AND ticker = ? AND mode = ? AND unit = ?",
+          (key_id, t, mode, unit))
+
+
+def reset_hr_budget(key_id: int) -> bool:
+    """Admin action: wipe an HR key's run ledger, restoring a full 5 runs.
+
+    Returns False for anything that is not an 'hr'-role row — this must
+    never be reachable against a real guest's dive ledger by an id mix-up,
+    and key_run_units is a table only HR rows ever write to, so scoping the
+    guard to role='hr' here is what keeps that true even if a caller passes
+    a stray id.
+    """
+    with _lock:
+        c = _connect()
+        row = c.execute("SELECT id FROM guest_keys WHERE id = ? AND role = 'hr'",
+                         (key_id,)).fetchone()
+        if row is None:
+            return False
+        c.execute("DELETE FROM key_run_units WHERE key_id = ?", (key_id,))
+        c.commit()
+        return True
 
 
 # ── Access requests ───────────────────────────────────────────────────────

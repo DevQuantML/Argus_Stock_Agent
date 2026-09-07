@@ -56,3 +56,65 @@ export function guestAllowanceLine(guest) {
        + 'single ticker of your choice. Everything else — quant, charts, history, '
        + 'news, the Brent gate — is free and unlimited until your key expires.';
 }
+
+/* ── HR preview key ───────────────────────────────────────────────────────
+   Same "take the live figures from GET /api/session" discipline as
+   guestAllowanceLine — every string below is a function of the server's own
+   count, never a hardcoded "5". This is the one tier with an owner's sight
+   of the book and no write access, so the tone is a welcome guest gets, not
+   a locked-out one. */
+
+/* Boot-footer line — same slot guestAllowanceLine fills for a real guest. */
+export function hrAllowanceLine(hr) {
+  if (!hr) return '';
+  if (hr.exhausted) {
+    return 'Your five preview research runs are used. Quant, charts, history, news, '
+         + 'the Brent gate and the whole portfolio stay free and unlimited.';
+  }
+  return `You have ${hr.runs_left} of ${hr.runs_total} preview research runs left — `
+       + 'spend them on any ticker, in either mode (a staged dive or Model Court). '
+       + 'Everything else here — quant, charts, history, news, the whole '
+       + 'portfolio — is free and unlimited.';
+}
+
+/* Shown once, the first time an HR key is redeemed this session (POST
+   /api/session's own onUnlocked callback — never re-shown on a page reload
+   of an already-live session). */
+export const HR_WELCOME_TITLE = 'Welcome in 👋';
+export const HR_WELCOME_BODY =
+  "You've got 5 research runs — spend them on any tickers you like, in either "
+  + 'mode: a full staged dive, or Model Court, where two different AI models '
+  + 'research the same company independently and then get compared against '
+  + 'each other.\n\n'
+  + 'Everything else — quant, charts, P&L, the Brent gate, news, the whole '
+  + 'portfolio — is free and unlimited.\n\n'
+  + "Nothing you do in here can change the owner's book, so poke around freely.";
+
+/* One toast per completed run, 2 through 4. Run 1 is silent by design — the
+   welcome modal above already set expectations, and a toast one run in
+   would just repeat it. Run 5 gets the farewell modal below instead of a
+   toast. Indexed by `used` (the run that just completed), 1-based. */
+const HR_RUN_TOASTS = {
+  2: "That's 2 of 5 runs. Three still in the tank ⛽ — plenty for a proper look around.",
+  3: '3 of 5 used, two to go. Still comfortable — but maybe save them for the '
+    + "companies you'd actually argue about.",
+  4: 'One run left. 🎯 No pressure — but if there\'s a company you\'ve been '
+    + 'quietly curious about, this is its moment.',
+};
+export function hrRunToast(used) {
+  return HR_RUN_TOASTS[used] || '';
+}
+
+/* Farewell modal at run 5, then an automatic sign-out — the visit is meant
+   to end here, not the app. */
+export const HR_FAREWELL_TITLE = 'That\'s the full tour — thank you 🙏';
+export const HR_FAREWELL_BODY =
+  "You've used all five research runs. Every one of them spent real API "
+  + "credits out of one developer's own budget, which is — let's be generous "
+  + '— charmingly modest. So this is where the hospitality politely runs '
+  + 'out, not where the app breaks.\n\n'
+  + 'Genuinely, thank you for taking the time to actually kick the tyres '
+  + 'instead of just reading the README. That means more than you\'d think.\n\n'
+  + "Signing you out now. If you'd like more runs, just ask — a fresh key "
+  + 'takes about four seconds to make.';
+export const HR_FAREWELL_BUTTON = 'THANKS — SIGN ME OUT';
