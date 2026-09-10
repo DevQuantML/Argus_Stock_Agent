@@ -1094,6 +1094,7 @@ def reset_hr_budget(key_id: int) -> bool:
         if row is None:
             return False
         c.execute("DELETE FROM key_run_units WHERE key_id = ?", (key_id,))
+        c.execute("UPDATE guest_keys SET revoked_at = NULL WHERE id = ?", (key_id,))
         c.commit()
         return True
 

@@ -858,6 +858,7 @@ def reset_hr_budget(key_id: int) -> bool:
             if cur.fetchone() is None:
                 return False
             cur.execute("DELETE FROM key_run_units WHERE key_id = %s", (key_id,))
+            cur.execute("UPDATE guest_keys SET revoked_at = NULL WHERE id = %s", (key_id,))
         return True
 
 
